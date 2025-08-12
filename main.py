@@ -25,7 +25,7 @@ OUTPUT_DIR = "output"
 AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
 
 # Models: Phi-4-mini-instruct, Phi-4 or gpt-4.1-nano
-AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
+AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-nano"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
 
 # In-memory message history
 #MESSAGE_REVIEW_BACK = 40

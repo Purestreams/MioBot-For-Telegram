@@ -25,11 +25,23 @@ OUTPUT_DIR = "output"
 AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
 
 # Models: Phi-4-mini-instruct, Phi-4 or gpt-4.1-nano
-AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-nano"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
+AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
 
-# In-memory message history
-#MESSAGE_REVIEW_BACK = 40
-#message_history = defaultdict(lambda: deque(maxlen=MESSAGE_REVIEW_BACK))
+# A robust YouTube URL regex pattern (ID = 11 chars)
+YOUTUBE_URL_REGEX = (
+    r'(https?://)?(www\.)?'
+    r'(youtube\.com/|youtu\.be/|youtube-nocookie\.com/)'
+    r'(?:watch\?v=|embed/|v/|shorts/|live/)?'
+    r'([a-zA-Z0-9_-]{11})'
+    
+)
+BILIBILI_URL_REGEX = (
+    r'(https?://)?(?:www\.|m\.)?'
+    r'(bilibili\.com/|b23\.tv/)'
+    r'(?:video/|watch\?bvid=)?'
+    r'([A-Za-z0-9_-]{6,12})'
+    r'(?:[/?#][^\s]*)?'
+)
 
 
 # Enable logging
@@ -39,6 +51,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
+# -------- Telegram Bot Handlers --------
+
+# Start command handler
+# This handler sends a welcome message when the /start command is issued.
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the /start command is issued."""
     await update.message.reply_text(
@@ -46,179 +63,154 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages to convert markdown to image."""
+async def handle_md2jpg_and_text2jpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /md2jpg and /text2jpg commands to generate images."""
     if not update.message or not update.message.text:
         return
-    logger.info(f"Received message: {update.message.text if update.message else 'No message text'}")
-    text = update.message.text
-    # Use a flexible regex to find the command and content
+    logger.info(f"Received text for rendering: {update.message.text if update.message else 'No message text'}")
+    message_text = update.message.text
+
     # This regex handles optional bot username in the command, e.g., md2jpg@MioooooooooBot
-    match_md2jpg = re.search(r'/md2jpg(?:@\w+)?\s*,,,(.*),,,', text, re.DOTALL)
-    match_text2jpg = re.search(r'/text2jpg(?:@\w+)?\s*,,,(.*),,,', text, re.DOTALL)
+    match_md2jpg = re.search(r'/md2jpg(?:@\w+)?\s*,,,(.*),,,', message_text, re.DOTALL)
+    match_text2jpg = re.search(r'/text2jpg(?:@\w+)?\s*,,,(.*),,,', message_text, re.DOTALL)
 
     # md2jpg command handling
     if match_md2jpg:
-        md_content = match_md2jpg.group(1).strip()
-        if not md_content:
+        markdown_input = match_md2jpg.group(1).strip()
+        if not markdown_input:
             await update.message.reply_text("Please provide some markdown content inside the triple quotes.")
             return
 
-        # Create a unique filename for the output image
-        output_filename = f"md_{update.message.message_id}.jpg"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        output_file_name = f"md_{update.message.message_id}.jpg"
+        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
-        massage_block = None
+        status_message = None
         try:
-            # Let the user know the process has started
-            massage_block = await update.message.reply_text("Generating your image, please wait a moment...")
+            status_message = await update.message.reply_text("Generating your image, please wait a moment...")
 
-            # The md_to_image function is now asynchronous
-            await md_to_image(md_text=md_content, output_path=output_path, theme='formal_code')
+            await md_to_image(md_text=markdown_input, output_path=output_file_path, theme='formal_code')
 
-            # Send the image back to the user
-            with open(output_path, 'rb') as photo:
+            with open(output_file_path, 'rb') as photo:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=photo,
                     reply_to_message_id=update.message.message_id
                 )
-            
-            await massage_block.delete()
-
+            await status_message.delete()
         except Exception as e:
             logger.error(f"Error during image generation or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while creating your image.")
-            await massage_block.delete() if massage_block else None
-
+            await status_message.delete() if status_message else None
         finally:
-            # Clean up by deleting the generated image file
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            if os.path.exists(output_file_path):
+                os.remove(output_file_path)
 
     # text2jpg command handling
     if match_text2jpg:
-        text_content = match_text2jpg.group(1).strip()
-
-        if not text_content:
+        plain_text_input = match_text2jpg.group(1).strip()
+        if not plain_text_input:
             await update.message.reply_text("Please provide some text content inside the triple quotes.")
             return
 
-        # Create a unique filename for the output image
-        output_filename = f"text_{update.message.message_id}.jpg"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        output_file_name = f"text_{update.message.message_id}.jpg"
+        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
-        massage_block = None
+        status_message = None
         try:
-            massage_block = await update.message.reply_text("Converting your text to markdown, please wait a moment...")
+            status_message = await update.message.reply_text("Converting your text to markdown, please wait a moment...")
 
-            # Convert plain text to markdown
-            markdown_content = await plain_text_to_markdown(text_content, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME)
+            generated_markdown = await plain_text_to_markdown(
+                plain_text_input, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME
+            )
 
+            await status_message.edit_text("Generating your image from markdown, please wait a moment...")
 
-            # Let the user know the process has started, change the massage of massage_block
-            await massage_block.edit_text("Generating your image from markdown, please wait a moment...")
+            await md_to_image(md_text=generated_markdown, output_path=output_file_path, theme='formal_code')
 
-            # The md_to_image function is now asynchronous
-            await md_to_image(md_text=markdown_content, output_path=output_path, theme='formal_code')
-
-            # Send the image back to the user
-            with open(output_path, 'rb') as photo:
+            with open(output_file_path, 'rb') as photo:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=photo,
                     reply_to_message_id=update.message.message_id
                 )
-
-            await massage_block.delete()
-
+            await status_message.delete()
         except Exception as e:
             logger.error(f"Error during image generation or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while creating your image.")
-            await massage_block.delete() if massage_block else None
-
+            await status_message.delete() if status_message else None
         finally:
-            # Clean up by deleting the generated image file
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            if os.path.exists(output_file_path):
+                os.remove(output_file_path)
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle document messages to convert .txt or .md files to image."""
+
+# Handle .txt or .md files to render as image
+async def handle_text_or_markdown_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle .txt or .md files to render as image."""
     if not update.message or not update.message.document:
         return
 
-    file = update.message.document
+    document_file = update.message.document
+    is_already_markdown = document_file.file_name.endswith('.md')
 
-    skip_convert = False
-    if file.file_name.endswith('.md'):
-        skip_convert = True
+    if document_file.file_name.endswith(('.txt', '.md')):
+        tg_file = await document_file.get_file()
+        downloaded_path = await tg_file.download_to_drive(
+            custom_path=os.path.join(OUTPUT_DIR, document_file.file_name)
+        )
 
-    if file.file_name.endswith(('.txt', '.md')):
-        # Download the file
-        telegram_file = await file.get_file()
-        file_path = await telegram_file.download_to_drive(custom_path=os.path.join(OUTPUT_DIR, file.file_name))
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        with open(downloaded_path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
 
-        # Create a unique filename for the output image
-        output_filename = f"file_{update.message.message_id}.jpg"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        output_file_name = f"file_{update.message.message_id}.jpg"
+        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
-        massage_block = None
+        status_message = None
         try:
-            massage_block = await update.message.reply_text("Converting your file to markdown, please wait a moment...")
+            status_message = await update.message.reply_text("Converting your file to markdown, please wait a moment...")
 
-            # Convert plain text to markdown
-            if not skip_convert:
-                markdown_content = await plain_text_to_markdown(content, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME)
+            if not is_already_markdown:
+                generated_markdown = await plain_text_to_markdown(
+                    file_content, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME
+                )
             else:
-                markdown_content = content
+                generated_markdown = file_content
 
-            # Let the user know the process has started, change the massage of massage_block
-            await massage_block.edit_text("Generating your image from markdown, please wait a moment...")
+            await status_message.edit_text("Generating your image from markdown, please wait a moment...")
 
-            # The md_to_image function is now asynchronous
-            await md_to_image(md_text=markdown_content, output_path=output_path, theme='formal_code')
+            await md_to_image(md_text=generated_markdown, output_path=output_file_path, theme='formal_code')
 
-            # Send the image back to the user
-            with open(output_path, 'rb') as photo:
+            with open(output_file_path, 'rb') as photo:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=photo,
                     reply_to_message_id=update.message.message_id
                 )
-
-            await massage_block.delete()
-
+            await status_message.delete()
         except Exception as e:
             logger.error(f"Error during image generation or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while creating your image.")
-            await massage_block.delete() if massage_block else None
-
+            await status_message.delete() if status_message else None
         finally:
-            # Clean up by deleting the generated image file and downloaded file
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            if os.path.exists(output_file_path):
+                os.remove(output_file_path)
+            if os.path.exists(downloaded_path):
+                os.remove(downloaded_path)
 
-async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles text messages in groups for potential replies."""
+
+# Handle Group AI Replies
+async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle group messages and occasionally reply using AI."""
     if not update.message or not update.message.text:
         return
 
     chat_id = update.effective_chat.id
-    text = update.message.text
+    message_text = update.message.text
 
-    # Add current message to history with username
-    print(f"Adding message to history for chat {update.effective_user.full_name}: {text}")
-    #message_history[chat_id].append(
-    #    f"username: {update.effective_user.full_name} \n content: {text}"
-    #)
+    print(f"Adding message to history for chat {update.effective_user.full_name}: {message_text}")
     await add_message(
         chat_id=chat_id,
         username=update.effective_user.full_name,
-        content=text
+        content=message_text
     )
 
     is_reply_to_bot = False
@@ -231,15 +223,11 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         is_reply_to_bot = True
         logger.info(f"User {update.effective_user.full_name} replied to the bot.")
 
-
-    # Randomly decide whether to check for a reply to avoid spamming
-    # 1 in 2 chance to consider replying, unless it's a reply to the bot.
+    # 1 in 5 chance to consider replying, unless it's a reply to the bot.
     if not is_reply_to_bot and random.randint(1, 5) != 1:
         return
 
-    # Call the AI to see if we should reply
-    reply_content = await should_reply_and_generate(
-        #message_history=list(message_history[chat_id]),
+    ai_reply = await should_reply_and_generate(
         message_history=await get_messages(chat_id),
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
         api_key=AZURE_OPENAI_API_KEY,
@@ -248,75 +236,71 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         is_reply_to_bot=is_reply_to_bot
     )
 
-    if reply_content:
-        #message_history[chat_id].append(f"Mioo Bot: {reply_content}")
+    if ai_reply:
         await add_message(
             chat_id=chat_id,
             username="mioo_bot",
-            content=reply_content
+            content=ai_reply
         )
         try:
-            await update.message.reply_text(reply_content)
+            await update.message.reply_text(ai_reply)
         except Exception as e:
             logger.error(f"Error sending AI reply: {e}")
 
-
-async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle all text messages to download YouTube videos."""
+# Handle text messages: download YouTube videos, else pass to group AI handler
+async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages: download YouTube videos, else pass to group AI handler."""
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text.strip()
-    # This regex is more robust for finding YouTube URLs anywhere in the message
-    youtube_regex = (
-        r'(https?://)?(www\.)?'
-        r'(youtube\.com/|youtu\.be/|youtube-nocookie\.com/)'
-        r'(?:watch\?v=|embed/|v/|shorts/|live/)?'
-        r'([a-zA-Z0-9_-]{11})'
-    )
+    message_text = update.message.text.strip()
+    youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
+    bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
 
-    match = re.search(youtube_regex, text)
+    match = youtube_match or bilibili_match
 
-    if not match:
-        # If not a youtube link, and it's a group chat, let the group handler deal with it
+    if match:
+        if youtube_match:
+            youtube_url = youtube_match.group(0)
+        elif bilibili_match:
+            youtube_url = bilibili_match.group(0)
+        else:
+            logger.error("No valid YouTube or Bilibili URL found in the message.")
+            return
+
+        status_message = None
+        try:
+            status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
+
+            video_title = await get_video_title(youtube_url)
+            output_file_name = f"{video_title}_{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
+            output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
+
+            await download_video_720p_h264(youtube_url, output_path=output_file_path)
+
+            await status_message.edit_text("Download completed successfully. Sending the video...")
+
+            with open(output_file_path, 'rb') as video:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=video,
+                    reply_to_message_id=update.message.message_id,
+                    caption=f'{video_title}\n<a href="{youtube_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
+                    parse_mode=ParseMode.HTML
+                )
+            await status_message.delete()
+            await update.message.delete()
+            if os.path.exists(output_file_path):
+                os.remove(output_file_path)
+        except Exception as e:
+            logger.error(f"Error during video download or sending: {e}")
+            await update.message.reply_text("Sorry, I encountered an error while downloading your video.")
+            await status_message.delete() if status_message else None
+    else:
         if update.effective_chat.type in ['group', 'supergroup']:
-            logger.info(f"Non-YouTube message in group chat: {text}")
-            await handle_group_text(update, context)
+            logger.info(f"Non-YouTube message in group chat: {message_text}")
+            await handle_group_ai_reply(update, context)
         return
-
-    youtube_url = match.group(0) # The matched URL
-
-    massage_block = None
-    try:
-        massage_block = await update.message.reply_text("Downloading your video, please wait a moment...")
-
-        title = await get_video_title(youtube_url)
-        output_filename = f"{title}_{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        # Call the download function
-        await download_video_720p_h264(youtube_url, output_path=output_path)
-
-        await massage_block.edit_text("Download completed successfully. Sending the video...")
-
-        # Send the video back to the user
-        with open(output_path, 'rb') as video:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=video,
-                reply_to_message_id=update.message.message_id,
-                caption=f'{title}\n<a href="{youtube_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
-                parse_mode=ParseMode.HTML
-            )
-        await massage_block.delete()
-        # delete the link message
-        await update.message.delete()
-        # delete the downloaded video file
-        if os.path.exists(output_path):
-            os.remove(output_path)
-    except Exception as e:
-        logger.error(f"Error during video download or sending: {e}")
-        await update.message.reply_text("Sorry, I encountered an error while downloading your video.")
-        await massage_block.delete() if massage_block else None
 
 
 
@@ -332,18 +316,15 @@ def main() -> None:
     # on different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
 
-    # on non command i.e message - echo the message on Telegram
-    application.add_handler(CommandHandler("md2jpg", handle_message))
-    application.add_handler(CommandHandler("text2jpg", handle_message))
+    # Commands for rendering to image
+    application.add_handler(CommandHandler("md2jpg", handle_md2jpg_and_text2jpg))
+    application.add_handler(CommandHandler("text2jpg", handle_md2jpg_and_text2jpg))
 
-    # on file with .txt or .md extension - convert to image
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    # Documents (.txt, .md)
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_text_or_markdown_document))
 
-    # on youtube video download command - download video
-    # This handler now also routes non-command, non-youtube-link messages from groups to the new group handler.
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text))
-
-    # application.add_handler(MessageHandler(filters.TEXT, handle_message))
+    # General text: YouTube downloads or group AI replies
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_youtube_or_group))
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling()

@@ -76,7 +76,8 @@ async def get_video_title(url: str) -> Union[str, None]:
 
 if __name__ == '__main__':
     # Replace with the URL of the video you want to download
-    video_url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+    # video_url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+    video_url = 'https://b23.tv/Enqggyo'
     
     async def main():
         # Example of downloading
@@ -86,5 +87,7 @@ if __name__ == '__main__':
         title = await get_video_title(video_url)
         if title:
             print(f"Video Title: {title}")
+        
+        await download_video_720p_h264(video_url, output_path=f'output/{title}.mp4')
 
     asyncio.run(main())

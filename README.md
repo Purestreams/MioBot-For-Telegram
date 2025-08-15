@@ -5,7 +5,7 @@
 MioBot 是一个异步 Telegram 机器人，提供以下功能：  
 - 将内联 Markdown 或纯文本转换为图片。  
 - 支持上传 `.txt` / `.md` 文件并转成图片。  
-- 识别消息里的 YouTube 链接并下载 720p H.264 MP4。  
+- 识别消息里的 YouTube 以及 Bilibili 链接并下载 720p H.264 MP4。  
 - 在群聊中根据最近上下文与随机概率（或被直接回复时必定）的一位“猫娘”Bot。  
 - 使用 SQLite 保存消息，每次API Call使用最近最多 100 条群消息，供上下文生成回复。  
 - 基于 Azure OpenAI（自定义部署模型）完成文本格式化与对话生成。  
@@ -52,8 +52,8 @@ More examples in [output/](output/).
 ### 2. File Conversion  
 Upload a `.txt` (will be converted first) or `.md` (used as-is). Bot returns an image.
 
-### 3. YouTube Video Download  
-Paste (no command needed) a YouTube URL (supports `watch`, `shorts`, `youtu.be`, etc.).  
+### 3. YouTube and Bilibili Video Download  
+Paste (no command needed) a YouTube URL (supports `watch`, `shorts`, `youtu.be`, etc.) and a Bilibili URL (supports `bilibili.com` and `b23.tv`).
 Handled in [`main.handle_all_text`](main.py) which calls:
 - [`app.youtube_dl.get_video_title`](app/youtube_dl.py)
 - [`app.youtube_dl.download_video_720p_h264`](app/youtube_dl.py)

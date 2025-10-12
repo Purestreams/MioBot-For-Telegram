@@ -19,7 +19,7 @@ from app.youtube_dl import download_video_720p_h264, get_video_title
 from app.reply2message import should_reply_and_generate
 from app.database import init_db, add_message, get_messages
 
-from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price
+from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price, get_Price_Coinbase
 
 
 AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_KEY = secret.pass_secret_variables()
@@ -315,7 +315,8 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     try:
-        prices = await get_Price(["BTC", "ETH", "SOL"])
+        #prices = await get_Price(["BTC", "ETH", "SOL"])
+        prices = await get_Price_Coinbase(["SOL", "USDC", "BTC", "ETH", "USDT"])
         allez_sol_apr = await get_Allez_APR()
         allez_usdc_apr = await get_Allez_USDC_APR()
 
@@ -326,7 +327,7 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
         allez_sol_message = "\n\nAllez SOL APR Info:\n" + "\n".join(allez_sol_lines)
 
         allez_usdc_lines = [f"{key}: {value}" for key, value in allez_usdc_apr.items()]
-        allez_usdc_message = "\n\nAllez USDC APR Info:\n" + "\n".join(allez_usdc_lines)
+        allez_usdc_message = "\n\n <a href='https://kamino.com/lend/allez-usdc'>Allez USDC<\a> APR Info:\n" + "\n".join(allez_usdc_lines)
 
         full_message = price_message + allez_sol_message + allez_usdc_message
 

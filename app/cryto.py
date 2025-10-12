@@ -67,8 +67,28 @@ async def get_Price(list_tokens: list) -> dict:
     output = []
     for item in full_data:
         if isinstance(item, dict) and item.get("token") in list_tokens:
+            #print(item)
             output.append(item)
+
+        if len(output) == len(list_tokens):
+            break
+    
     return {item["token"]: round(float(item["usdPrice"]), 3) for item in output}
+
+
+async def get_Price_Coinbase(list_tokens: list) -> dict:
+    url = "https://api.coinbase.com/v2/prices"
+    output = {}
+    for token in list_tokens:
+        try:
+            resp = await _aget(f"{url}/{token}-USD/spot")
+            data = resp.json()  # Expected: { data: { base, currency, amount } }
+            amount = data.get("data", {}).get("amount")
+            if amount is not None:
+                output[token] = round(float(amount), 3)
+        except Exception as e:
+            print(f"Error fetching price for {token}: {e}")
+    return output
 
 
 async def get_Allez_APR() -> dict:
@@ -128,6 +148,9 @@ async def main():
     try:
         prices = await get_Price(tokens)
         print(prices)
+
+        prices_coinbase = await get_Price_Coinbase(tokens)
+        print(prices_coinbase)
 
         allez_apr = await get_Allez_APR()
         print(allez_apr)

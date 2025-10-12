@@ -324,10 +324,10 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
         price_message = "Current Crypto Prices:\n" + "\n".join(price_lines)
 
         allez_sol_lines = [f"{key}: {value}" for key, value in allez_sol_apr.items()]
-        allez_sol_message = "\n\nAllez SOL APR Info:\n" + "\n".join(allez_sol_lines)
+        allez_sol_message = "\n\n <a href=\"https://kamino.com/lend/allez-sol\">Allez SOL</a> APR Info:\n" + "\n".join(allez_sol_lines)
 
         allez_usdc_lines = [f"{key}: {value}" for key, value in allez_usdc_apr.items()]
-        allez_usdc_message = "\n\n <a href='https://kamino.com/lend/allez-usdc'>Allez USDC<\a> APR Info:\n" + "\n".join(allez_usdc_lines)
+        allez_usdc_message = '\n\n <a href="https://kamino.com/lend/allez-usdc">Allez USDC</a> APR Info:\n' + "\n".join(allez_usdc_lines)
 
         full_message = price_message + allez_sol_message + allez_usdc_message
 

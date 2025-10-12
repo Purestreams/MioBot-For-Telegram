@@ -317,6 +317,8 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         #prices = await get_Price(["BTC", "ETH", "SOL"])
         prices = await get_Price_Coinbase(["SOL", "USDC", "BTC", "ETH", "USDT"])
+        # Sort of prices by key
+        prices = dict(sorted(prices.items()))
         allez_sol_apr = await get_Allez_APR()
         allez_usdc_apr = await get_Allez_USDC_APR()
 

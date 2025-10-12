@@ -331,8 +331,7 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
 
         full_message = price_message + allez_sol_message + allez_usdc_message
 
-        await update.message.reply_text(full_message)
-
+        await update.message.reply_text(full_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Error fetching crypto prices: {e}")
         await update.message.reply_text("Sorry, I encountered an error while fetching crypto prices.")

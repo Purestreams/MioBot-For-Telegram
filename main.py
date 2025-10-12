@@ -19,6 +19,8 @@ from app.youtube_dl import download_video_720p_h264, get_video_title
 from app.reply2message import should_reply_and_generate
 from app.database import init_db, add_message, get_messages
 
+from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price
+
 
 AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_KEY = secret.pass_secret_variables()
 OUTPUT_DIR = "output"
@@ -303,6 +305,36 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
         return
 
 
+async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    '''
+    the get_crypto_prices, get_Allez_APR, get_Allez_USDC_APR will return something like:
+    {'SOL': 181.888, 'ETH': 3827.993, 'BTC': 398.588, 'USDC': 1.0, 'USDT': 1.0}
+    {'name': 'Allez SOL', 'APR_24H': '11.65%', 'APR_7D': '6.33%', 'APR_30D': '5.78%', 'APR_90D': '5.88%', 'Total_Supply': '10.43M'}
+    {'name': 'Allez USDC', 'APR_24H': '3.57%', 'APR_7D': '4.61%', 'APR_30D': '5.01%', 'APR_90D': '10.85%', 'Total_Supply': '59.94M'}'''
+    if not update.message:
+        return
+    
+    try:
+        prices = await get_Price(["BTC", "ETH", "SOL"])
+        allez_sol_apr = await get_Allez_APR()
+        allez_usdc_apr = await get_Allez_USDC_APR()
+
+        price_lines = [f"{token}: ${price}" for token, price in prices.items()]
+        price_message = "Current Crypto Prices:\n" + "\n".join(price_lines)
+
+        allez_sol_lines = [f"{key}: {value}" for key, value in allez_sol_apr.items()]
+        allez_sol_message = "\n\nAllez SOL APR Info:\n" + "\n".join(allez_sol_lines)
+
+        allez_usdc_lines = [f"{key}: {value}" for key, value in allez_usdc_apr.items()]
+        allez_usdc_message = "\n\nAllez USDC APR Info:\n" + "\n".join(allez_usdc_lines)
+
+        full_message = price_message + allez_sol_message + allez_usdc_message
+
+        await update.message.reply_text(full_message)
+
+    except Exception as e:
+        logger.error(f"Error fetching crypto prices: {e}")
+        await update.message.reply_text("Sorry, I encountered an error while fetching crypto prices.")
 
 def main() -> None:
     """Start the bot."""
@@ -326,6 +358,8 @@ def main() -> None:
     # General text: YouTube downloads or group AI replies
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_youtube_or_group))
 
+    # Cryto info command
+    application.add_handler(CommandHandler("crypto", handle_crypto_command))
     # Run the bot until the user presses Ctrl-C
     application.run_polling()
 

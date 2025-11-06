@@ -584,6 +584,7 @@ async def generate_jpg_from_med_json(
         output_jpg,
     ):
     generate_pdf_path = await generate_pdf(json_input, None)
+    print(f"Generated PDF path: {generate_pdf_path}")
     if not generate_pdf_path:
         return False
     jpg_path = await generate_jpg(generate_pdf_path, output_jpg)

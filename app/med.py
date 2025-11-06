@@ -17,8 +17,11 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 import random
+import logging
 
 from openai import AsyncAzureOpenAI
+
+logger = logging.getLogger(__name__)
 
 def generate_macro_tex(data):
     """Generate macro.tex content from JSON data"""
@@ -257,8 +260,8 @@ async def generate_pdf(json_input, output_pdf=None):
     images_dir = script_dir / 'data'
 
     if not images_dir.exists():
-        print(f"Warning: images directory not found at {images_dir}")
-        print("The PDF generation may fail if images are required.")
+        logger.warning("images directory not found at %s", images_dir)
+        logger.warning("The PDF generation may fail if images are required.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -288,8 +291,8 @@ async def generate_pdf(json_input, output_pdf=None):
                         stderr=asyncio.subprocess.PIPE
                     )
                 except FileNotFoundError:
-                    print("Error: xelatex not found. Please install TeX Live or similar LaTeX distribution.")
-                    print("On Ubuntu/Debian: sudo apt-get install texlive-xetex texlive-latex-extra")
+                    logger.error("xelatex not found. Please install TeX Live or similar LaTeX distribution.")
+                    logger.info("On Ubuntu/Debian: sudo apt-get install texlive-xetex texlive-latex-extra")
                     return False
 
                 try:
@@ -297,36 +300,36 @@ async def generate_pdf(json_input, output_pdf=None):
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.communicate()
-                    print("Error: LaTeX compilation timed out")
+                    logger.error("LaTeX compilation timed out")
                     return False
 
                 last_stdout = stdout_bytes.decode('utf-8', 'ignore')
                 last_stderr = stderr_bytes.decode('utf-8', 'ignore')
 
                 if process.returncode != 0 and i == 1:
-                    print("Error compiling LaTeX:")
+                    logger.error("Error compiling LaTeX:")
                     if last_stdout:
-                        print(last_stdout)
+                        logger.error(last_stdout)
                     if last_stderr:
-                        print(last_stderr)
+                        logger.error(last_stderr)
                     return False
 
             src_pdf = tmpdir_path / 'main.pdf'
             if src_pdf.exists():
                 await _ensure_dir_async(output_path.parent)
                 await _copy_async(src_pdf, output_path)
-                print(f"PDF generated successfully: {output_path}")
+                logger.info("PDF generated successfully: %s", output_path)
                 return output_path
 
-            print("Error: PDF file was not generated")
+            logger.error("PDF file was not generated")
             if last_stdout:
-                print(last_stdout)
+                logger.error(last_stdout)
             if last_stderr:
-                print(last_stderr)
+                logger.error(last_stderr)
             return False
 
         except Exception as e:
-            print(f"Error during compilation: {e}")
+            logger.error("Error during compilation: %s", e)
             return False
 
 sample_input = {
@@ -505,18 +508,18 @@ async def generate_jpg(pdf_path, jpg_output=None, *, quality=30, ppi=150):
     """Generate a JPG from the first page of the given PDF using ImageMagick."""
     src_path = Path(pdf_path)
     if not src_path.exists():
-        print(f"Error: source PDF not found at {src_path}")
+        logger.error("Source PDF not found at %s", src_path)
         return False
 
     if jpg_output is None:
         jpg_output = src_path.with_suffix('.jpg')
 
     if quality <= 0 or quality > 100:
-        print("Error: quality must be within 1-100")
+        logger.error("Quality must be within 1-100")
         return False
 
     if ppi <= 0:
-        print("Error: ppi must be positive")
+        logger.error("ppi must be positive")
         return False
 
     output_path = Path(jpg_output)
@@ -535,7 +538,7 @@ async def generate_jpg(pdf_path, jpg_output=None, *, quality=30, ppi=150):
             stderr=asyncio.subprocess.PIPE
         )
     except FileNotFoundError:
-        print("Error: ImageMagick 'magick' command not found. Please install ImageMagick to enable JPG generation.")
+        logger.error("ImageMagick 'magick' command not found. Please install ImageMagick to enable JPG generation.")
         return False
 
     try:
@@ -543,34 +546,34 @@ async def generate_jpg(pdf_path, jpg_output=None, *, quality=30, ppi=150):
     except asyncio.TimeoutError:
         process.kill()
         await process.communicate()
-        print("Error: JPG conversion timed out")
+        logger.error("JPG conversion timed out")
         return False
 
     stdout_text = stdout_bytes.decode('utf-8', 'ignore')
     stderr_text = stderr_bytes.decode('utf-8', 'ignore')
 
     if process.returncode != 0:
-        print("Error converting PDF to JPG:")
+        logger.error("Error converting PDF to JPG:")
         if stdout_text:
-            print(stdout_text)
+            logger.error(stdout_text)
         if stderr_text:
-            print(stderr_text)
+            logger.error(stderr_text)
         return False
 
     if stdout_text:
-        print(stdout_text)
+        logger.info(stdout_text)
     if stderr_text:
-        print(stderr_text)
+        logger.info(stderr_text)
 
-    print(f"JPG generated successfully: {output_path}")
+    logger.info("JPG generated successfully: %s", output_path)
 
     # Delete the PDF after successful JPG generation when paths differ
     if src_path != output_path:
         try:
             src_path.unlink()
-            print(f"Deleted temporary PDF file: {src_path}")
+            logger.info("Deleted temporary PDF file: %s", src_path)
         except Exception as e:
-            print(f"Warning: could not delete temporary PDF file: {e}")
+            logger.warning("Could not delete temporary PDF file: %s", e)
 
     return output_path
 
@@ -584,7 +587,7 @@ async def generate_jpg_from_med_json(
         output_jpg,
     ):
     generate_pdf_path = await generate_pdf(json_input, None)
-    print(f"Generated PDF path: {generate_pdf_path}")
+    logger.info("Generated PDF path: %s", generate_pdf_path)
     if not generate_pdf_path:
         return False
     jpg_path = await generate_jpg(generate_pdf_path, output_jpg)
@@ -609,7 +612,7 @@ async def main():
         }
         missing = [name for name, value in env_map.items() if not value]
         if missing:
-            print(f"Error: missing Azure OpenAI configuration environment variables: {', '.join(missing)}")
+            logger.error("Missing Azure OpenAI configuration environment variables: %s", ', '.join(missing))
             return 1
 
         try:
@@ -621,7 +624,7 @@ async def main():
                 env_map["AZURE_OPENAI_DEPLOYMENT_NAME"],
             )
         except Exception as exc:
-            print(f"Error generating prescription JSON: {exc}")
+            logger.error("Error generating prescription JSON: %s", exc)
             return 1
 
     pdf_path = await generate_pdf(data, output_pdf)

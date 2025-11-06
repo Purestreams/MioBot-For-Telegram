@@ -21,6 +21,33 @@ import logging
 
 from openai import AsyncAzureOpenAI
 
+try:
+    import pypdfium2 as pdfium
+except ImportError:  # pragma: no cover - optional dependency lookup
+    pdfium = None
+async def _latex_resource_exists(resource: str) -> bool:
+    """Check whether a LaTeX resource can be located via kpsewhich."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            'kpsewhich',
+            resource,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        logger.warning("kpsewhich not found; skipping LaTeX dependency check for %s", resource)
+        return True  # assume available so existing behaviour continues
+
+    stdout_bytes, stderr_bytes = await process.communicate()
+
+    if process.returncode != 0:
+        stderr_text = stderr_bytes.decode('utf-8', 'ignore').strip()
+        if stderr_text:
+            logger.debug("kpsewhich error for %s: %s", resource, stderr_text)
+        return False
+
+    return bool(stdout_bytes.decode('utf-8', 'ignore').strip())
+
 logger = logging.getLogger(__name__)
 
 def generate_macro_tex(data):
@@ -262,6 +289,11 @@ async def generate_pdf(json_input, output_pdf=None):
     if not images_dir.exists():
         logger.warning("images directory not found at %s", images_dir)
         logger.warning("The PDF generation may fail if images are required.")
+
+    has_ctex = await _latex_resource_exists('ctexart.cls')
+    if not has_ctex:
+        logger.error("Required LaTeX class 'ctexart.cls' not found. Install a TeX Live distribution with Chinese support (e.g., texlive-full or texlive-lang-chinese).")
+        return False
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -505,7 +537,7 @@ Sample real JSON:
 
 
 async def generate_jpg(pdf_path, jpg_output=None, *, quality=30, ppi=150):
-    """Generate a JPG from the first page of the given PDF using ImageMagick."""
+    """Generate a JPG from the first page of the given PDF using pypdfium2."""
     src_path = Path(pdf_path)
     if not src_path.exists():
         logger.error("Source PDF not found at %s", src_path)
@@ -525,45 +557,32 @@ async def generate_jpg(pdf_path, jpg_output=None, *, quality=30, ppi=150):
     output_path = Path(jpg_output)
     await _ensure_dir_async(output_path.parent)
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            'magick',
-            '-density', str(ppi),
-            str(src_path) + '[0]',
-            '-quality', str(quality),
-            '-units', 'PixelsPerInch',
-            '-flatten',
-            str(output_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-    except FileNotFoundError:
-        logger.error("ImageMagick 'magick' command not found. Please install ImageMagick to enable JPG generation.")
+    if pdfium is None:
+        logger.error("Python package 'pypdfium2' is required for JPG generation. Install it with 'pip install pypdfium2'.")
         return False
 
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
-        logger.error("JPG conversion timed out")
+    async def _render_first_page() -> bool:
+        def _render() -> bool:
+            try:
+                doc = pdfium.PdfDocument(str(src_path))
+                page = doc.get_page(0)
+                scale = max(ppi / 72, 1)
+                bitmap = page.render(scale=scale)
+                image = bitmap.to_pil()
+                image = image.convert('RGB')
+                image.save(output_path, format='JPEG', quality=quality, optimize=True, dpi=(ppi, ppi))
+                page.close()
+                doc.close()
+                return True
+            except Exception as exc:  # pragma: no cover - error path logging
+                logger.error("Error converting PDF to JPG: %s", exc)
+                return False
+
+        return await asyncio.to_thread(_render)
+
+    success = await _render_first_page()
+    if not success:
         return False
-
-    stdout_text = stdout_bytes.decode('utf-8', 'ignore')
-    stderr_text = stderr_bytes.decode('utf-8', 'ignore')
-
-    if process.returncode != 0:
-        logger.error("Error converting PDF to JPG:")
-        if stdout_text:
-            logger.error(stdout_text)
-        if stderr_text:
-            logger.error(stderr_text)
-        return False
-
-    if stdout_text:
-        logger.info(stdout_text)
-    if stderr_text:
-        logger.info(stderr_text)
 
     logger.info("JPG generated successfully: %s", output_path)
 

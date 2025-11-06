@@ -360,6 +360,8 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         # Convert the generated prescription data straight to JPG
         jpg_path = await generate_jpg_from_med_json(json_prompt, output_file_path)
+        if not jpg_path or not os.path.exists(jpg_path):
+            raise FileNotFoundError(f"MED JPG not created at {jpg_path}")
 
         with open(jpg_path, 'rb') as photo:
             await context.bot.send_document(

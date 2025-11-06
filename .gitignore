@@ -218,4 +218,6 @@ __marimo__/
 # sqlite
 *.db
 
-#
+#output/prescription*
+
+output/prescription*

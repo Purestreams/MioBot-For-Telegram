@@ -1,400 +1,635 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Generate a prescription PDF from a JSON file.
+Prescription Generator - Generate prescription PDF from JSON input
 
 Usage:
-  python prescription_template.py input.json output.pdf
-
-Notes:
-- For Chinese characters, provide a CJK font file (e.g., NotoSansCJKsc-Regular.otf or SimSun.ttf)
-  via --font path/to/font.ttf or the JSON field header.font_path.
-- This template is for demonstration only and not a real medical document.
+    python3 prescription_generator.py input.json [output.pdf]
+    
+If output.pdf is not specified, it defaults to 'prescription.pdf'
 """
 
-import argparse
+import asyncio
 import json
 import os
+import sys
+import tempfile
+import shutil
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from pathlib import Path
+import random
 
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.pagesizes import A4, A5
-from reportlab.lib.units import mm
-from reportlab.lib import colors
+from openai import AsyncAzureOpenAI
 
+def generate_macro_tex(data):
+    """Generate macro.tex content from JSON data"""
+    patient = data.get('patient', {})
+    date_info = patient.get('date', {})
+    doctor = data.get('doctor', {})
+    
+    # Use current date if not specified
+    now = datetime.now()
+    year = date_info.get('year') or str(now.year)
+    month = date_info.get('month') or str(now.month)
+    day = date_info.get('day') or str(now.day)
+    
+    macro_content = f"""% User Defined Values
 
-def register_font(font_path: Optional[str]) -> str:
-    """
-    Register a font for multilingual text. Returns the font name to use.
-    """
-    if font_path and os.path.exists(font_path):
-        font_name = "CJKMain"
-        try:
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
-            return font_name
-        except Exception as e:
-            print(f"[warn] Failed to register font at {font_path}: {e}. Falling back to Helvetica.")
-    # Fallback; may not render CJK properly
-    return "Helvetica"
+\\newcommand{{\\textHospitalName}}{{{data.get('hospital_name', '深圳市罗湖区人民医院')}}}
+\\newcommand{{\\textPatientName}}{{{patient.get('name', '')}}}
+\\newcommand{{\\textPatientGender}}{{{patient.get('gender', '女')}}}
+\\newcommand{{\\textPatientAge}}{{{patient.get('age', '')}}}
+\\newcommand{{\\textPatientDep}}{{{patient.get('department', '')}}}
+\\newcommand{{\\textPatientID}}{{{patient.get('id', '')}}}
+\\newcommand{{\\textPatientFeeType}}{{{patient.get('fee_type', '自费')}}}
+\\newcommand{{\\textPatientDateYear}}{{{year}}}
+\\newcommand{{\\textPatientDateMonth}}{{{month}}}
+\\newcommand{{\\textPatientDateDay}}{{{day}}}
+\\newcommand{{\\textPatientDiag}}{{{patient.get('diagnosis', '')}}}
+\\newcommand{{\\textDoctorName}}{{{doctor.get('name', '')}}}
+\\newcommand{{\\textFee}}{{{doctor.get('fee', '')}}}
 
+% Warning: Set this value to blank may be criminal in some countries and regions.
+\\newcommand{{\\textWatermark}}{{{data.get('watermark', 'test')}}}
 
-def ensure_page_size(name: Optional[str]):
-    """
-    Return a reportlab page size by common name.
-    """
-    if not name:
-        return A5  # closer to the example size
-    name = str(name).strip().upper()
-    if name == "A4":
-        return A4
-    if name == "A5":
-        return A5
-    # default
-    return A5
+% End
 
-
-def draw_checkbox(c: canvas.Canvas, x: float, y: float, label: str, checked: bool, font_name: str, font_size: int = 9):
-    box_size = 4.2 * mm
-    c.setLineWidth(0.7)
-    c.rect(x, y - box_size, box_size, box_size)
-    if checked:
-        c.setStrokeColor(colors.black)
-        c.line(x + 0.8 * mm, y - box_size + 0.8 * mm, x + box_size - 0.8 * mm, y - 0.8 * mm)
-        c.line(x + box_size - 0.8 * mm, y - box_size + 0.8 * mm, x + 0.8 * mm, y - 0.8 * mm)
-    c.setFont(font_name, font_size)
-    c.drawString(x + box_size + 1.2 * mm, y - box_size + 0.6 * mm, label)
-
-
-def text_wrap(c: canvas.Canvas, text: str, max_width: float, font_name: str, font_size: int) -> List[str]:
-    """
-    Simple word-based wrapping for Latin text; for CJK, splits by character.
-    """
-    if not text:
-        return []
-    c.setFont(font_name, font_size)
-    # Heuristic: if contains CJK, split by char
-    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in text)
-    if has_cjk:
-        lines, cur, cur_w = [], "", 0
-        for ch in text:
-            w = pdfmetrics.stringWidth(ch, font_name, font_size)
-            if cur_w + w <= max_width:
-                cur += ch
-                cur_w += w
-            else:
-                if cur:
-                    lines.append(cur)
-                cur, cur_w = ch, w
-        if cur:
-            lines.append(cur)
-        return lines
-    else:
-        words = text.split()
-        lines, cur = [], ""
-        for w in words:
-            test = (cur + " " + w).strip()
-            if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
-                cur = test
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-        return lines
+\\newcommand{{\\styleNormalText}}{{\\songti \\fontsize{{15}}{{15}} \\selectfont }}
+\\newcommand{{\\blockUnderlinedText}}[1]
+    {{\\uline{{\\space\\space #1 \\space\\space}}}}
+\\newcommand{{\\blockRSign}}
+    {{{{\\bfseries \\sffamily \\fontsize{{40}}{{40}} \\selectfont \\; R.}}}}
+\\newcommand{{\\blockMedicine}}[3]{{
+    {{
+        \\LARGE #1
+        \\hfill
+        \\large #2
+        \\hfill
+    }}
+    \\\\
+    \\hspace*{{1cm}}
+    {{
+        \\large 用法: #3
+    }}
+}}"""
+    return macro_content
 
 
-def draw_header(c: canvas.Canvas, data: Dict[str, Any], font_name: str, page_w: float, top_y: float) -> float:
-    header = data.get("header", {})
-    left_logo_path = header.get("logo_left_path")
-    right_logo_path = header.get("logo_right_path")
-    title = header.get("title", "处方笺")
-    hospital = header.get("hospital", "")
-    affiliation = header.get("affiliation", "")
-    number = header.get("no", "")
+def generate_medicine_tex(data):
+    """Generate medicine.tex content from JSON data"""
+    medicines = data.get('medicines', [])
+    
+    medicine_blocks = []
+    for med in medicines:
+        name = med.get('name', '')
+        quantity = med.get('quantity', '')
+        usage = med.get('usage', '')
+        
+        block = f"""\\blockMedicine{{
+    {name} % 药品名称
+}}
+{{
+    {quantity} % 药品数量
+}}
+{{
+    {usage} % 药品用法
+}}"""
+        medicine_blocks.append(block)
+    
+    return '\n\n'.join(medicine_blocks)
 
-    # optional logos
-    logo_h = 12 * mm
-    margin = 15 * mm
-    y = top_y
-
-    if left_logo_path and os.path.exists(left_logo_path):
-        try:
-            c.drawImage(left_logo_path, margin, y - logo_h, height=logo_h, preserveAspectRatio=True, mask='auto')
-        except Exception as e:
-            print(f"[warn] Failed to draw left logo: {e}")
-
-    if right_logo_path and os.path.exists(right_logo_path):
-        try:
-            c.drawImage(right_logo_path, page_w - margin - 20 * mm, y - logo_h, height=logo_h, preserveAspectRatio=True, mask='auto')
-        except Exception as e:
-            print(f"[warn] Failed to draw right logo: {e}")
-
-    # Hospital and affiliation line
-    if affiliation:
-        c.setFont(font_name, 10)
-        c.drawCentredString(page_w / 2.0, y - 3 * mm, affiliation)
-        y -= 10 * mm
-    if hospital:
-        c.setFont(font_name, 18)
-        c.drawCentredString(page_w / 2.0, y - 3 * mm, hospital+title)
-        y -= 7 * mm
-
-    # Title
-    #c.setFont(font_name, 18)
-    #c.drawCentredString(page_w / 2.0, y - 2 * mm, title)
-    #y -= 14 * mm
-
-    # Number
-    if number:
-        c.setFont(font_name, 10)
-        c.drawRightString(page_w - margin, y, f"No {number}")
-
-    # horizontal rule
-    c.setLineWidth(0.6)
-    c.line(margin, y - 2 * mm, page_w - margin, y - 2 * mm)
-    return y - 10 * mm
+# random 8 digits
+random_ID = random.randint(10000000, 99999999)
 
 
-def draw_patient_section(c: canvas.Canvas, data: Dict[str, Any], font_name: str, page_w: float, cur_y: float) -> float:
-    margin = 15 * mm
-    line_h = 7 * mm
+def generate_main_tex():
+    """Generate main.tex content - static structure"""
+    main_content = r"""\documentclass[UTF8]{ctexart}
+\usepackage[T1]{fontenc}
+\usepackage{setspace}
+\usepackage{pst-barcode}
+\usepackage{tikz}
+\usepackage{draftwatermark}
+\usepackage{dashrule}
+\usepackage[normalem]{ulem}
+\usepackage[paperwidth=14.5cm,paperheight=21cm]{geometry}
+\newgeometry{top=1cm,bottom=0.5cm,left=1.5cm,right=1.5cm}
+\setlength\parindent{0pt}
+\begin{document}
+\include{macro.tex}
+\DraftwatermarkOptions{text=\heiti \fbox{\textWatermark}}
+\pagenumbering{gobble}
 
-    fee_type = data.get("fee_type", "")
-    fee_opts = ["公费", "自费", "医保", "其他"]
-    x = margin
-    c.setFont(font_name, 10)
-    c.drawString(x, cur_y, "费别:")
-    x += 12 * mm
-    for opt in fee_opts:
-        draw_checkbox(c, x, cur_y + 4.2 * mm, opt, fee_type == opt, font_name, 9)
-        x += 18 * mm
-    cur_y -= line_h
+\begin{center}
+    \LARGE \heiti \textHospitalName
+    \\
+    \Huge \heiti 处 \space 方 \space 笺
+\end{center}
 
-    patient = data.get("patient", {})
-    name = patient.get("name", "")
-    gender = patient.get("gender", "")
-    age = patient.get("age", "")
-    visit_no = patient.get("visit_no", "")
-    dept = patient.get("dept", "")
-    diagnosis = patient.get("diagnosis", "")
-    id_no = patient.get("id_no", "")
-    phone = patient.get("phone", "")
+\vspace{0.5cm}
 
-    # Row: Name, Gender, Age
-    c.drawString(margin, cur_y, f"姓名: {name}")
-    c.drawString(margin + 50 * mm, cur_y, f"性别: {gender}")
-    c.drawString(margin + 85 * mm, cur_y, f"年龄: {age}")
-    cur_y -= line_h
-
-    # Row: 门诊/住院病历号, 科别(病区/床位号)
-    c.drawString(margin, cur_y, f"门诊/住院病历号: {visit_no}")
-    c.drawString(margin + 80 * mm, cur_y, f"科别(病区/床位号): {dept}")
-    cur_y -= line_h
-
-    # Row: 临床诊断, 开具日期
-    today = data.get("date") or datetime.now().strftime("%Y-%m-%d")
-    c.drawString(margin, cur_y, f"临床诊断: {diagnosis}")
-    c.drawString(margin + 80 * mm, cur_y, f"开具日期: {today}")
-    cur_y -= line_h
-
-    # Row: 地址/电话 & 身份证/医保号
-    c.drawString(margin, cur_y, f"身份证/医保号: {id_no}")
-    c.drawString(margin + 80 * mm, cur_y, f"电话: {phone}")
-    cur_y -= line_h
-
-    # Rp label
-    c.setFont(font_name, 12)
-    c.drawString(margin, cur_y - 1 * mm, "Rp")
-    # divider line under header portion
-    c.setLineWidth(0.4)
-    c.line(margin, cur_y - 3 * mm, page_w - margin, cur_y - 3 * mm)
-    return cur_y - 7 * mm
-
-
-def format_item_line(item: Dict[str, Any]) -> str:
-    """
-    Compose a standard line for one prescription item.
-    """
-    parts = []
-    if item.get("name"):
-        parts.append(str(item["name"]))
-    if item.get("strength"):
-        parts.append(str(item["strength"]))
-    if item.get("form"):
-        parts.append(str(item["form"]))
-    if item.get("dose"):
-        parts.append(f"每次 {item['dose']}")
-    if item.get("route"):
-        parts.append(str(item["route"]))
-    if item.get("frequency"):
-        parts.append(str(item["frequency"]))
-    if item.get("days"):
-        parts.append(f"{item['days']} 天")
-    if item.get("quantity"):
-        parts.append(f"数量 {item['quantity']}")
-    if item.get("notes"):
-        parts.append(f"({item['notes']})")
-    return "  ".join(parts)
-
-
-def draw_items(c: canvas.Canvas, items: List[Dict[str, Any]], font_name: str, page_w: float, cur_y: float) -> float:
-    margin = 22 * mm  # indent to align after "Rp"
-    right_margin = 15 * mm
-    max_w = page_w - margin - right_margin
-    c.setFont(font_name, 11)
-
-    if not items:
-        c.drawString(margin, cur_y, "—")
-        return cur_y - 8 * mm
-
-    idx = 1
-    for it in items:
-        line = it.get("line") or format_item_line(it)
-        # wrap
-        lines = text_wrap(c, line, max_w, font_name, 11)
-        if not lines:
-            lines = ["—"]
-        prefix = f"{idx}."
-        first_line = f"{prefix} {lines[0]}"
-        c.drawString(margin, cur_y, first_line)
-        cur_y -= 6.5 * mm
-        for cont in lines[1:]:
-            c.drawString(margin + pdfmetrics.stringWidth(prefix + " ", font_name, 11), cur_y, cont)
-            cur_y -= 6.5 * mm
-        idx += 1
-        cur_y -= 2 * mm
-    return cur_y
-
-
-def draw_footer(c: canvas.Canvas, data: Dict[str, Any], font_name: str, page_w: float, cur_y: float):
-    margin = 15 * mm
-    c.setLineWidth(0.4)
-    c.line(margin, cur_y, page_w - margin, cur_y)
-    cur_y -= 7 * mm
-
-    doctor = data.get("doctor", {})
-    pharmacist = data.get("pharmacist", {})
-    amount = data.get("amount", "")
-
-    c.setFont(font_name, 10)
-    c.drawString(margin, cur_y, f"医师：{doctor.get('name', '')}")
-    c.drawString(margin + 50 * mm, cur_y, f"药品金额：{amount}")
-    cur_y -= 7 * mm
-
-    c.drawString(margin, cur_y, f"审核药师：{pharmacist.get('checker', '')}")
-    c.drawString(margin + 50 * mm, cur_y, f"调配药师/士：{pharmacist.get('dispenser', '')}")
-    cur_y -= 7 * mm
-
-    c.drawString(margin, cur_y, f"核对、发药药师：{pharmacist.get('verifier', '')}")
-    cur_y -= 10 * mm
-
-    c.setFont(font_name, 9)
-    c.drawCentredString(page_w / 2.0, cur_y, "处方为开具当日有效")
-    cur_y -= 6 * mm
-
-    printed_on = data.get("printed_on") or datetime.now().strftime("%Y年%m月%d日")
-    c.drawRightString(page_w - margin, cur_y, f"印制日期：{printed_on}")
-
-
-def generate_pdf(data: Dict[str, Any], out_path: str, font_path: Optional[str] = None):
-    page_size = ensure_page_size(data.get("page_size"))
-    page_w, page_h = page_size
-    c = canvas.Canvas(out_path, pagesize=page_size)
-
-    # Register font and set default font
-    if not font_path:
-        font_path = (data.get("header", {}) or {}).get("font_path")
-    font_name = register_font(font_path)
-
-    top_y = page_h - 15 * mm
-    y = draw_header(c, data, font_name, page_w, top_y)
-    y = draw_patient_section(c, data, font_name, page_w, y)
-
-    items = data.get("items", [])
-    y = draw_items(c, items, font_name, page_w, y)
-
-    draw_footer(c, data, font_name, page_w, y)
-    c.showPage()
-    c.save()
-    print(f"[ok] Wrote {out_path}")
-
-
-sample_data = {
-  "page_size": "A5",
-  "header": {
-    "affiliation": "广东省医学科学院",
-    "hospital": "广东省人民医院",
-    "title": "处方笺",
-    "no": "3549524",
-    "font_path": "NotoSansCJKsc-Regular.otf",
-    "logo_left_path": "",
-    "logo_right_path": ""
-  },
-  "fee_type": "医保",
-  "date": "2024-08-11",
-  "patient": {
-    "name": "张三",
-    "gender": "男",
-    "age": "22 岁",
-    "visit_no": "MZ20240811001",
-    "dept": "内科/12床",
-    "diagnosis": "上呼吸道感染",
-    "id_no": "350781200001010011",
-    "phone": "13450000000"
-  },
-  "items": [
-    {
-      "name": "阿莫西林",
-      "strength": "500 mg",
-      "form": "胶囊",
-      "dose": "1 粒",
-      "route": "口服",
-      "frequency": "每日 3 次",
-      "days": 7,
-      "quantity": 21,
-      "notes": "饭后服用"
-    },
-    {
-      "name": "布洛芬",
-      "strength": "200 mg",
-      "form": "片剂",
-      "dose": "1 片",
-      "route": "口服",
-      "frequency": "必要时",
-      "days": 3,
-      "quantity": 6,
-      "notes": "发热或疼痛时服用"
-    }
-  ],
-  "amount": "¥58.00",
-  "doctor": {
-    "name": "李医生"
-  },
-  "pharmacist": {
-    "checker": "王药师",
-    "dispenser": "赵药师",
-    "verifier": "孙药师"
-  },
-  "printed_on": "2025年08月11日"
+{
+    \begin{spacing}{1.8}
+    \styleNormalText
+    姓 \space 名：\blockUnderlinedText{\textPatientName}
+    \hfill
+    性 \space 别：\blockUnderlinedText{\textPatientGender}
+    \hfill
+    年 \space 龄：\blockUnderlinedText{\textPatientAge}
+    \hfill
+    科 \space 室：\blockUnderlinedText{\textPatientDep}
+    \\
+    门诊号：\blockUnderlinedText{\textPatientID}
+    \hfill
+    费 \space 别：\blockUnderlinedText{\textPatientFeeType}
+    \hfill
+    日期：
+    \blockUnderlinedText{\textPatientDateYear} 年
+    \blockUnderlinedText{\textPatientDateMonth} 月
+    \blockUnderlinedText{\textPatientDateDay} 日
+    \\
+    临床诊断及证型：\space \textPatientDiag 
+    \end{spacing}
 }
 
+\vspace{0.5cm}
+\hrule
 
-def main():
-    #parser = argparse.ArgumentParser(description="Generate a prescription PDF from JSON.")
-    #parser.add_argument("input", help="Path to JSON data")
-    #parser.add_argument("output", help="Path to output PDF")
-    #parser.add_argument("--font", help="Path to a TTF/OTF font (e.g., NotoSansCJKsc-Regular.otf)", default=None)
-    #args = parser.parse_args()
+\centerline{
+\begin{minipage}{0.9\linewidth}
+\vspace{0.5cm}
+\blockRSign
+\vspace{0.8cm}
+\include{medicine.tex}
+\hdashrule{\linewidth}{1pt}{5pt}
+\begin{center}
+    \Large (以下空白)
+\end{center}
+\end{minipage}
+}
 
-    #with open(args.input, "r", encoding="utf-8") as f:
-    #    data = json.load(f)
+\vspace*{\fill}
 
-    generate_pdf(sample_data, "output/prescription_sample.pdf", font_path="data/NotoSansSC-Regular.ttf")
+\hrule
+\vspace{0.5cm}
+
+\styleNormalText
+医 \space 师：\blockUnderlinedText{\qquad\textDoctorName\qquad}
+\hfill
+金 \space 额：
+\blockUnderlinedText{\qquad\textFee\qquad}
+\\
+药师（审核、校对、发药）：\blockUnderlinedText{\qquad 张倩 \qquad}
+\hfill
+药师/士（调配）：\blockUnderlinedText{\qquad\qquad}
+
+\vspace{0.5cm}
+
+\begin{minipage}{0.7\linewidth}
+\begin{spacing}{1}
+    温馨提示：
+    \begin{enumerate}
+        \itemsep0em 
+        \item 本处方当天有效，过期作废；
+        \item 取药时请仔细核对清单，点齐药品；
+        \item 依《电报药品管理法》，药品一经发出，一律不得退换；
+    \end{enumerate}
+    支付宝，微信（仅限自费和普通医保）
+\end{spacing}
+\end{minipage}
+
+\begin{tikzpicture}[remember picture,overlay]
+    \node[xshift=-4cm,yshift=-2cm] at (current page.north east){
+        \LARGE \heiti \fbox {普通}
+    };
+    \node[xshift=2cm,yshift=-3cm] at (current page.north west){
+        \psbarcode{*11451419*}{includetext width=2 height=0.5 textsize=15 textgaps=2}{code128}
+    };
+    \node[xshift=-4cm,yshift=1cm] at (current page.south east){
+        \psbarcode{ScanThisToPayYourFeeOfMedicinesAndEnjoyYourLife}{includetext width=1 height=1}{qrcode}
+    };
+    \node[xshift=6.5cm,yshift=6cm] at (current page.south west){
+        \includegraphics[width=4cm,angle=6]{data/sign.png}
+    };
+\end{tikzpicture}
+
+\pagenumbering{gobble}
+\end{document}"""
+    # replace the placeholder numeric ID in the LaTeX with the generated random_ID
+    main_content = main_content.replace("11451419", str(random_ID))
+    return main_content
 
 
-if __name__ == "__main__":
-    main()
+async def _write_text_async(path: Path, content: str) -> None:
+    await asyncio.to_thread(path.write_text, content, encoding='utf-8')
+
+
+async def _copy_async(src: Path, dst: Path) -> None:
+    await asyncio.to_thread(shutil.copy, src, dst)
+
+
+async def _copytree_async(src: Path, dst: Path) -> None:
+    await asyncio.to_thread(shutil.copytree, src, dst)
+
+
+async def _ensure_dir_async(path: Path) -> None:
+    await asyncio.to_thread(path.mkdir, parents=True, exist_ok=True)
+
+
+async def generate_pdf(json_input, output_pdf=None):
+    """
+    Generate a prescription PDF from JSON input
+    
+    Args:
+        json_file: Path to input JSON file
+        output_pdf: Path to output PDF file (default: prescription.pdf)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    data = json_input
+
+    if output_pdf is None:
+        time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_pdf = f'output/prescription_{time}.pdf'
+
+    output_path = Path(output_pdf)
+    script_dir = Path(__file__).parent.absolute()
+    images_dir = script_dir / 'data'
+
+    if not images_dir.exists():
+        print(f"Warning: images directory not found at {images_dir}")
+        print("The PDF generation may fail if images are required.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+
+        macro_content = generate_macro_tex(data)
+        medicine_content = generate_medicine_tex(data)
+        main_content = generate_main_tex()
+
+        await asyncio.gather(
+            _write_text_async(tmpdir_path / 'macro.tex', macro_content),
+            _write_text_async(tmpdir_path / 'medicine.tex', medicine_content),
+            _write_text_async(tmpdir_path / 'main.tex', main_content)
+        )
+
+        if images_dir.exists():
+            await _copytree_async(images_dir, tmpdir_path / 'data')
+
+        try:
+            last_stdout = ''
+            last_stderr = ''
+            for i in range(2):
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        'xelatex', '-interaction=nonstopmode', 'main.tex',
+                        cwd=str(tmpdir_path),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                except FileNotFoundError:
+                    print("Error: xelatex not found. Please install TeX Live or similar LaTeX distribution.")
+                    print("On Ubuntu/Debian: sudo apt-get install texlive-xetex texlive-latex-extra")
+                    return False
+
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=60)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.communicate()
+                    print("Error: LaTeX compilation timed out")
+                    return False
+
+                last_stdout = stdout_bytes.decode('utf-8', 'ignore')
+                last_stderr = stderr_bytes.decode('utf-8', 'ignore')
+
+                if process.returncode != 0 and i == 1:
+                    print("Error compiling LaTeX:")
+                    if last_stdout:
+                        print(last_stdout)
+                    if last_stderr:
+                        print(last_stderr)
+                    return False
+
+            src_pdf = tmpdir_path / 'main.pdf'
+            if src_pdf.exists():
+                await _ensure_dir_async(output_path.parent)
+                await _copy_async(src_pdf, output_path)
+                print(f"PDF generated successfully: {output_path}")
+                return output_path
+
+            print("Error: PDF file was not generated")
+            if last_stdout:
+                print(last_stdout)
+            if last_stderr:
+                print(last_stderr)
+            return False
+
+        except Exception as e:
+            print(f"Error during compilation: {e}")
+            return False
+
+sample_input = {
+    "hospital_name": "深圳市罗湖区人民医院",
+    "patient": {
+        "name": "王小美",
+        "gender": "女",
+        "age": "22岁",
+        "department": "精神科综合门诊",
+        "id": "000114514",
+        "fee_type": "自费",
+        "date": {
+            "year": "2025",
+            "month": "10",
+            "day": "11"
+        },
+        "diagnosis": "焦虑状态, 抑郁状态"
+    },
+    "medicines": [
+        {
+            "name": "盐酸氟西汀胶囊 20mg",
+            "quantity": "1 盒",
+            "usage": "\\quad 20mg \\quad 口服 \\quad 每日一次 \\quad 14天"
+        },
+    ],
+    "doctor": {
+        "name": "孙致连",
+        "fee": "30.00 元"
+    },
+    "watermark": ""
+}
+
+async def generate_med(
+    prompt: str,
+    AZURE_OPENAI_ENDPOINT: str,
+    AZURE_OPENAI_API_KEY: str,
+    AZURE_OPENAI_API_VERSION: str,
+    AZURE_OPENAI_DEPLOYMENT_NAME: str,
+) -> dict:
+    """Use Azure OpenAI to turn a natural-language prescription brief into JSON for ``generate_pdf``."""
+
+    schema_template = """
+Return a JSON object that strictly follows this schema:
+{
+    "hospital_name": "string",
+    "patient": {
+        "name": "string",
+        "gender": "string",
+        "age": "string",
+        "department": "string",
+        "id": "string",
+        "fee_type": "string",
+        "date": {
+            "year": "string",
+            "month": "string",
+            "day": "string"
+        },
+        "diagnosis": "string"
+    },
+    "medicines": [
+        {
+            "name": "string",
+            "quantity": "string",
+            "usage": "string"
+        }
+    ],
+    "doctor": {
+        "name": "string",
+        "fee": "string"
+    },
+    "watermark": "string"
+}
+
+Rules:
+- Always include every field shown above.
+- Use empty strings when the prompt does not supply a value.
+- Output must be valid JSON with double-quoted keys and string values.
+- Represent numbers as strings (e.g., "30.00 元").
+- The ``medicines`` array must contain at least one entry; synthesize reasonable defaults if necessary.
+- If the prompt omits department, use "精神科综合门诊".
+- If the prompt omits patient ID, generate a random 10-digit string.
+- If the prompt omits fee type, use "自费".
+- If the prompt omits the date, default to year "2025", month "10", and day "11".
+- Keep the doctor name exactly "孙致连" unless explicitly overridden.
+- Use an empty string for the watermark unless the prompt provides a value.
+- Do not add extra fields or commentary.
+- If not enough information is provided, synthesize reasonable defaults to complete the JSON.
+- If hospital name is missing, use "北京大学第三医院".
+
+Sample real JSON:
+"""
+
+
+
+    schema_instructions = f"{schema_template}{str(sample_input)}\nUser prompt: {prompt}"
+
+
+    client = AsyncAzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
+
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT_NAME,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a meticulous medical scribe who outputs structured prescription JSON.",
+            },
+            {"role": "user", "content": schema_instructions},
+        ],
+    )
+
+    content = response.choices[0].message.content.strip()
+
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Model returned invalid JSON: {content}") from exc
+
+    required_top_level = {"hospital_name", "patient", "medicines", "doctor", "watermark"}
+    missing = required_top_level.difference(payload.keys())
+    if missing:
+        raise ValueError(f"Model response missing fields: {sorted(missing)}")
+
+    patient = payload.get("patient")
+    if not isinstance(patient, dict):
+        raise ValueError("Model response must include a patient object")
+
+    doctor = payload.get("doctor")
+    if not isinstance(doctor, dict):
+        raise ValueError("Model response must include a doctor object")
+
+    medicines = payload.get("medicines")
+    if not isinstance(medicines, list) or not medicines:
+        raise ValueError("Model response must include at least one medicine entry")
+
+    if not all(isinstance(item, dict) for item in medicines):
+        raise ValueError("Each medicine entry must be a JSON object")
+
+    patient.setdefault("department", "精神科综合门诊")
+
+    patient_id = patient.get("id")
+    if not patient_id:
+        patient["id"] = "".join(random.choices("0123456789", k=10))
+
+    patient.setdefault("fee_type", "自费")
+
+    default_date = {"year": "2025", "month": "10", "day": "11"}
+    date_info = patient.get("date")
+    if not isinstance(date_info, dict):
+        patient["date"] = default_date.copy()
+    else:
+        for key, value in default_date.items():
+            if not date_info.get(key):
+                date_info[key] = value
+
+    doctor.setdefault("name", "孙致连")
+    doctor.setdefault("fee", "")
+
+    payload.setdefault("watermark", "")
+
+    for med in medicines:
+        med.setdefault("name", "")
+        med.setdefault("quantity", "")
+        med.setdefault("usage", "")
+
+    return payload
+
+
+
+
+async def generate_jpg(pdf_path, jpg_output=None, *, quality=30, ppi=150):
+    """Generate a JPG from the first page of the given PDF using ImageMagick."""
+    src_path = Path(pdf_path)
+    if not src_path.exists():
+        print(f"Error: source PDF not found at {src_path}")
+        return False
+
+    if jpg_output is None:
+        jpg_output = src_path.with_suffix('.jpg')
+
+    if quality <= 0 or quality > 100:
+        print("Error: quality must be within 1-100")
+        return False
+
+    if ppi <= 0:
+        print("Error: ppi must be positive")
+        return False
+
+    output_path = Path(jpg_output)
+    await _ensure_dir_async(output_path.parent)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            'magick',
+            '-density', str(ppi),
+            str(src_path) + '[0]',
+            '-quality', str(quality),
+            '-units', 'PixelsPerInch',
+            '-flatten',
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+    except FileNotFoundError:
+        print("Error: ImageMagick 'magick' command not found. Please install ImageMagick to enable JPG generation.")
+        return False
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        print("Error: JPG conversion timed out")
+        return False
+
+    stdout_text = stdout_bytes.decode('utf-8', 'ignore')
+    stderr_text = stderr_bytes.decode('utf-8', 'ignore')
+
+    if process.returncode != 0:
+        print("Error converting PDF to JPG:")
+        if stdout_text:
+            print(stdout_text)
+        if stderr_text:
+            print(stderr_text)
+        return False
+
+    if stdout_text:
+        print(stdout_text)
+    if stderr_text:
+        print(stderr_text)
+
+    print(f"JPG generated successfully: {output_path}")
+
+    # Delete the PDF after successful JPG generation when paths differ
+    if src_path != output_path:
+        try:
+            src_path.unlink()
+            print(f"Deleted temporary PDF file: {src_path}")
+        except Exception as e:
+            print(f"Warning: could not delete temporary PDF file: {e}")
+
+    return output_path
+
+# Legacy alias for compatibility
+generate_jpg_med = generate_jpg
+
+
+# directly create jpg from JSON by calling generate_pdf and generate_jpg
+async def generate_jpg_from_med_json(
+        json_input,
+        output_jpg,
+    ):
+    generate_pdf_path = await generate_pdf(json_input, None)
+    if not generate_pdf_path:
+        return False
+    jpg_path = await generate_jpg(generate_pdf_path, output_jpg)
+    return jpg_path
+
+    
+
+
+async def main():
+    """Main entry point"""
+    output_pdf = None  # or specify a path like 'output.pdf'
+
+    prompt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
+    data = sample_input
+
+    if prompt:
+        env_map = {
+            "AZURE_OPENAI_ENDPOINT": os.getenv("AZURE_OPENAI_ENDPOINT"),
+            "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY"),
+            "AZURE_OPENAI_API_VERSION": os.getenv("AZURE_OPENAI_API_VERSION"),
+            "AZURE_OPENAI_DEPLOYMENT_NAME": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+        }
+        missing = [name for name, value in env_map.items() if not value]
+        if missing:
+            print(f"Error: missing Azure OpenAI configuration environment variables: {', '.join(missing)}")
+            return 1
+
+        try:
+            data = await generate_med(
+                prompt,
+                env_map["AZURE_OPENAI_ENDPOINT"],
+                env_map["AZURE_OPENAI_API_KEY"],
+                env_map["AZURE_OPENAI_API_VERSION"],
+                env_map["AZURE_OPENAI_DEPLOYMENT_NAME"],
+            )
+        except Exception as exc:
+            print(f"Error generating prescription JSON: {exc}")
+            return 1
+
+    pdf_path = await generate_pdf(data, output_pdf)
+    if not pdf_path:
+        return 1
+
+    success = await generate_jpg(pdf_path)
+    return 0 if success else 1
+
+
+if __name__ == '__main__':
+    sys.exit(asyncio.run(main()))

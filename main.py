@@ -21,6 +21,8 @@ from app.database import init_db, add_message, get_messages
 
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price, get_Price_Coinbase
 
+from app.med import generate_jpg_from_med_json, generate_med
+
 
 AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_KEY = secret.pass_secret_variables()
 OUTPUT_DIR = "output"
@@ -338,6 +340,43 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Error fetching crypto prices: {e}")
         await update.message.reply_text("Sorry, I encountered an error while fetching crypto prices.")
 
+
+async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /med2jpg command to generate med image from text."""
+    if not update.message or not update.message.text:
+        return
+    logger.info(f"Received text for MED rendering: {update.message.text if update.message else 'No message text'}")
+    message_text = update.message.text
+    await update.message.reply_text("Processing your MED image request...")
+    json_prompt = await generate_med(message_text, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME)
+    if not json_prompt:
+        await update.message.reply_text("Failed to generate MED JSON from the provided text.")
+        return
+    output_file_name = f"med_{update.message.message_id}.jpg"
+    output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
+    status_message = None
+    try:
+        status_message = await update.message.reply_text("Generating your MED image, please wait a moment...")
+
+        # Convert the generated prescription data straight to JPG
+        jpg_path = await generate_jpg_from_med_json(json_prompt, output_file_path)
+
+        with open(jpg_path, 'rb') as photo:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=photo,
+                reply_to_message_id=update.message.message_id
+            )
+        await status_message.delete()
+    except Exception as e:
+        logger.error(f"Error during MED image generation or sending: {e}")
+        await update.message.reply_text("Sorry, I encountered an error while creating your MED image.")
+        await status_message.delete() if status_message else None
+    finally:
+        if os.path.exists(output_file_path):
+            os.remove(output_file_path)
+
+
 def main() -> None:
     """Start the bot."""
 
@@ -353,6 +392,9 @@ def main() -> None:
     # Commands for rendering to image
     application.add_handler(CommandHandler("md2jpg", handle_md2jpg_and_text2jpg))
     application.add_handler(CommandHandler("text2jpg", handle_md2jpg_and_text2jpg))
+
+    # Command for rendering med
+    application.add_handler(CommandHandler("med2jpg", handle_medjpg))
 
     # Documents (.txt, .md)
     application.add_handler(MessageHandler(filters.Document.ALL, handle_text_or_markdown_document))

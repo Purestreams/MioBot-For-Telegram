@@ -474,6 +474,7 @@ Rules:
 - If diagnosis is missing, synthesize a reasonable diagnosis based on the medicines listed.
 - If medicines are missing, synthesize at least one medicine with reasonable diagnosis.
 - The catagory field can be "普通", "毒麻", "儿少".
+- doctor.fee is required, 总价 of all medicines prices.
 
 Sample real JSON:
 """

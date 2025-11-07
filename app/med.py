@@ -7,7 +7,6 @@ Usage:
     
 If output.pdf is not specified, it defaults to 'prescription.pdf'
 """
-
 import asyncio
 import json
 import os
@@ -77,6 +76,8 @@ def generate_macro_tex(data):
 \\newcommand{{\\textPatientDiag}}{{{patient.get('diagnosis', '')}}}
 \\newcommand{{\\textDoctorName}}{{{doctor.get('name', '')}}}
 \\newcommand{{\\textFee}}{{{doctor.get('fee', '')}}}
+\\newcommand{{\\catagory}}{{{patient.get('catagory', '普通')}}}
+
 
 % Warning: Set this value to blank may be criminal in some countries and regions.
 \\newcommand{{\\textWatermark}}{{{data.get('watermark', 'test')}}}
@@ -88,7 +89,7 @@ def generate_macro_tex(data):
     {{\\uline{{\\space\\space #1 \\space\\space}}}}
 \\newcommand{{\\blockRSign}}
     {{{{\\bfseries \\sffamily \\fontsize{{40}}{{40}} \\selectfont \\; R.}}}}
-\\newcommand{{\\blockMedicine}}[3]{{
+\\newcommand{{\\blockMedicine}}[4]{{
     {{
         \\LARGE #1
         \\hfill
@@ -99,6 +100,11 @@ def generate_macro_tex(data):
     \\hspace*{{1cm}}
     {{
         \\large 用法: #3
+    }}
+    \\\\
+    \\hspace*{{1cm}}
+    {{
+        \\large 单价：#4
     }}
 }}"""
     return macro_content
@@ -113,6 +119,7 @@ def generate_medicine_tex(data):
         name = med.get('name', '')
         quantity = med.get('quantity', '')
         usage = med.get('usage', '')
+        price = med.get('price', '')
         
         block = f"""\\blockMedicine{{
     {name} % 药品名称
@@ -122,13 +129,14 @@ def generate_medicine_tex(data):
 }}
 {{
     {usage} % 药品用法
+}}
+{{
+    {price} % 药品单价
 }}"""
         medicine_blocks.append(block)
     
     return '\n\n'.join(medicine_blocks)
 
-# random 8 digits
-random_ID = random.randint(10000000, 99999999)
 
 
 def generate_main_tex():
@@ -138,7 +146,6 @@ def generate_main_tex():
 \usepackage{setspace}
 \usepackage{pst-barcode}
 \usepackage{tikz}
-\usepackage{draftwatermark}
 \usepackage{dashrule}
 \usepackage[normalem]{ulem}
 \usepackage[paperwidth=14.5cm,paperheight=21cm]{geometry}
@@ -146,7 +153,6 @@ def generate_main_tex():
 \setlength\parindent{0pt}
 \begin{document}
 \include{macro.tex}
-\DraftwatermarkOptions{text=\heiti \fbox{\textWatermark}}
 \pagenumbering{gobble}
 
 \begin{center}
@@ -171,6 +177,10 @@ def generate_main_tex():
     门诊号：\blockUnderlinedText{\textPatientID}
     \hfill
     费 \space 别：\blockUnderlinedText{\textPatientFeeType}
+    \hfill
+    主治医生： \blockUnderlinedText{孙致连}
+    \\
+    电话： \blockUnderlinedText{176****3888}
     \hfill
     日期：
     \blockUnderlinedText{\textPatientDateYear} 年
@@ -208,36 +218,41 @@ def generate_main_tex():
 金 \space 额：
 \blockUnderlinedText{\qquad\textFee\qquad}
 \\
-药师（审核、校对、发药）：\blockUnderlinedText{\qquad 张倩 \qquad}
+药师（审核、校对、发药）：\blockUnderlinedText{\qquad\qquad}
 \hfill
 药师/士（调配）：\blockUnderlinedText{\qquad\qquad}
 
 \vspace{0.5cm}
 
-\begin{minipage}{0.7\linewidth}
+\begin{minipage}{0.8\linewidth}
 \begin{spacing}{1}
     温馨提示：
     \begin{enumerate}
         \itemsep0em 
-        \item 本处方当天有效，过期作废；
+        \item 处方开具当日有效；
         \item 取药时请仔细核对清单，点齐药品；
-        \item 依《电报药品管理法》，药品一经发出，一律不得退换；
+        \item 依《医疗机构药事管理规定》，为保障患者用药安全，除药品质量原因外，药品一经发出，不得退换；
+        \item 本人已如实详细告知/询问新冠病毒感染相关流行病学史；
     \end{enumerate}
-    支付宝，微信（仅限自费和普通医保）
+    \begin{flushright}
+        领药窗口请看收费凭条/短信/微信公众号！
+        \\
+        支付宝，微信（仅限自费和普通医保） 可扫码缴费
+    \end{flushright}
 \end{spacing}
 \end{minipage}
 
 \begin{tikzpicture}[remember picture,overlay]
     \node[xshift=-4cm,yshift=-2cm] at (current page.north east){
-        \LARGE \heiti \fbox {普通}
+        \LARGE \heiti \fbox {\catagory}
     };
     \node[xshift=2cm,yshift=-3cm] at (current page.north west){
-        \psbarcode{*11451419*}{includetext width=2 height=0.5 textsize=15 textgaps=2}{code128}
+        \psbarcode{* \textPatientID *}{includetext width=2 height=0.5 textsize=15 textgaps=2}{code128}
     };
     \node[xshift=-4cm,yshift=1cm] at (current page.south east){
-        \psbarcode{ScanThisToPayYourFeeOfMedicinesAndEnjoyYourLife}{includetext width=1 height=1}{qrcode}
+        \psbarcode{https://nat.szlhyy.com.cn/nginx/lhyywebhospital/push/payOrder}{includetext width=1 height=1}{qrcode}
     };
-    \node[xshift=6.5cm,yshift=6cm] at (current page.south west){
+    \node[xshift=6.5cm,yshift=8cm] at (current page.south west){
         \includegraphics[width=4cm,angle=6]{data/sign.png}
     };
 \end{tikzpicture}
@@ -245,6 +260,7 @@ def generate_main_tex():
 \pagenumbering{gobble}
 \end{document}"""
     # replace the placeholder numeric ID in the LaTeX with the generated random_ID
+    random_ID = random.randint(100000000, 999999999)
     main_content = main_content.replace("11451419", str(random_ID))
     return main_content
 
@@ -370,6 +386,7 @@ sample_input = {
         "name": "王小美",
         "gender": "女",
         "age": "22岁",
+        "catagory": "普通",
         "department": "精神科综合门诊",
         "id": "000114514",
         "fee_type": "自费",
@@ -383,13 +400,14 @@ sample_input = {
     "medicines": [
         {
             "name": "盐酸氟西汀胶囊 20mg",
-            "quantity": "1 盒",
-            "usage": "\\quad 20mg \\quad 口服 \\quad 每日一次 \\quad 14天"
+            "quantity": "2 盒",
+            "usage": "\\quad 20mg \\quad 口服 \\quad 每日一次 \\quad 14天",
+            "price": "80.50 元"
         },
     ],
     "doctor": {
         "name": "孙致连",
-        "fee": "30.00 元"
+        "fee": "161.00 元"
     },
     "watermark": ""
 }
@@ -425,7 +443,8 @@ Return a JSON object that strictly follows this schema:
         {
             "name": "string",
             "quantity": "string",
-            "usage": "string"
+            "usage": "string",
+            "price": "string"
         }
     ],
     "doctor": {
@@ -438,6 +457,7 @@ Return a JSON object that strictly follows this schema:
 Rules:
 - Always include every field shown above.
 - Use empty strings when the prompt does not supply a value.
+- Use empty strings for each medicine price when the prompt omits it.
 - Output must be valid JSON with double-quoted keys and string values.
 - Represent numbers as strings (e.g., "30.00 元").
 - The ``medicines`` array must contain at least one entry; synthesize reasonable defaults if necessary.
@@ -450,6 +470,10 @@ Rules:
 - Do not add extra fields or commentary.
 - If not enough information is provided, synthesize reasonable defaults to complete the JSON.
 - If hospital name is missing, use "北京大学第三医院".
+- If department is missing, write a appropriate default value from medicines and diagnosis contents.
+- If diagnosis is missing, synthesize a reasonable diagnosis based on the medicines listed.
+- If medicines are missing, synthesize at least one medicine with reasonable diagnosis.
+- The catagory field can be "普通", "毒麻", "儿少".
 
 Sample real JSON:
 """
@@ -530,6 +554,7 @@ Sample real JSON:
         med.setdefault("name", "")
         med.setdefault("quantity", "")
         med.setdefault("usage", "")
+        med.setdefault("price", "")
 
     return payload
 
@@ -619,32 +644,7 @@ async def main():
     """Main entry point"""
     output_pdf = None  # or specify a path like 'output.pdf'
 
-    prompt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
-    data = sample_input
-
-    if prompt:
-        env_map = {
-            "AZURE_OPENAI_ENDPOINT": os.getenv("AZURE_OPENAI_ENDPOINT"),
-            "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY"),
-            "AZURE_OPENAI_API_VERSION": os.getenv("AZURE_OPENAI_API_VERSION"),
-            "AZURE_OPENAI_DEPLOYMENT_NAME": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
-        }
-        missing = [name for name, value in env_map.items() if not value]
-        if missing:
-            logger.error("Missing Azure OpenAI configuration environment variables: %s", ', '.join(missing))
-            return 1
-
-        try:
-            data = await generate_med(
-                prompt,
-                env_map["AZURE_OPENAI_ENDPOINT"],
-                env_map["AZURE_OPENAI_API_KEY"],
-                env_map["AZURE_OPENAI_API_VERSION"],
-                env_map["AZURE_OPENAI_DEPLOYMENT_NAME"],
-            )
-        except Exception as exc:
-            logger.error("Error generating prescription JSON: %s", exc)
-            return 1
+    data = sample_input  # or load from a JSON file
 
     pdf_path = await generate_pdf(data, output_pdf)
     if not pdf_path:

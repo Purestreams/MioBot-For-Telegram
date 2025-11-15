@@ -22,14 +22,32 @@ from app.database import init_db, add_message, get_messages
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price, get_Price_Coinbase
 
 from app.med import generate_jpg_from_med_json, generate_med
+from app.ai_model import configure_llm
 
 
-AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_KEY = secret.pass_secret_variables()
+AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_KEY, ARK_ENDPOINT, ARK_API_KEY = secret.pass_secret_variables()
+
+secret.set_environment()
+
 OUTPUT_DIR = "output"
 AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
 
 # Models: Phi-4-mini-instruct, Phi-4 or gpt-4.1-nano
 AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
+
+ARK_API_KEY = os.getenv("ARK_API_KEY")
+ARK_MODEL = os.getenv("ARK_MODEL", "deepseek-r1-250528")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER")
+
+configure_llm(
+    provider=LLM_PROVIDER,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    azure_api_key=AZURE_OPENAI_API_KEY,
+    azure_api_version=AZURE_OPENAI_API_VERSION,
+    azure_deployment=AZURE_OPENAI_DEPLOYMENT_NAME,
+    ark_api_key=ARK_API_KEY,
+    ark_model=ARK_MODEL,
+)
 
 # A robust YouTube URL regex pattern (ID = 11 chars)
 YOUTUBE_URL_REGEX = (
@@ -123,9 +141,7 @@ async def handle_md2jpg_and_text2jpg(update: Update, context: ContextTypes.DEFAU
         try:
             status_message = await update.message.reply_text("Converting your text to markdown, please wait a moment...")
 
-            generated_markdown = await plain_text_to_markdown(
-                plain_text_input, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME
-            )
+            generated_markdown = await plain_text_to_markdown(plain_text_input)
 
             await status_message.edit_text("Generating your image from markdown, please wait a moment...")
 
@@ -173,9 +189,7 @@ async def handle_text_or_markdown_document(update: Update, context: ContextTypes
             status_message = await update.message.reply_text("Converting your file to markdown, please wait a moment...")
 
             if not is_already_markdown:
-                generated_markdown = await plain_text_to_markdown(
-                    file_content, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME
-                )
+                generated_markdown = await plain_text_to_markdown(file_content)
             else:
                 generated_markdown = file_content
 
@@ -233,10 +247,6 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
 
     ai_reply = await should_reply_and_generate(
         message_history=await get_messages(chat_id),
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version=AZURE_OPENAI_API_VERSION,
-        deployment_name=AZURE_OPENAI_DEPLOYMENT_NAME,
         is_reply_to_bot=is_reply_to_bot
     )
 
@@ -348,7 +358,7 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"Received text for MED rendering: {update.message.text if update.message else 'No message text'}")
     message_text = update.message.text
     await update.message.reply_text("Processing your MED image request...")
-    json_prompt = await generate_med(message_text, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME)
+    json_prompt = await generate_med(message_text)
     if not json_prompt:
         await update.message.reply_text("Failed to generate MED JSON from the provided text.")
         return

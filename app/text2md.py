@@ -1,14 +1,10 @@
-import os
-from openai import AsyncAzureOpenAI
+from typing import Optional
+
+from app.ai_model import chat_completion_text
 
 
-
-
-async def plain_text_to_markdown(text: str, AZURE_OPENAI_ENDPOINT: str, AZURE_OPENAI_API_KEY: str, AZURE_OPENAI_API_VERSION: str, AZURE_OPENAI_DEPLOYMENT_NAME: str) -> str:
-    """
-    Convert plain text to Markdown format.
-    This is a placeholder function. Implement your conversion logic here.
-    """
+async def plain_text_to_markdown(text: str, *, model: Optional[str] = None) -> str:
+    """Convert plain text into markdown using the configured LLM provider."""
     prompt = f"""
         You are an expert technical writer specializing in markdown formatting. Your task is to convert the following plain text into a readable markdown document.
 
@@ -33,7 +29,7 @@ async def plain_text_to_markdown(text: str, AZURE_OPENAI_ENDPOINT: str, AZURE_OP
         *   Keep all the sentences in the original text.
         *   Do not make extra headings or subheadings that are not present in the original text.
         *   Keep the paragraphs and line breaks as they are in the original text.
-        *   Key the structure of the sentences generally the same as the original text.
+        *   Keep the structure of the sentences generally the same as the original text.
         *   Only use bullets and numbers for lists if they are present in the original text.
         *   Do not add any additional information or context that is not present in the original text.
         *   Do not alter the original meaning of the text.
@@ -46,32 +42,26 @@ async def plain_text_to_markdown(text: str, AZURE_OPENAI_ENDPOINT: str, AZURE_OP
         '''
 
         """
-    
-    client = AsyncAzureOpenAI(
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version=AZURE_OPENAI_API_VERSION,
-    )
 
-    response = await client.chat.completions.create(
-        model=AZURE_OPENAI_DEPLOYMENT_NAME,
+    markdown_content = await chat_completion_text(
         messages=[
             {"role": "system", "content": "You are a markdown formatting expert."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ],
+        model=model,
     )
+    return markdown_content.strip()
 
-    markdown_content = response.choices[0].message.content.strip()
-    return markdown_content
-
-# sample run
 
 if __name__ == "__main__":
     import asyncio
 
-    async def main():
-        text = 'A story about China 1000 years ago, a person died. This is the end of the story. python code: print("hello world") c++ code: stdout >> "c++ output" Appendix The university of China'
-        markdown = await plain_text_to_markdown(text)
+    async def main() -> None:
+        sample_text = (
+            'A story about China 1000 years ago, a person died. This is the end of the story. '
+            'python code: print("hello world") c++ code: stdout >> "c++ output" Appendix The university of China'
+        )
+        markdown = await plain_text_to_markdown(sample_text)
         print(markdown)
 
     asyncio.run(main())

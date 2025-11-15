@@ -17,8 +17,9 @@ from datetime import datetime
 from pathlib import Path
 import random
 import logging
+from typing import Optional
 
-from openai import AsyncAzureOpenAI
+from app.ai_model import chat_completion
 
 try:
     import pypdfium2 as pdfium
@@ -414,12 +415,10 @@ sample_input = {
 
 async def generate_med(
     prompt: str,
-    AZURE_OPENAI_ENDPOINT: str,
-    AZURE_OPENAI_API_KEY: str,
-    AZURE_OPENAI_API_VERSION: str,
-    AZURE_OPENAI_DEPLOYMENT_NAME: str,
+    *,
+    model: Optional[str] = None,
 ) -> dict:
-    """Use Azure OpenAI to turn a natural-language prescription brief into JSON for ``generate_pdf``."""
+    """Use the configured LLM to turn a natural-language brief into prescription JSON for ``generate_pdf``."""
 
     schema_template = """
 Return a JSON object that strictly follows this schema:
@@ -482,17 +481,7 @@ Sample real JSON:
 
 
     schema_instructions = f"{schema_template}{str(sample_input)}\nUser prompt: {prompt}"
-
-
-    client = AsyncAzureOpenAI(
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version=AZURE_OPENAI_API_VERSION,
-    )
-
-    response = await client.chat.completions.create(
-        model=AZURE_OPENAI_DEPLOYMENT_NAME,
-        response_format={"type": "json_object"},
+    completion = await chat_completion(
         messages=[
             {
                 "role": "system",
@@ -500,9 +489,11 @@ Sample real JSON:
             },
             {"role": "user", "content": schema_instructions},
         ],
+        response_format={"type": "json_object"},
+        model=model,
     )
 
-    content = response.choices[0].message.content.strip()
+    content = completion.content.strip()
 
     try:
         payload = json.loads(content)

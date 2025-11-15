@@ -1,36 +1,27 @@
 import json
-from openai import AsyncAzureOpenAI
 import logging
-from typing import Union
+from typing import Optional, Union
+
+from app.ai_model import chat_completion
 
 
 async def should_reply_and_generate(
     message_history: list[str],
-    azure_endpoint: str,
-    api_key: str,
-    api_version: str,
-    deployment_name: str,
-    is_reply_to_bot: bool = False
+    *,
+    is_reply_to_bot: bool = False,
+    model: Optional[str] = None,
 ) -> Union[str, None]:
     """
     Decides if a reply is warranted and generates a funny, cat-girl-like response.
 
     Args:
         message_history: A list of the last few messages.
-        azure_endpoint: Azure OpenAI endpoint.
-        api_key: Azure OpenAI API key.
-        api_version: Azure OpenAI API version.
-        deployment_name: Azure OpenAI deployment name.
+        is_reply_to_bot: Indicates whether the triggering message replied to the bot.
+        model: Optional override for the model/deployment to use.
 
     Returns:
         The reply string, or None if no reply should be sent.
     """
-    client = AsyncAzureOpenAI(
-        azure_endpoint=azure_endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
     formatted_history = ",\n".join(f"User: {msg}" for msg in message_history)
 
 
@@ -170,16 +161,16 @@ Attributes:
 # -------
 
     try:
-        response = await client.chat.completions.create(
-            model=deployment_name,
+        completion = await chat_completion(
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Here is the conversation history:\n\n{formatted_history}"}
+                {"role": "user", "content": f"Here is the conversation history:\n\n{formatted_history}"},
             ],
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            model=model,
         )
-        
-        result_text = response.choices[0].message.content
+
+        result_text = completion.content
         if not result_text:
             return None
 

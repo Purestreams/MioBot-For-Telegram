@@ -23,6 +23,7 @@ to select the provider and credentials.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -262,13 +263,20 @@ async def _chat_completion_ark(
   if not settings.ark_api_key:
     raise RuntimeError("ARK_API_KEY is not configured.")
 
+  ark_response_format: Optional[Dict[str, Any]] = None
+  if response_format is not None:
+    logger.info(
+      "Ark provider does not support response_format; dropping %s and relying on prompt instructions instead",
+      response_format,
+    )
+
   payload: Dict[str, Any] = {
     "model": model or settings.ark_model,
     "messages": messages,
     "temperature": temperature,
     "max_tokens": max_tokens,
     "top_p": top_p,
-    "response_format": response_format,
+    "response_format": ark_response_format,
     "tools": tools,
     "tool_choice": tool_choice,
   }
@@ -404,5 +412,105 @@ async def stream_chat_completion(
       yield event
 
   return _iterator()
+
+
+def _build_test_messages(user_prompt: str, system_prompt: str) -> List[Dict[str, Any]]:
+  return [
+    {"role": "system", "content": system_prompt},
+    {"role": "user", "content": user_prompt},
+  ]
+
+
+async def _run_diagnostic(args: argparse.Namespace) -> None:
+  if args.ark_api_key or args.ark_model:
+    configure_llm(ark_api_key=args.ark_api_key, ark_model=args.ark_model)
+
+  settings = get_settings()
+  provider = _coerce_provider(args.provider or settings.provider)
+
+  messages = _build_test_messages(args.user_prompt, args.system_prompt)
+
+  logger.info(
+    "Running diagnostic call",
+    extra={
+      "provider": provider.value,
+      "model": args.model,
+      "temperature": args.temperature,
+      "max_tokens": args.max_tokens,
+      "top_p": args.top_p,
+    },
+  )
+
+  if args.dry_run:
+    payload = _clean_dict(
+      {
+        "model": args.model or (settings.ark_model if provider == LLMProvider.ARK else settings.azure_deployment),
+        "messages": messages,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "top_p": args.top_p,
+        "response_format": None,
+      }
+    )
+    print("Dry run payload:")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return
+
+  try:
+    result = await chat_completion(
+      messages=messages,
+      model=args.model,
+      provider=provider,
+      temperature=args.temperature,
+      max_tokens=args.max_tokens,
+      top_p=args.top_p,
+    )
+  except httpx.HTTPStatusError as exc:
+    print("HTTP error while requesting chat completion:")
+    print(f"Status: {exc.response.status_code} {exc.response.reason_phrase}")
+    print(f"URL: {exc.request.url}")
+    try:
+      body = exc.response.json()
+      print("Response JSON:")
+      print(json.dumps(body, indent=2, ensure_ascii=False))
+    except json.JSONDecodeError:
+      print("Response Text:")
+      print(exc.response.text)
+    raise
+
+  print("Completion succeeded. Provider:", result.provider.value)
+  print("Content:\n", result.content)
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(description="Run a diagnostic chat completion call")
+  parser.add_argument("--provider", choices=[p.value for p in LLMProvider], help="Force provider instead of env")
+  parser.add_argument("--model", help="Override model/deployment name")
+  parser.add_argument("--temperature", type=float, default=None)
+  parser.add_argument("--top-p", dest="top_p", type=float, default=None)
+  parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
+  parser.add_argument(
+    "--system-prompt",
+    default="You are a helpful assistant that replies briefly.",
+    help="System prompt for the diagnostic request",
+  )
+  parser.add_argument(
+    "--user-prompt",
+    default="Reply with the single word 'pong' if you received this message.",
+    help="User message for the diagnostic request",
+  )
+  parser.add_argument("--dry-run", action="store_true", help="Print payload without sending the request")
+  parser.add_argument("--ark-api-key", help="Override ARK_API_KEY for this run")
+  parser.add_argument("--ark-model", help="Override ARK_MODEL for this run")
+
+  args = parser.parse_args()
+
+  logging.basicConfig(level=logging.INFO)
+
+  asyncio.run(_run_diagnostic(args))
+
+
+if __name__ == "__main__":
+  main()
 
 

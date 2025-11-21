@@ -36,7 +36,7 @@ AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
 AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
 
 ARK_API_KEY = os.getenv("ARK_API_KEY")
-ARK_MODEL = os.getenv("ARK_MODEL", "kimi-k2-250905") # or "deepseek-r1-250528"
+ARK_MODEL = os.getenv("ARK_MODEL") # or "deepseek-r1-250528"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER")
 
 configure_llm(

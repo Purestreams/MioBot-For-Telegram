@@ -155,7 +155,7 @@ def _load_settings_from_env() -> LLMSettings:
     settings.ark_endpoint,
   )
   settings.ark_api_key = os.getenv("ARK_API_KEY", settings.ark_api_key)
-  settings.ark_model = os.getenv("ARK_MODEL", settings.ark_model or "deepseek-r1-250528")
+  settings.ark_model = os.getenv("ARK_MODEL", settings.ark_model)
 
   timeout_env = os.getenv("LLM_REQUEST_TIMEOUT")
   if timeout_env:

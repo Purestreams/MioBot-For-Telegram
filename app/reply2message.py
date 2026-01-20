@@ -22,7 +22,8 @@ async def should_reply_and_generate(
     Returns:
         The reply string, or None if no reply should be sent.
     """
-    formatted_history = ",\n".join(f"User: {msg}" for msg in message_history)
+    # Keep the history lines as-is; upstream now formats them.
+    formatted_history = "\n".join(message_history)
 
 
 # If the message is a reply to the bot, we want to ensure we always respond

@@ -17,7 +17,7 @@ from app.md2jpg import md_to_image
 from app.text2md import plain_text_to_markdown
 from app.youtube_dl import download_video_720p_h264, get_video_title
 from app.reply2message import should_reply_and_generate
-from app.database import init_db, add_message, get_messages
+from app.database import init_db, add_message, get_messages, get_rag_context
 
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price, get_Price_Coinbase
 
@@ -246,7 +246,7 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     ai_reply = await should_reply_and_generate(
-        message_history=await get_messages(chat_id),
+        message_history=await get_rag_context(chat_id, query=message_text),
         is_reply_to_bot=is_reply_to_bot
     )
 

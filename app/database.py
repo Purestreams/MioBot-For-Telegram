@@ -3,7 +3,7 @@ import sqlite3
 import logging
 
 DB_FILE = "message_history.db"
-MESSAGE_REVIEW_BACK = 50
+MESSAGE_REVIEW_BACK = 100
 
 def init_db():
     """Initializes the database and creates the messages table if it doesn't exist."""

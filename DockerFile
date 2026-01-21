@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy code
 COPY . /app
 
-# If you have requirements.txt, install it (safe if not present if you prefer conditional logic)
+# If you have requirements.txt, install it (safe if not present if you prefer conditional logic)123
 RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
 # Default command: run init then main

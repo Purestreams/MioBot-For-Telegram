@@ -47,6 +47,7 @@ class LLMProvider(str, Enum):
 
   ARK = "ark"
   AZURE = "azure"
+  OLLAMA = "ollama"
 
 
 @dataclass
@@ -61,6 +62,8 @@ class LLMSettings:
   ark_endpoint: str = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
   ark_api_key: Optional[str] = None
   ark_model: Optional[str] = None
+  ollama_endpoint: str = "http://100.69.97.8:11434"
+  ollama_model: str = "gpt-oss:20b"
   request_timeout: float = 60.0
 
 
@@ -88,6 +91,8 @@ def configure_llm(
   ark_endpoint: Optional[str] = None,
   ark_api_key: Optional[str] = None,
   ark_model: Optional[str] = None,
+  ollama_endpoint: Optional[str] = None,
+  ollama_model: Optional[str] = None,
   request_timeout: Optional[float] = None,
 ) -> None:
   """Override LLM configuration at runtime."""
@@ -118,6 +123,10 @@ def configure_llm(
     settings.ark_api_key = ark_api_key
   if ark_model is not None:
     settings.ark_model = ark_model
+  if ollama_endpoint is not None:
+    settings.ollama_endpoint = ollama_endpoint
+  if ollama_model is not None:
+    settings.ollama_model = ollama_model
   if request_timeout is not None:
     settings.request_timeout = request_timeout
 
@@ -137,6 +146,8 @@ def _load_settings_from_env() -> LLMSettings:
   provider_env = os.getenv("LLM_PROVIDER")
   if provider_env:
     provider = _coerce_provider(provider_env)
+  elif os.getenv("OLLAMA_ENDPOINT") or os.getenv("OLLAMA_MODEL"):
+    provider = LLMProvider.OLLAMA
   elif os.getenv("ARK_API_KEY"):
     provider = LLMProvider.ARK
   elif os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
@@ -158,6 +169,9 @@ def _load_settings_from_env() -> LLMSettings:
   settings.ark_api_key = os.getenv("ARK_API_KEY", settings.ark_api_key)
   settings.ark_model = os.getenv("ARK_MODEL", settings.ark_model)
 
+  settings.ollama_endpoint = os.getenv("OLLAMA_ENDPOINT", settings.ollama_endpoint)
+  settings.ollama_model = os.getenv("OLLAMA_MODEL", settings.ollama_model)
+
   timeout_env = os.getenv("LLM_REQUEST_TIMEOUT")
   if timeout_env:
     try:
@@ -174,6 +188,8 @@ def _coerce_provider(provider: str | LLMProvider) -> LLMProvider:
   normalized = (provider or "").strip().lower()
   if normalized == LLMProvider.AZURE.value:
     return LLMProvider.AZURE
+  if normalized == LLMProvider.OLLAMA.value:
+    return LLMProvider.OLLAMA
   return LLMProvider.ARK
 
 
@@ -233,6 +249,18 @@ async def chat_completion(
       extra_body=extra_body,
     )
 
+  if active_provider == LLMProvider.OLLAMA:
+    return await _chat_completion_ollama(
+      settings=settings,
+      messages=messages,
+      model=model,
+      response_format=response_format,
+      temperature=temperature,
+      max_tokens=max_tokens,
+      top_p=top_p,
+      extra_body=extra_body,
+    )
+
   return await _chat_completion_azure(
     settings=settings,
     messages=messages,
@@ -245,6 +273,75 @@ async def chat_completion(
     tool_choice=tool_choice,
     extra_body=extra_body,
   )
+
+
+async def _chat_completion_ollama(
+  *,
+  settings: LLMSettings,
+  messages: List[Dict[str, Any]],
+  model: Optional[str],
+  response_format: Optional[Dict[str, Any]],
+  temperature: Optional[float],
+  max_tokens: Optional[int],
+  top_p: Optional[float],
+  extra_body: Optional[Dict[str, Any]],
+) -> ChatCompletionResult:
+  """Send chat completion to Ollama /api/chat.
+
+  Docs: https://github.com/ollama/ollama/blob/main/docs/api.md
+  """
+
+  if response_format is not None:
+    logger.info(
+      "Ollama provider does not support response_format; dropping %s and relying on prompt instructions instead",
+      response_format,
+    )
+
+  # Ollama expects messages in {role, content}. We accept and forward other keys.
+  ollama_messages: List[Dict[str, Any]] = []
+  for msg in messages:
+    role = msg.get("role")
+    content = msg.get("content")
+    if not role or content is None:
+      continue
+    ollama_messages.append({"role": role, "content": str(content)})
+
+  options: Dict[str, Any] = {}
+  if temperature is not None:
+    options["temperature"] = temperature
+  if top_p is not None:
+    options["top_p"] = top_p
+  if max_tokens is not None:
+    options["num_predict"] = max_tokens
+
+  payload: Dict[str, Any] = {
+    "model": model or settings.ollama_model,
+    "messages": ollama_messages,
+    "stream": False,
+    "options": options or None,
+  }
+
+  if extra_body:
+    payload.update(extra_body)
+
+  cleaned_payload = _clean_dict(payload)
+
+  base = (settings.ollama_endpoint or "").rstrip("/")
+  url = f"{base}/api/chat"
+
+  async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
+    response = await client.post(url, json=cleaned_payload)
+
+  response.raise_for_status()
+  data = response.json()
+
+  content = ""
+  try:
+    content = data.get("message", {}).get("content", "")
+  except AttributeError:
+    content = ""
+
+  return ChatCompletionResult(content=content or "", raw=data, provider=LLMProvider.OLLAMA)
 
 
 async def _chat_completion_ark(

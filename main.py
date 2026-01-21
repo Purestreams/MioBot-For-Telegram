@@ -37,7 +37,13 @@ AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-
 
 ARK_API_KEY = os.getenv("ARK_API_KEY")
 ARK_MODEL = os.getenv("ARK_MODEL") # or "deepseek-r1-250528"
-LLM_PROVIDER = os.getenv("LLM_PROVIDER")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER") or os.getenv("AI_PROVIDER")
+if LLM_PROVIDER:
+    normalized_provider = LLM_PROVIDER.strip().lower()
+    if normalized_provider in {"azure_openai", "azure-openai", "azureopenai"}:
+        LLM_PROVIDER = "azure"
+    else:
+        LLM_PROVIDER = normalized_provider
 
 configure_llm(
     provider=LLM_PROVIDER,

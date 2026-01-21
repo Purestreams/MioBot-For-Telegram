@@ -103,11 +103,8 @@ def configure_llm(
 
   if provider is not None:
     settings.provider = _coerce_provider(provider)
-  else:
-    if settings.ark_api_key:
-      settings.provider = LLMProvider.ARK
-    elif settings.azure_api_key and settings.azure_endpoint:
-      settings.provider = LLMProvider.AZURE
+  # When provider is omitted, keep the env-selected provider from
+  # _load_settings_from_env() instead of overriding based on credentials.
 
   if azure_endpoint is not None:
     settings.azure_endpoint = azure_endpoint
@@ -143,7 +140,7 @@ def get_settings() -> LLMSettings:
 
 
 def _load_settings_from_env() -> LLMSettings:
-  provider_env = os.getenv("LLM_PROVIDER")
+  provider_env = os.getenv("LLM_PROVIDER") or os.getenv("AI_PROVIDER")
   if provider_env:
     provider = _coerce_provider(provider_env)
   elif os.getenv("OLLAMA_ENDPOINT") or os.getenv("OLLAMA_MODEL"):
@@ -186,6 +183,8 @@ def _coerce_provider(provider: str | LLMProvider) -> LLMProvider:
   if isinstance(provider, LLMProvider):
     return provider
   normalized = (provider or "").strip().lower()
+  if normalized in {"azure_openai", "azure-openai", "azureopenai"}:
+    normalized = LLMProvider.AZURE.value
   if normalized == LLMProvider.AZURE.value:
     return LLMProvider.AZURE
   if normalized == LLMProvider.OLLAMA.value:

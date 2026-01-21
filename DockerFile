@@ -1,0 +1,17 @@
+FROM python:3.13.0-slim
+
+WORKDIR /app
+
+# System deps (adjust if your init.sh needs more)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy code
+COPY . /app
+
+# If you have requirements.txt, install it (safe if not present if you prefer conditional logic)
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+# Default command: run init then main
+CMD ["bash", "-lc", "bash init.sh && python main.py"]

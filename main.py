@@ -6,10 +6,12 @@ import logging
 import os
 import random
 import re
+import time
 from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
@@ -20,6 +22,7 @@ from app.text2md import plain_text_to_markdown
 from app.youtube_dl import download_video_720p_h264, get_video_title
 from app.reply2message import should_reply_and_generate
 from app.database import init_db, add_message, get_prompt_context_parts
+from app.image2text import image_to_text
 
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
@@ -157,6 +160,10 @@ def _build_rag_query_from_message(message_text: str) -> str:
     if keywords:
         return " ".join(keywords)
     return message_text
+
+
+def _is_group_chat(update: Update) -> bool:
+    return bool(update.effective_chat and update.effective_chat.type in ['group', 'supergroup'])
 
 
 async def _render_and_send_image_from_markdown(
@@ -313,11 +320,23 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
     if not update.message or not update.message.text:
         return
 
+    await _handle_group_ai_reply_pipeline(update, update.message.text)
+
+
+async def _handle_group_ai_reply_pipeline(
+    update: Update,
+    message_text: str,
+    *,
+    additional_context: Optional[list[str]] = None,
+) -> None:
+    """Shared group-reply flow for text-like content."""
+    if not update.message:
+        return
+
     if not update.effective_chat or not update.effective_user:
         return
 
     chat_id = update.effective_chat.id
-    message_text = update.message.text
 
     print(f"Adding message to history for chat {update.effective_user.full_name}: {message_text}")
     await add_message(
@@ -340,6 +359,7 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
     ai_reply = await should_reply_and_generate(
         message_history=history_messages,
         rag_related_messages=rag_related_messages,
+        additional_context=additional_context,
         is_reply_to_bot=is_reply_to_bot,
     )
 
@@ -400,6 +420,48 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
             logger.info(f"Non-YouTube message in group chat: {message_text}")
             await handle_group_ai_reply(update, context)
         return
+
+
+async def handle_photo_for_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram photos in groups by converting image content to text and reusing AI reply flow."""
+    if not update.message or not update.message.photo:
+        return
+    if not _is_group_chat(update):
+        return
+
+    photo = update.message.photo[-1]
+    photo_path = _build_output_path("photo", update.message.message_id, extension="jpg")
+
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        await tg_file.download_to_drive(custom_path=photo_path)
+
+        image_text = await image_to_text(photo_path)
+        caption_text = (update.message.caption or "").strip()
+
+        if not image_text and not caption_text:
+            return
+
+        combined_parts = []
+        if image_text:
+            combined_parts.append(image_text)
+        if caption_text:
+            combined_parts.append(f"caption: {caption_text}")
+        synthesized_text = "\n".join(combined_parts)
+
+        await _handle_group_ai_reply_pipeline(
+            update,
+            synthesized_text,
+            additional_context=[
+                "input_type: image",
+                f"image_message_id: {update.message.message_id}",
+                f"captured_at_unix: {int(time.time())}",
+            ],
+        )
+    except Exception as e:
+        logger.error(f"Error handling group image message: {e}")
+    finally:
+        _remove_file_if_exists(photo_path)
 
 
 async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,6 +537,19 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         _remove_file_if_exists(output_file_path)
 
 
+async def handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler for Telegram application-level exceptions."""
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning(
+            "Telegram polling conflict: another bot instance is calling getUpdates. "
+            "Stop other instances or switch to webhook mode."
+        )
+        return
+
+    logger.exception("Unhandled telegram error", exc_info=err)
+
+
 def register_handlers(application: Application) -> None:
     """Register all command and message handlers in one place."""
     # on different commands - answer in Telegram
@@ -493,6 +568,9 @@ def register_handlers(application: Application) -> None:
     # General text: YouTube downloads or group AI replies
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_for_youtube_or_group))
 
+    # Group images: convert to text and pass through AI reply process
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo_for_group_ai_reply))
+
     # Cryto info command
     application.add_handler(CommandHandler("crypto", handle_crypto_command))
 
@@ -507,6 +585,7 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()
 
     register_handlers(application)
+    application.add_error_handler(handle_application_error)
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling()

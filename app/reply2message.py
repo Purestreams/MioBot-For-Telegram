@@ -5,9 +5,31 @@ from typing import Optional, Union
 from app.ai_model import chat_completion
 
 
+def _build_user_prompt(
+    message_history: list[str],
+    rag_related_messages: Optional[list[str]] = None,
+    additional_context: Optional[list[str]] = None,
+) -> str:
+    history_block = "\n".join(message_history) if message_history else "(empty)"
+    rag_block = "\n".join(rag_related_messages or []) if rag_related_messages else "(empty)"
+    additional_block = "\n".join(additional_context or []) if additional_context else "(none)"
+
+    return (
+        "Here is the prompt context in 3 parts plus optional extras:\n\n"
+        "### PART 1: HISTORY MESSAGE\n"
+        f"{history_block}\n\n"
+        "### PART 2: RAG RELATED MESSAGE\n"
+        f"{rag_block}\n\n"
+        "### PART 3: ADDITIONAL IMPORTANT CONTEXT\n"
+        f"{additional_block}\n"
+    )
+
+
 async def should_reply_and_generate(
     message_history: list[str],
     *,
+    rag_related_messages: Optional[list[str]] = None,
+    additional_context: Optional[list[str]] = None,
     is_reply_to_bot: bool = False,
     model: Optional[str] = None,
 ) -> Union[str, None]:
@@ -15,22 +37,20 @@ async def should_reply_and_generate(
     Decides if a reply is warranted and generates a funny, cat-girl-like response.
 
     Args:
-        message_history: A list of the last few messages.
+        message_history: A list of recent messages.
+        rag_related_messages: A list of retrieved relevant history snippets.
+        additional_context: Optional extra context lines.
         is_reply_to_bot: Indicates whether the triggering message replied to the bot.
         model: Optional override for the model/deployment to use.
 
     Returns:
         The reply string, or None if no reply should be sent.
     """
-    # Keep the history lines as-is; upstream now formats them.
-    formatted_history = "\n".join(message_history)
-
-
 # If the message is a reply to the bot, we want to ensure we always respond
     if is_reply_to_bot:
         reply_logic_prompt = "must_reply = True"
     else:
-        reply_logic_prompt = None
+        reply_logic_prompt = "must_reply = False"
 
     # Read info.txt and convert each non-empty line to a markdown list item "- {line}"
     try:
@@ -165,7 +185,14 @@ Attributes:
         completion = await chat_completion(
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Here is the conversation history:\n\n{formatted_history}"},
+                {
+                    "role": "user",
+                    "content": _build_user_prompt(
+                        message_history,
+                        rag_related_messages=rag_related_messages,
+                        additional_context=additional_context,
+                    ),
+                },
             ],
             response_format={"type": "json_object"},
             model=model,

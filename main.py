@@ -1,14 +1,16 @@
+"""Telegram bot entrypoint and handler orchestration."""
+
 # general imports
+import datetime
 import logging
 import os
-import re
-import datetime
 import random
-import asyncio
-from collections import defaultdict, deque
+import re
+from typing import Optional
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 # private imports
@@ -17,9 +19,9 @@ from app.md2jpg import md_to_image
 from app.text2md import plain_text_to_markdown
 from app.youtube_dl import download_video_720p_h264, get_video_title
 from app.reply2message import should_reply_and_generate
-from app.database import init_db, add_message, get_messages, get_rag_context
+from app.database import init_db, add_message, get_prompt_context_parts
 
-from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price, get_Price_Coinbase
+from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
 from app.med import generate_jpg_from_med_json, generate_med
 from app.ai_model import configure_llm
@@ -36,7 +38,7 @@ AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
 AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
 
 ARK_API_KEY = os.getenv("ARK_API_KEY")
-ARK_MODEL = os.getenv("ARK_MODEL") # or "deepseek-r1-250528"
+ARK_MODEL = os.getenv("ARK_MODEL")  # or "deepseek-r1-250528"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER") or os.getenv("AI_PROVIDER")
 if LLM_PROVIDER:
     normalized_provider = LLM_PROVIDER.strip().lower()
@@ -55,13 +57,12 @@ configure_llm(
     ark_model=ARK_MODEL,
 )
 
-# A robust YouTube URL regex pattern (ID = 11 chars)
+# URL regex patterns
 YOUTUBE_URL_REGEX = (
     r'(https?://)?(www\.)?'
     r'(youtube\.com/|youtu\.be/|youtube-nocookie\.com/)'
     r'(?:watch\?v=|embed/|v/|shorts/|live/)?'
     r'([a-zA-Z0-9_-]{11})'
-    
 )
 BILIBILI_URL_REGEX = (
     r'(https?://)?(?:www\.|m\.)?'
@@ -71,13 +72,163 @@ BILIBILI_URL_REGEX = (
     r'(?:[/?#][^\s]*)?'
 )
 
+MD2JPG_REGEX = r'/md2jpg(?:@\w+)?\s*,,,(.*),,,'
+TEXT2JPG_REGEX = r'/text2jpg(?:@\w+)?\s*,,,(.*),,,'
 
-# Enable logging
+RAG_KEYWORD_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "for", "with", "and", "or", "but", "if", "then",
+    "this", "that", "it", "as", "at", "by", "from", "about", "just", "very",
+    "you", "your", "me", "my", "we", "our", "they", "their", "he", "she", "his", "her",
+}
+
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+
+
+def _build_output_path(prefix: str, message_id: int, extension: str = "jpg") -> str:
+    return os.path.join(OUTPUT_DIR, f"{prefix}_{message_id}.{extension}")
+
+
+def _remove_file_if_exists(path) -> None:
+    if path and os.path.exists(path):
+        os.remove(path)
+
+
+async def _delete_message_if_exists(message) -> None:
+    if message:
+        await message.delete()
+
+
+def _extract_video_url(message_text: str) -> Optional[str]:
+    youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
+    bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
+
+    if youtube_match:
+        return youtube_match.group(0)
+    if bilibili_match:
+        return bilibili_match.group(0)
+    return None
+
+
+def _is_reply_to_this_bot(update: Update) -> bool:
+    message = update.message
+    if not message or not message.reply_to_message:
+        return False
+
+    from_user = message.reply_to_message.from_user
+    return bool(
+        from_user
+        and from_user.is_bot
+        and from_user.username == TELEGRAM_BOT_USERNAME
+    )
+
+
+def _match_command_payload(message_text: str, regex_pattern: str) -> Optional[str]:
+    match = re.search(regex_pattern, message_text, re.DOTALL)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _extract_search_keywords(message_text: str, *, max_keywords: int = 8) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9_]{2,}", message_text.lower())
+    keywords: list[str] = []
+    seen = set()
+
+    for token in tokens:
+        if token in RAG_KEYWORD_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        keywords.append(token)
+        if len(keywords) >= max_keywords:
+            break
+    return keywords
+
+
+def _build_rag_query_from_message(message_text: str) -> str:
+    keywords = _extract_search_keywords(message_text)
+    if keywords:
+        return " ".join(keywords)
+    return message_text
+
+
+async def _render_and_send_image_from_markdown(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    markdown_input: str,
+    output_file_path: str,
+) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    await md_to_image(md_text=markdown_input, output_path=output_file_path, theme='formal_code')
+    with open(output_file_path, 'rb') as photo:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=photo,
+            reply_to_message_id=update.message.message_id,
+        )
+
+
+async def _handle_md2jpg_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    markdown_input: str,
+) -> None:
+    if not update.message:
+        return
+
+    if not markdown_input:
+        await update.message.reply_text("Please provide some markdown content inside the triple quotes.")
+        return
+
+    output_file_path = _build_output_path("md", update.message.message_id)
+    status_message = None
+    try:
+        status_message = await update.message.reply_text("Generating your image, please wait a moment...")
+        await _render_and_send_image_from_markdown(update, context, markdown_input, output_file_path)
+        await _delete_message_if_exists(status_message)
+    except Exception as e:
+        logger.error(f"Error during image generation or sending: {e}")
+        await update.message.reply_text("Sorry, I encountered an error while creating your image.")
+        await _delete_message_if_exists(status_message)
+    finally:
+        _remove_file_if_exists(output_file_path)
+
+
+async def _handle_text2jpg_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    plain_text_input: str,
+) -> None:
+    if not update.message:
+        return
+
+    if not plain_text_input:
+        await update.message.reply_text("Please provide some text content inside the triple quotes.")
+        return
+
+    output_file_path = _build_output_path("text", update.message.message_id)
+    status_message = None
+    try:
+        status_message = await update.message.reply_text("Converting your text to markdown, please wait a moment...")
+        generated_markdown = await plain_text_to_markdown(plain_text_input)
+        await status_message.edit_text("Generating your image from markdown, please wait a moment...")
+        await _render_and_send_image_from_markdown(update, context, generated_markdown, output_file_path)
+        await _delete_message_if_exists(status_message)
+    except Exception as e:
+        logger.error(f"Error during image generation or sending: {e}")
+        await update.message.reply_text("Sorry, I encountered an error while creating your image.")
+        await _delete_message_if_exists(status_message)
+    finally:
+        _remove_file_if_exists(output_file_path)
 
 
 # -------- Telegram Bot Handlers --------
@@ -86,6 +237,9 @@ logger = logging.getLogger(__name__)
 # This handler sends a welcome message when the /start command is issued.
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the /start command is issued."""
+    if not update.message:
+        return
+
     await update.message.reply_text(
         """Hi! I can convert Markdown to an image. Send me a message like:\n\n /md2jpg ,,,Your markdown here,,, \n\n'or\n\n /text2jpg ,,,Your plain text here,,, \n\nI can also download YouTube videos if you send me a link, and I might reply to messages in this group if I find them interesting, nya~"""
     )
@@ -98,75 +252,13 @@ async def handle_md2jpg_and_text2jpg(update: Update, context: ContextTypes.DEFAU
     logger.info(f"Received text for rendering: {update.message.text if update.message else 'No message text'}")
     message_text = update.message.text
 
-    # This regex handles optional bot username in the command, e.g., md2jpg@MioooooooooBot
-    match_md2jpg = re.search(r'/md2jpg(?:@\w+)?\s*,,,(.*),,,', message_text, re.DOTALL)
-    match_text2jpg = re.search(r'/text2jpg(?:@\w+)?\s*,,,(.*),,,', message_text, re.DOTALL)
+    markdown_input = _match_command_payload(message_text, MD2JPG_REGEX)
+    if markdown_input is not None:
+        await _handle_md2jpg_request(update, context, markdown_input)
 
-    # md2jpg command handling
-    if match_md2jpg:
-        markdown_input = match_md2jpg.group(1).strip()
-        if not markdown_input:
-            await update.message.reply_text("Please provide some markdown content inside the triple quotes.")
-            return
-
-        output_file_name = f"md_{update.message.message_id}.jpg"
-        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
-
-        status_message = None
-        try:
-            status_message = await update.message.reply_text("Generating your image, please wait a moment...")
-
-            await md_to_image(md_text=markdown_input, output_path=output_file_path, theme='formal_code')
-
-            with open(output_file_path, 'rb') as photo:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=photo,
-                    reply_to_message_id=update.message.message_id
-                )
-            await status_message.delete()
-        except Exception as e:
-            logger.error(f"Error during image generation or sending: {e}")
-            await update.message.reply_text("Sorry, I encountered an error while creating your image.")
-            await status_message.delete() if status_message else None
-        finally:
-            if os.path.exists(output_file_path):
-                os.remove(output_file_path)
-
-    # text2jpg command handling
-    if match_text2jpg:
-        plain_text_input = match_text2jpg.group(1).strip()
-        if not plain_text_input:
-            await update.message.reply_text("Please provide some text content inside the triple quotes.")
-            return
-
-        output_file_name = f"text_{update.message.message_id}.jpg"
-        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
-
-        status_message = None
-        try:
-            status_message = await update.message.reply_text("Converting your text to markdown, please wait a moment...")
-
-            generated_markdown = await plain_text_to_markdown(plain_text_input)
-
-            await status_message.edit_text("Generating your image from markdown, please wait a moment...")
-
-            await md_to_image(md_text=generated_markdown, output_path=output_file_path, theme='formal_code')
-
-            with open(output_file_path, 'rb') as photo:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=photo,
-                    reply_to_message_id=update.message.message_id
-                )
-            await status_message.delete()
-        except Exception as e:
-            logger.error(f"Error during image generation or sending: {e}")
-            await update.message.reply_text("Sorry, I encountered an error while creating your image.")
-            await status_message.delete() if status_message else None
-        finally:
-            if os.path.exists(output_file_path):
-                os.remove(output_file_path)
+    plain_text_input = _match_command_payload(message_text, TEXT2JPG_REGEX)
+    if plain_text_input is not None:
+        await _handle_text2jpg_request(update, context, plain_text_input)
 
 
 # Handle .txt or .md files to render as image
@@ -176,19 +268,22 @@ async def handle_text_or_markdown_document(update: Update, context: ContextTypes
         return
 
     document_file = update.message.document
-    is_already_markdown = document_file.file_name.endswith('.md')
+    file_name = document_file.file_name
+    if not file_name:
+        return
 
-    if document_file.file_name.endswith(('.txt', '.md')):
+    is_already_markdown = file_name.endswith('.md')
+
+    if file_name.endswith(('.txt', '.md')):
         tg_file = await document_file.get_file()
         downloaded_path = await tg_file.download_to_drive(
-            custom_path=os.path.join(OUTPUT_DIR, document_file.file_name)
+            custom_path=os.path.join(OUTPUT_DIR, file_name)
         )
 
         with open(downloaded_path, 'r', encoding='utf-8') as f:
             file_content = f.read()
 
-        output_file_name = f"file_{update.message.message_id}.jpg"
-        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
+        output_file_path = _build_output_path("file", update.message.message_id)
 
         status_message = None
         try:
@@ -201,30 +296,24 @@ async def handle_text_or_markdown_document(update: Update, context: ContextTypes
 
             await status_message.edit_text("Generating your image from markdown, please wait a moment...")
 
-            await md_to_image(md_text=generated_markdown, output_path=output_file_path, theme='formal_code')
-
-            with open(output_file_path, 'rb') as photo:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=photo,
-                    reply_to_message_id=update.message.message_id
-                )
-            await status_message.delete()
+            await _render_and_send_image_from_markdown(update, context, generated_markdown, output_file_path)
+            await _delete_message_if_exists(status_message)
         except Exception as e:
             logger.error(f"Error during image generation or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while creating your image.")
-            await status_message.delete() if status_message else None
+            await _delete_message_if_exists(status_message)
         finally:
-            if os.path.exists(output_file_path):
-                os.remove(output_file_path)
-            if os.path.exists(downloaded_path):
-                os.remove(downloaded_path)
+            _remove_file_if_exists(output_file_path)
+            _remove_file_if_exists(downloaded_path)
 
 
 # Handle Group AI Replies
 async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle group messages and occasionally reply using AI."""
     if not update.message or not update.message.text:
+        return
+
+    if not update.effective_chat or not update.effective_user:
         return
 
     chat_id = update.effective_chat.id
@@ -237,23 +326,21 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
         content=message_text
     )
 
-    is_reply_to_bot = False
-    if (
-        update.message.reply_to_message and
-        update.message.reply_to_message.from_user and
-        update.message.reply_to_message.from_user.is_bot and
-        update.message.reply_to_message.from_user.username == TELEGRAM_BOT_USERNAME
-    ):
-        is_reply_to_bot = True
+    is_reply_to_bot = _is_reply_to_this_bot(update)
+    if is_reply_to_bot:
         logger.info(f"User {update.effective_user.full_name} replied to the bot.")
 
     # 1 in 5 chance to consider replying, unless it's a reply to the bot.
     if not is_reply_to_bot and random.randint(1, 5) != 1:
         return
 
+    rag_query = _build_rag_query_from_message(message_text)
+    history_messages, rag_related_messages = await get_prompt_context_parts(chat_id, query=rag_query)
+
     ai_reply = await should_reply_and_generate(
-        message_history=await get_rag_context(chat_id, query=message_text),
-        is_reply_to_bot=is_reply_to_bot
+        message_history=history_messages,
+        rag_related_messages=rag_related_messages,
+        is_reply_to_bot=is_reply_to_bot,
     )
 
     if ai_reply:
@@ -273,30 +360,23 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
     if not update.message or not update.message.text:
         return
 
+    if not update.effective_chat or not update.effective_user:
+        return
+
     message_text = update.message.text.strip()
-    youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
-    bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
+    video_url = _extract_video_url(message_text)
 
-    match = youtube_match or bilibili_match
-
-    if match:
-        if youtube_match:
-            youtube_url = youtube_match.group(0)
-        elif bilibili_match:
-            youtube_url = bilibili_match.group(0)
-        else:
-            logger.error("No valid YouTube or Bilibili URL found in the message.")
-            return
+    if video_url:
 
         status_message = None
         try:
             status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
 
-            video_title = await get_video_title(youtube_url)
+            video_title = await get_video_title(video_url)
             output_file_name = f"{video_title}_{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
             output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
-            await download_video_720p_h264(youtube_url, output_path=output_file_path)
+            await download_video_720p_h264(video_url, output_path=output_file_path)
 
             await status_message.edit_text("Download completed successfully. Sending the video...")
 
@@ -305,17 +385,16 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
                     chat_id=update.effective_chat.id,
                     document=video,
                     reply_to_message_id=update.message.message_id,
-                    caption=f'{video_title}\n<a href="{youtube_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
+                    caption=f'{video_title}\n<a href="{video_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
                     parse_mode=ParseMode.HTML
                 )
-            await status_message.delete()
+            await _delete_message_if_exists(status_message)
             await update.message.delete()
-            if os.path.exists(output_file_path):
-                os.remove(output_file_path)
+            _remove_file_if_exists(output_file_path)
         except Exception as e:
             logger.error(f"Error during video download or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while downloading your video.")
-            await status_message.delete() if status_message else None
+            await _delete_message_if_exists(status_message)
     else:
         if update.effective_chat.type in ['group', 'supergroup']:
             logger.info(f"Non-YouTube message in group chat: {message_text}")
@@ -333,7 +412,7 @@ async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     try:
-        #prices = await get_Price(["BTC", "ETH", "SOL"])
+        # prices = await get_Price(["BTC", "ETH", "SOL"])
         prices = await get_Price_Coinbase(["SOL", "USDC", "BTC", "ETH", "USDT"])
         # Sort of prices by key
         prices = dict(sorted(prices.items()))
@@ -368,8 +447,7 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not json_prompt:
         await update.message.reply_text("Failed to generate MED JSON from the provided text.")
         return
-    output_file_name = f"med_{update.message.message_id}.jpg"
-    output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
+    output_file_path = _build_output_path("med", update.message.message_id)
     status_message = None
     try:
         status_message = await update.message.reply_text("Generating your MED image, please wait a moment...")
@@ -379,31 +457,26 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not jpg_path or not os.path.exists(jpg_path):
             raise FileNotFoundError(f"MED JPG not created at {jpg_path}")
 
+        if not update.effective_chat:
+            return
+
         with open(jpg_path, 'rb') as photo:
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=photo,
                 reply_to_message_id=update.message.message_id
             )
-        await status_message.delete()
+        await _delete_message_if_exists(status_message)
     except Exception as e:
         logger.error(f"Error during MED image generation or sending: {e}")
         await update.message.reply_text("Sorry, I encountered an error while creating your MED image.")
-        await status_message.delete() if status_message else None
+        await _delete_message_if_exists(status_message)
     finally:
-        if os.path.exists(output_file_path):
-            os.remove(output_file_path)
+        _remove_file_if_exists(output_file_path)
 
 
-def main() -> None:
-    """Start the bot."""
-
-    # Initialize the database
-    init_db()
-
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()
-
+def register_handlers(application: Application) -> None:
+    """Register all command and message handlers in one place."""
     # on different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
 
@@ -422,6 +495,19 @@ def main() -> None:
 
     # Cryto info command
     application.add_handler(CommandHandler("crypto", handle_crypto_command))
+
+
+def main() -> None:
+    """Start the bot."""
+
+    # Initialize the database
+    init_db()
+
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()
+
+    register_handlers(application)
+
     # Run the bot until the user presses Ctrl-C
     application.run_polling()
 

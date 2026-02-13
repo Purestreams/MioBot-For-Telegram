@@ -86,7 +86,11 @@ async def add_message(chat_id: int, username: str, content: str):
             (chat_id, username, content)
         )
 
-        message_id = int(cursor.lastrowid)
+        lastrowid = cursor.lastrowid
+        if lastrowid is None:
+            await db.commit()
+            return
+        message_id = int(lastrowid)
 
         # Store local embedding (best-effort)
         try:
@@ -124,7 +128,7 @@ async def get_recent_messages(chat_id: int, *, limit: int = RAG_RECENT_N) -> lis
             ''',
             (chat_id, limit),
         )
-        rows = await cursor.fetchall()
+        rows = list(await cursor.fetchall())
         # reverse to chronological
         rows.reverse()
         return [MessageRow(*row) for row in rows]
@@ -216,6 +220,35 @@ async def get_rag_context(
     We place retrieved history first, then recent chat, so the model's
     "last message is most recent" rule stays true.
     """
+    recent_lines, retrieved_lines = await get_prompt_context_parts(
+        chat_id,
+        query,
+        recent_n=recent_n,
+        retrieved_k=retrieved_k,
+    )
+
+    lines: list[str] = []
+    if retrieved_lines:
+        lines.append("### RETRIEVED RELEVANT HISTORY")
+        lines.extend(retrieved_lines)
+
+    lines.append("### RECENT CHAT")
+    lines.extend(recent_lines)
+    return lines
+
+
+async def get_prompt_context_parts(
+    chat_id: int,
+    query: str,
+    *,
+    recent_n: int = RAG_RECENT_N,
+    retrieved_k: int = RAG_TOP_K,
+) -> tuple[list[str], list[str]]:
+    """Return context split into recent history and retrieved RAG lines.
+
+    Returns:
+        (recent_lines, retrieved_lines)
+    """
     recent = await get_recent_messages(chat_id, limit=recent_n)
 
     retrieved: list[MessageRow] = []
@@ -229,14 +262,9 @@ async def get_rag_context(
     recent_ids = {m.id for m in recent}
     retrieved = [m for m in retrieved if m.id not in recent_ids]
 
-    lines: list[str] = []
-    if retrieved:
-        lines.append("### RETRIEVED RELEVANT HISTORY")
-        lines.extend(_format_message(m) for m in retrieved)
-
-    lines.append("### RECENT CHAT")
-    lines.extend(_format_message(m) for m in recent)
-    return lines
+    recent_lines = [_format_message(m) for m in recent]
+    retrieved_lines = [_format_message(m) for m in retrieved]
+    return recent_lines, retrieved_lines
 
 async def get_messages(chat_id: int) -> list[str]:
     """Retrieves the last messages for a given chat, formatted as strings."""

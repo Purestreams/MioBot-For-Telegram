@@ -2,6 +2,8 @@ import yt_dlp
 import asyncio
 import functools
 from typing import Union
+import httpx
+import re
 
 async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
     """
@@ -73,6 +75,38 @@ async def get_video_title(url: str) -> Union[str, None]:
     except Exception as e:
         print(f"An error occurred while fetching video title: {e}")
         return None
+    
+async def get_bilibili_permanent_url(url: str) -> Union[str, None]:
+    """
+    Fetches the permanent URL for a Bilibili video.
+
+    Args:
+        url (str): The original Bilibili video URL.
+
+    Returns:
+        str: The permanent URL of the video, or None if it can't be fetched.
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.head(url)
+            #return str(response.url)
+    except Exception as e:
+        print(f"An error occurred while fetching permanent URL: {e}")
+        return None
+    
+    if 'location' in response.headers:
+        return get_bilibili_permanent_url(response.headers['location'])
+    else:
+        #return response.url
+        pattern = r'https?://www\.bilibili\.com/video/[^/?]+'
+
+        match = re.search(pattern, str(response.url))
+        if match:
+            return match.group(0)
+        else:
+            print(f"Could not extract permanent URL from: {response.url}")
+            return None
+
 
 if __name__ == '__main__':
     # Replace with the URL of the video you want to download
@@ -90,4 +124,13 @@ if __name__ == '__main__':
         
         await download_video_720p_h264(video_url, output_path=f'output/{title}.mp4')
 
-    asyncio.run(main())
+    async def test_bilibili_url():
+        original_url = 'https://b23.tv/Enqggyo'
+        permanent_url = await get_bilibili_permanent_url(original_url)
+        if permanent_url:
+            print(f"Permanent URL: {permanent_url}")
+        else:
+            print("Failed to fetch permanent URL.")
+
+    #asyncio.run(main())
+    asyncio.run(test_bilibili_url())

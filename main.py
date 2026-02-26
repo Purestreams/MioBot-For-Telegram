@@ -393,7 +393,7 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
             status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
 
             video_title = await get_video_title(video_url)
-            output_file_name = f"{video_title}_{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
+            output_file_name = f"{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
             output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
             await download_video_720p_h264(video_url, output_path=output_file_path)

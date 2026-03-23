@@ -57,6 +57,7 @@ Paste (no command needed) a YouTube URL (supports `watch`, `shorts`, `youtu.be`,
 Handled in [`main.handle_all_text`](main.py) which calls:
 - [`app.youtube_dl.get_video_title`](app/youtube_dl.py)
 - [`app.youtube_dl.download_video_720p_h264`](app/youtube_dl.py)
+- [`app.twitter_downloader.TwitterDownloader.extract_twitter_media`](app/twitter_downloader.py) for Twitter/X links
 
 ### 4. Contextual Group Replies  
 Stores messages in SQLite via:
@@ -79,7 +80,8 @@ Themes: `formal_code` (default) or `cute_anime` (see CSS in [`app.md2jpg.md_to_i
 | Entry point & handlers | [main.py](main.py) |
 | Markdown → Image | [app/md2jpg.py](app/md2jpg.py) |
 | Plain Text → Markdown (LLM) | [app/text2md.py](app/text2md.py) |
-| YouTube download | [app/youtube_dl.py](app/youtube_dl.py) |
+| YouTube/Bilibili download | [app/youtube_dl.py](app/youtube_dl.py) |
+| Twitter/X media extraction | [app/twitter_downloader.py](app/twitter_downloader.py) |
 | Reply decision + generation | [app/reply2message.py](app/reply2message.py) |
 | SQLite persistence | [app/database.py](app/database.py) |
 | Secrets template | [secret.py.template](secret.py.template) |

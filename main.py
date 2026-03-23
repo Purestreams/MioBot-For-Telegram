@@ -19,6 +19,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import secret
 from app.md2jpg import md_to_image
 from app.text2md import plain_text_to_markdown
+from app.youtube_dl import download_video_720p_h264, get_video_title, get_bilibili_permanent_url
+from app.twitter_downloader import TwitterDownloader, is_twitter_status_url
 from app.youtube_dl import (
     download_video_720p_h264,
     get_video_title,
@@ -407,10 +409,44 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
         try:
             status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
 
-            video_title = await get_video_title(video_url)
             output_file_name = f"{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
             output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
+            if is_twitter_status_url(video_url):
+                video_title = None
+                twitter_downloader = TwitterDownloader()
+                media_list, text_dict = twitter_downloader.extract_twitter_media(video_url)
+                video_media = next((media for media_type, media in media_list if media_type == 'vid'), None)
+                if not video_media:
+                    raise ValueError("No video could be found in this tweet.")
+                with open(output_file_path, 'wb') as output_file:
+                    output_file.write(video_media)
+                if not video_title:
+                    tweet_text = next(iter(text_dict.values()), "")
+                    video_title = (tweet_text[:80] or "Twitter/X video").strip()
+            else:
+                video_title = await get_video_title(video_url)
+                await download_video_720p_h264(video_url, output_path=output_file_path)
+
+            await status_message.edit_text("Download completed successfully. Sending the video...")
+
+            # if video url is bilibili, also try to get the permanent URL and replace the video_url in the caption with the permanent URL
+            if re.match(BILIBILI_URL_REGEX, video_url):
+                permanent_url = await get_bilibili_permanent_url(video_url)
+                if permanent_url:
+                    video_url = permanent_url
+
+            with open(output_file_path, 'rb') as video:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=video,
+                    reply_to_message_id=update.message.message_id,
+                    caption=f'{video_title}\n<a href="{video_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
+                    parse_mode=ParseMode.HTML
+                )
+            await _delete_message_if_exists(status_message)
+            await update.message.delete()
+            _remove_file_if_exists(output_file_path)
             await download_video_720p_h264(video_url, output_path=output_file_path)
             file_to_send_path = output_file_path
             cleanup_paths = {output_file_path}
@@ -443,6 +479,7 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
             logger.error(f"Error during video download or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while downloading your video.")
             await _delete_message_if_exists(status_message)
+            _remove_file_if_exists(output_file_path if 'output_file_path' in locals() else None)
     else:
         if update.effective_chat.type in ['group', 'supergroup']:
             logger.info(f"Non-video-link message in group chat: {message_text}")

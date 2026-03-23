@@ -4,6 +4,10 @@ import functools
 from typing import Union
 import httpx
 import re
+import os
+import subprocess
+
+TELEGRAM_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024
 
 async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
     """
@@ -45,6 +49,67 @@ async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
             # Return the title of the video
     except Exception as e:
         print(f"An error occurred: {e}")
+
+
+async def compress_video_if_needed(input_path: str, max_size_bytes: int = TELEGRAM_VIDEO_MAX_SIZE_BYTES) -> str:
+    """
+    Compresses a video with ffmpeg when it exceeds Telegram bot size limits.
+
+    Args:
+        input_path (str): Source video path.
+        max_size_bytes (int): Maximum allowed size in bytes.
+
+    Returns:
+        str: Original path if already within limit, otherwise compressed path.
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Video file not found: {input_path}")
+
+    if os.path.getsize(input_path) <= max_size_bytes:
+        return input_path
+
+    base, _ = os.path.splitext(input_path)
+    compressed_path = f"{base}_compressed.mp4"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "28",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        "-fs", str(max_size_bytes),
+        compressed_path,
+    ]
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                subprocess.run,
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required to compress oversized videos.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Failed to compress video: {exc.stderr}") from exc
+
+    if not os.path.exists(compressed_path):
+        raise RuntimeError("Compressed video file was not created.")
+    if os.path.getsize(compressed_path) > max_size_bytes:
+        size_limit_mb = max_size_bytes / (1024 * 1024)
+        raise RuntimeError(f"Compressed video still exceeds the {size_limit_mb:.1f}MB limit.")
+
+    return compressed_path
 
 async def get_video_title(url: str) -> Union[str, None]:
     """

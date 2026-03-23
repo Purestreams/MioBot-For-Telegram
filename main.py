@@ -19,7 +19,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import secret
 from app.md2jpg import md_to_image
 from app.text2md import plain_text_to_markdown
-from app.youtube_dl import download_video_720p_h264, get_video_title, get_bilibili_permanent_url
+from app.youtube_dl import (
+    download_video_720p_h264,
+    get_video_title,
+    get_bilibili_permanent_url,
+    compress_video_if_needed,
+)
 from app.reply2message import should_reply_and_generate
 from app.database import init_db, add_message, get_prompt_context_parts
 from app.image2text import image_to_text
@@ -407,26 +412,33 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
             output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
             await download_video_720p_h264(video_url, output_path=output_file_path)
+            file_to_send_path = output_file_path
+            cleanup_paths = {output_file_path}
+            try:
+                file_to_send_path = await compress_video_if_needed(output_file_path)
+                cleanup_paths.add(file_to_send_path)
 
-            await status_message.edit_text("Download completed successfully. Sending the video...")
+                await status_message.edit_text("Download completed successfully. Sending the video...")
 
-            # if video url is bilibili, also try to get the permanent URL and replace the video_url in the caption with the permanent URL
-            if re.match(BILIBILI_URL_REGEX, video_url):
-                permanent_url = await get_bilibili_permanent_url(video_url)
-                if permanent_url:
-                    video_url = permanent_url
+                # if video url is bilibili, also try to get the permanent URL and replace the video_url in the caption with the permanent URL
+                if re.match(BILIBILI_URL_REGEX, video_url):
+                    permanent_url = await get_bilibili_permanent_url(video_url)
+                    if permanent_url:
+                        video_url = permanent_url
 
-            with open(output_file_path, 'rb') as video:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=video,
-                    reply_to_message_id=update.message.message_id,
-                    caption=f'{video_title}\n<a href="{video_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
-                    parse_mode=ParseMode.HTML
-                )
-            await _delete_message_if_exists(status_message)
-            await update.message.delete()
-            _remove_file_if_exists(output_file_path)
+                with open(file_to_send_path, 'rb') as video:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=video,
+                        reply_to_message_id=update.message.message_id,
+                        caption=f'{video_title}\n<a href="{video_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
+                        parse_mode=ParseMode.HTML
+                    )
+                await _delete_message_if_exists(status_message)
+                await update.message.delete()
+            finally:
+                for path in cleanup_paths:
+                    _remove_file_if_exists(path)
         except Exception as e:
             logger.error(f"Error during video download or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while downloading your video.")

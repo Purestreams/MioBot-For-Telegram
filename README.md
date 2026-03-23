@@ -22,7 +22,7 @@ MioBot 是一个异步 Telegram 机器人，提供以下功能：
 Async Telegram bot that:
 - Converts inline Markdown or plain text to themed images (formal code or cute anime).
 - Converts uploaded `.txt` / `.md` files to images.
-- Downloads YouTube videos (up to 720p AVC) on link detection.
+- Downloads YouTube videos (up to 720p AVC) on link detection, and auto-compresses oversized files to Telegram's 50MB limit before sending.
 - Occasionally (or when directly addressed / replied to) participates in group chats in a cat‑girl persona using Azure OpenAI.
 - Persists recent group chat history in SQLite for contextual replies.
 

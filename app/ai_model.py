@@ -375,6 +375,7 @@ async def _chat_completion_ark(
     "response_format": ark_response_format,
     "tools": tools,
     "tool_choice": tool_choice,
+    "thinking": {"type": "disabled"},
   }
 
   if extra_body:
@@ -608,5 +609,4 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-
 

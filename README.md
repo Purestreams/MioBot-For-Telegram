@@ -52,8 +52,8 @@ More examples in [output/](output/).
 ### 2. File Conversion  
 Upload a `.txt` (will be converted first) or `.md` (used as-is). Bot returns an image.
 
-### 3. YouTube and Bilibili Video Download  
-Paste (no command needed) a YouTube URL (supports `watch`, `shorts`, `youtu.be`, etc.) and a Bilibili URL (supports `bilibili.com` and `b23.tv`).
+### 3. YouTube, Bilibili and Twitter/X Video Download  
+Paste (no command needed) a YouTube URL (supports `watch`, `shorts`, `youtu.be`, etc.), a Bilibili URL (supports `bilibili.com` and `b23.tv`), or a Twitter/X status link.
 Handled in [`main.handle_all_text`](main.py) which calls:
 - [`app.youtube_dl.get_video_title`](app/youtube_dl.py)
 - [`app.youtube_dl.download_video_720p_h264`](app/youtube_dl.py)
@@ -154,7 +154,7 @@ On first run SQLite file `message_history.db` created by [`app.database.init_db`
 | Markdown to image | `/md2jpg ,,,...markdown...,,,` |
 | Plain text to image | `/text2jpg ,,,...plain text...,,,` |
 | File to image | Upload `.txt` / `.md` |
-| YouTube download | Paste link |
+| Video download (YouTube/Bilibili/Twitter-X) | Paste link |
 | Group playful reply | Bot auto-decides (see logic) |
 
 Notes:

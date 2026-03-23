@@ -41,7 +41,7 @@ AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
 AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
 
 ARK_API_KEY = os.getenv("ARK_API_KEY")
-ARK_MODEL = os.getenv("ARK_MODEL")  # or "deepseek-r1-250528"
+ARK_MODEL = os.getenv("ARK_MODEL", "doubao-seed-2-0-pro-260215")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER") or os.getenv("AI_PROVIDER")
 if LLM_PROVIDER:
     normalized_provider = LLM_PROVIDER.strip().lower()
@@ -72,6 +72,13 @@ BILIBILI_URL_REGEX = (
     r'(bilibili\.com/|b23\.tv/)'
     r'(?:video/|watch\?bvid=)?'
     r'([A-Za-z0-9_-]{6,12})'
+    r'(?:[/?#][^\s]*)?'
+)
+TWITTER_URL_REGEX = (
+    # Keep protocol optional to match the existing YouTube/Bilibili extraction behavior.
+    r'(https?://)?(?:www\.)?'
+    r'(twitter\.com/|x\.com/)'
+    r'[A-Za-z0-9_]+/status/\d+'
     r'(?:[/?#][^\s]*)?'
 )
 
@@ -110,11 +117,14 @@ async def _delete_message_if_exists(message) -> None:
 def _extract_video_url(message_text: str) -> Optional[str]:
     youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
     bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
+    twitter_match = re.search(TWITTER_URL_REGEX, message_text)
 
     if youtube_match:
         return youtube_match.group(0)
     if bilibili_match:
         return bilibili_match.group(0)
+    if twitter_match:
+        return twitter_match.group(0)
     return None
 
 
@@ -374,9 +384,9 @@ async def _handle_group_ai_reply_pipeline(
         except Exception as e:
             logger.error(f"Error sending AI reply: {e}")
 
-# Handle text messages: download YouTube videos, else pass to group AI handler
+# Handle text messages: download video links (YouTube/Bilibili/Twitter), else pass to group AI handler
 async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages: download YouTube videos, else pass to group AI handler."""
+    """Handle text messages: download supported video links, else pass to group AI handler."""
     if not update.message or not update.message.text:
         return
 
@@ -423,7 +433,7 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
             await _delete_message_if_exists(status_message)
     else:
         if update.effective_chat.type in ['group', 'supergroup']:
-            logger.info(f"Non-YouTube message in group chat: {message_text}")
+            logger.info(f"Non-video-link message in group chat: {message_text}")
             await handle_group_ai_reply(update, context)
         return
 

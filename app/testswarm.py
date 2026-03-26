@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Any, Dict, List, Optional
 
 from app.ai_model import (
@@ -19,6 +18,7 @@ from app.ai_model import (
     get_settings,
     stream_chat_completion,
 )
+from app.runtime_config import get_runtime_value
 
 
 # -------- Example local "tools" (Python functions) --------
@@ -236,7 +236,7 @@ async def agent_handoff_example(
 async def main() -> None:
     settings = get_settings()
     provider = settings.provider.value
-    model = os.getenv("LLM_DEMO_MODEL", _default_model(settings) or "") or None
+    model = get_runtime_value("LLM_DEMO_MODEL") or (_default_model(settings) or None)
 
     print("=== Basic Single Call ===")
     completion = await chat_completion(

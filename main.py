@@ -2,30 +2,38 @@
 
 # general imports
 import datetime
+import io
 import logging
 import os
 import random
-import re
 import time
 from typing import Optional
 
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 # private imports
-import secret
+from app.runtime_config import bootstrap_runtime_environment, get_runtime_value
+
+# Load config/runtime env before importing modules that read env at import time.
+bootstrap_runtime_environment()
+
 from app.md2jpg import md_to_image
 from app.text2md import plain_text_to_markdown
-from app.youtube_dl import download_video_720p_h264, get_video_title, get_bilibili_permanent_url
-from app.twitter_downloader import TwitterDownloader, is_twitter_status_url
+from app.twitter_downloader import (
+    TwitterDownloader,
+    build_twitter_caption,
+    format_tweet_text_for_reply,
+    is_twitter_status_url,
+    summarize_tweet_text,
+)
 from app.youtube_dl import (
-    download_video_720p_h264,
-    get_video_title,
-    get_bilibili_permanent_url,
+    download_video_to_file,
     compress_video_if_needed,
+    resolve_caption_url,
 )
 from app.reply2message import should_reply_and_generate
 from app.database import init_db, add_message, get_prompt_context_parts
@@ -35,27 +43,64 @@ from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
 from app.med import generate_jpg_from_med_json, generate_med
 from app.ai_model import configure_llm
+from app.main_helpers import (
+    OUTPUT_DIR,
+    MD2JPG_REGEX,
+    TEXT2JPG_REGEX,
+    _build_output_path,
+    _remove_file_if_exists,
+    _delete_message_if_exists,
+    _extract_video_url,
+    _is_reply_to_this_bot,
+    _display_name_from_user,
+    _build_reply_relation_payload,
+    _match_command_payload,
+    _build_rag_query_from_message,
+    _is_group_chat,
+    _extract_search_keywords,
+)
 
+AZURE_OPENAI_ENDPOINT = get_runtime_value("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = get_runtime_value("AZURE_OPENAI_API_KEY")
+TELEGRAM_BOT_USERNAME = get_runtime_value("TELEGRAM_BOT_USERNAME")
+TELEGRAM_BOT_KEY = get_runtime_value("TELEGRAM_BOT_KEY")
+ARK_ENDPOINT = get_runtime_value("ARK_API_ENDPOINT")
+ARK_API_KEY = get_runtime_value("ARK_API_KEY")
 
-AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_KEY, ARK_ENDPOINT, ARK_API_KEY = secret.pass_secret_variables()
-
-secret.set_environment()
-
-OUTPUT_DIR = "output"
-AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
+AZURE_OPENAI_API_VERSION = get_runtime_value("AZURE_OPENAI_API_VERSION")
 
 # Models: Phi-4-mini-instruct, Phi-4 or gpt-4.1-nano
-AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-5-mini"  # or "phi-4-mini-instruct" or "phi-4" or 'gpt-4.1-nano' or 'gpt-4.1-mini'
+AZURE_OPENAI_DEPLOYMENT_NAME = get_runtime_value("AZURE_OPENAI_DEPLOYMENT_NAME")
 
-ARK_API_KEY = os.getenv("ARK_API_KEY")
-ARK_MODEL = os.getenv("ARK_MODEL", "doubao-seed-2-0-pro-260215")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER") or os.getenv("AI_PROVIDER")
+ARK_API_KEY = get_runtime_value("ARK_API_KEY")
+ARK_MODEL = get_runtime_value("ARK_MODEL")
+LLM_PROVIDER = get_runtime_value("LLM_PROVIDER")
 if LLM_PROVIDER:
     normalized_provider = LLM_PROVIDER.strip().lower()
     if normalized_provider in {"azure_openai", "azure-openai", "azureopenai"}:
         LLM_PROVIDER = "azure"
     else:
         LLM_PROVIDER = normalized_provider
+
+
+def _warn_missing_runtime_env(provider: str) -> None:
+    required = ["TELEGRAM_BOT_KEY"]
+    if provider == "azure":
+        required += ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_DEPLOYMENT_NAME"]
+    elif provider == "ark":
+        required += ["ARK_API_KEY", "ARK_API_ENDPOINT", "ARK_MODEL"]
+    elif provider == "ollama":
+        required += ["OLLAMA_ENDPOINT", "OLLAMA_MODEL"]
+
+    missing = [name for name in required if not get_runtime_value(name)]
+    if missing:
+        logger.warning(
+            "Missing runtime env values at startup: %s. Check config/runtime.env or config/runtime.local.env.",
+            ", ".join(missing),
+        )
+
+
+_warn_missing_runtime_env(LLM_PROVIDER or "ark")
 
 configure_llm(
     provider=LLM_PROVIDER,
@@ -67,120 +112,111 @@ configure_llm(
     ark_model=ARK_MODEL,
 )
 
-# URL regex patterns
-YOUTUBE_URL_REGEX = (
-    r'(https?://)?(www\.)?'
-    r'(youtube\.com/|youtu\.be/|youtube-nocookie\.com/)'
-    r'(?:watch\?v=|embed/|v/|shorts/|live/)?'
-    r'([a-zA-Z0-9_-]{11})'
-)
-BILIBILI_URL_REGEX = (
-    r'(https?://)?(?:www\.|m\.)?'
-    r'(bilibili\.com/|b23\.tv/)'
-    r'(?:video/|watch\?bvid=)?'
-    r'([A-Za-z0-9_-]{6,12})'
-    r'(?:[/?#][^\s]*)?'
-)
-TWITTER_URL_REGEX = (
-    # Keep protocol optional to match the existing YouTube/Bilibili extraction behavior.
-    r'(https?://)?(?:www\.)?'
-    r'(twitter\.com/|x\.com/)'
-    r'[A-Za-z0-9_]+/status/\d+'
-    r'(?:[/?#][^\s]*)?'
-)
-
-MD2JPG_REGEX = r'/md2jpg(?:@\w+)?\s*,,,(.*),,,'
-TEXT2JPG_REGEX = r'/text2jpg(?:@\w+)?\s*,,,(.*),,,'
-
-RAG_KEYWORD_STOPWORDS = {
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "to", "of", "in", "on", "for", "with", "and", "or", "but", "if", "then",
-    "this", "that", "it", "as", "at", "by", "from", "about", "just", "very",
-    "you", "your", "me", "my", "we", "our", "they", "their", "he", "she", "his", "her",
-}
-
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 
-
-def _build_output_path(prefix: str, message_id: int, extension: str = "jpg") -> str:
-    return os.path.join(OUTPUT_DIR, f"{prefix}_{message_id}.{extension}")
-
-
-def _remove_file_if_exists(path) -> None:
-    if path and os.path.exists(path):
-        os.remove(path)
-
-
-async def _delete_message_if_exists(message) -> None:
-    if message:
-        await message.delete()
-
-
-def _extract_video_url(message_text: str) -> Optional[str]:
-    youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
-    bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
-    twitter_match = re.search(TWITTER_URL_REGEX, message_text)
-
-    if youtube_match:
-        return youtube_match.group(0)
-    if bilibili_match:
-        return bilibili_match.group(0)
-    if twitter_match:
-        return twitter_match.group(0)
-    return None
-
-
-def _is_reply_to_this_bot(update: Update) -> bool:
-    message = update.message
-    if not message or not message.reply_to_message:
+async def _handle_twitter_media_message(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    video_url: str,
+    sender_display: str,
+    status_message,
+) -> bool:
+    """Handle Twitter/X media. Returns True when request is fully handled."""
+    if not update.message or not update.effective_chat:
         return False
 
-    from_user = message.reply_to_message.from_user
-    return bool(
-        from_user
-        and from_user.is_bot
-        and from_user.username == TELEGRAM_BOT_USERNAME
-    )
+    twitter_downloader = TwitterDownloader()
+    media_list, text_dict = twitter_downloader.extract_twitter_media(video_url)
 
+    tweet_text = summarize_tweet_text(text_dict)
 
-def _match_command_payload(message_text: str, regex_pattern: str) -> Optional[str]:
-    match = re.search(regex_pattern, message_text, re.DOTALL)
-    if not match:
-        return None
-    return match.group(1).strip()
+    image_medias = [media for media_type, media in media_list if media_type == 'pic']
+    video_medias = [media for media_type, media in media_list if media_type == 'vid']
+    gif_medias = [media for media_type, media in media_list if media_type == 'gif']
+    raw_text_caption = (tweet_text[:900] + "...") if len(tweet_text) > 900 else tweet_text
+    text_caption = format_tweet_text_for_reply(raw_text_caption, video_url)
 
+    if not image_medias and not video_medias and not gif_medias and not text_caption:
+        raise ValueError(
+            "Could not extract video, images, or text from this tweet. "
+            "It may be deleted, protected, region-restricted, or blocked by auth/cookie settings."
+        )
 
-def _extract_search_keywords(message_text: str, *, max_keywords: int = 8) -> list[str]:
-    tokens = re.findall(r"[A-Za-z0-9_]{2,}", message_text.lower())
-    keywords: list[str] = []
-    seen = set()
+    if len(image_medias) > 1:
+        album_caption = build_twitter_caption(text_caption, sender_display, video_url)
+        media_group = []
+        for index, image_bytes in enumerate(image_medias, start=1):
+            image_buffer = io.BytesIO(image_bytes)
+            image_buffer.name = f"tweet_image_{index}.jpg"
+            is_first_image = index == 1
+            media_group.append(
+                InputMediaPhoto(
+                    media=image_buffer,
+                    caption=album_caption if is_first_image else None,
+                    parse_mode=ParseMode.HTML if is_first_image else None,
+                )
+            )
+        await context.bot.send_media_group(
+            chat_id=update.effective_chat.id,
+            media=media_group,
+            ##reply_to_message_id=update.message.message_id,
+        )
+    elif len(image_medias) == 1:
+        image_caption = build_twitter_caption(text_caption, sender_display, video_url)
+        image_buffer = io.BytesIO(image_medias[0])
+        image_buffer.name = "tweet_image_1.jpg"
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=image_buffer,
+            ##reply_to_message_id=update.message.message_id,
+            caption=image_caption,
+            parse_mode=ParseMode.HTML,
+        )
 
-    for token in tokens:
-        if token in RAG_KEYWORD_STOPWORDS:
-            continue
-        if token in seen:
-            continue
-        seen.add(token)
-        keywords.append(token)
-        if len(keywords) >= max_keywords:
-            break
-    return keywords
+    if video_medias and not image_medias:
+        for index, video_bytes in enumerate(video_medias, start=1):
+            video_buffer = io.BytesIO(video_bytes)
+            video_buffer.name = f"tweet_video_{index}.mp4"
+            is_first_video = index == 1
+            video_caption = build_twitter_caption(text_caption, sender_display, video_url) if is_first_video else None
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=video_buffer,
+                ##reply_to_message_id=update.message.message_id if is_first_video else None,
+                caption=video_caption,
+                parse_mode=ParseMode.HTML if is_first_video else None,
+            )
 
+    for index, gif_bytes in enumerate(gif_medias, start=1):
+        gif_buffer = io.BytesIO(gif_bytes)
+        gif_buffer.name = f"tweet_gif_{index}.mp4"
+        is_primary_document = not image_medias and not video_medias and index == 1
+        gif_caption = build_twitter_caption(text_caption, sender_display, video_url) if is_primary_document else None
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=gif_buffer,
+            ##reply_to_message_id=update.message.message_id if is_primary_document else None,
+            caption=gif_caption,
+            parse_mode=ParseMode.HTML if gif_caption else None,
+        )
 
-def _build_rag_query_from_message(message_text: str) -> str:
-    keywords = _extract_search_keywords(message_text)
-    if keywords:
-        return " ".join(keywords)
-    return message_text
+    if text_caption and not image_medias and not video_medias and not gif_medias:
+        text_body = build_twitter_caption(text_caption, sender_display, video_url)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text_body,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
-
-def _is_group_chat(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.type in ['group', 'supergroup'])
+    await _delete_message_if_exists(status_message)
+    await update.message.delete()
+    return True
 
 
 async def _render_and_send_image_from_markdown(
@@ -354,17 +390,26 @@ async def _handle_group_ai_reply_pipeline(
         return
 
     chat_id = update.effective_chat.id
+    sender_display = _display_name_from_user(update.effective_user)
+    stored_message_text, relation_context = _build_reply_relation_payload(update, message_text)
+    merged_additional_context = list(additional_context or []) + relation_context
+    replied_message = update.message.reply_to_message
+    reply_to_tg_id = getattr(replied_message, "message_id", None) if replied_message else None
+    reply_to_username = _display_name_from_user(getattr(replied_message, "from_user", None)) if replied_message else None
 
-    print(f"Adding message to history for chat {update.effective_user.full_name}: {message_text}")
+    logger.info("Adding message to history for %s", sender_display)
     await add_message(
         chat_id=chat_id,
-        username=update.effective_user.full_name,
-        content=message_text
+        username=sender_display,
+        content=stored_message_text,
+        telegram_message_id=getattr(update.message, "message_id", None),
+        reply_to_telegram_message_id=reply_to_tg_id,
+        reply_to_username=reply_to_username,
     )
 
-    is_reply_to_bot = _is_reply_to_this_bot(update)
+    is_reply_to_bot = _is_reply_to_this_bot(update, TELEGRAM_BOT_USERNAME)
     if is_reply_to_bot:
-        logger.info(f"User {update.effective_user.full_name} replied to the bot.")
+        logger.info("User %s replied to the bot.", sender_display)
 
     # 1 in 5 chance to consider replying, unless it's a reply to the bot.
     if not is_reply_to_bot and random.randint(1, 5) != 1:
@@ -376,18 +421,21 @@ async def _handle_group_ai_reply_pipeline(
     ai_reply = await should_reply_and_generate(
         message_history=history_messages,
         rag_related_messages=rag_related_messages,
-        additional_context=additional_context,
+        additional_context=merged_additional_context or None,
         is_reply_to_bot=is_reply_to_bot,
     )
 
     if ai_reply:
-        await add_message(
-            chat_id=chat_id,
-            username="mioo_bot",
-            content=ai_reply
-        )
         try:
-            await update.message.reply_text(ai_reply)
+            sent_message = await update.message.reply_text(ai_reply)
+            await add_message(
+                chat_id=chat_id,
+                username="mioo_bot",
+                content=ai_reply,
+                telegram_message_id=getattr(sent_message, "message_id", None),
+                reply_to_telegram_message_id=getattr(update.message, "message_id", None),
+                reply_to_username=sender_display,
+            )
         except Exception as e:
             logger.error(f"Error sending AI reply: {e}")
 
@@ -400,86 +448,58 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
     if not update.effective_chat or not update.effective_user:
         return
 
+    sender_display = _display_name_from_user(update.effective_user)
     message_text = update.message.text.strip()
     video_url = _extract_video_url(message_text)
 
     if video_url:
-
         status_message = None
+        output_file_path = ""
+        cleanup_paths: set[str] = set()
         try:
             status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
+
+            if is_twitter_status_url(video_url):
+                await _handle_twitter_media_message(
+                    update=update,
+                    context=context,
+                    video_url=video_url,
+                    sender_display=sender_display,
+                    status_message=status_message,
+                )
+                return
 
             output_file_name = f"{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
             output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
 
-            if is_twitter_status_url(video_url):
-                video_title = None
-                twitter_downloader = TwitterDownloader()
-                media_list, text_dict = twitter_downloader.extract_twitter_media(video_url)
-                video_media = next((media for media_type, media in media_list if media_type == 'vid'), None)
-                if not video_media:
-                    raise ValueError("No video could be found in this tweet.")
-                with open(output_file_path, 'wb') as output_file:
-                    output_file.write(video_media)
-                if not video_title:
-                    tweet_text = next(iter(text_dict.values()), "")
-                    video_title = (tweet_text[:80] or "Twitter/X video").strip()
-            else:
-                video_title = await get_video_title(video_url)
-                await download_video_720p_h264(video_url, output_path=output_file_path)
+            video_title = await download_video_to_file(video_url, output_file_path)
+
+            cleanup_paths.add(output_file_path)
+
+            file_to_send_path = await compress_video_if_needed(output_file_path)
+            cleanup_paths.add(file_to_send_path)
 
             await status_message.edit_text("Download completed successfully. Sending the video...")
+            caption_url = await resolve_caption_url(video_url)
 
-            # if video url is bilibili, also try to get the permanent URL and replace the video_url in the caption with the permanent URL
-            if re.match(BILIBILI_URL_REGEX, video_url):
-                permanent_url = await get_bilibili_permanent_url(video_url)
-                if permanent_url:
-                    video_url = permanent_url
-
-            with open(output_file_path, 'rb') as video:
+            with open(file_to_send_path, 'rb') as video:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=video,
                     reply_to_message_id=update.message.message_id,
-                    caption=f'{video_title}\n<a href="{video_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
-                    parse_mode=ParseMode.HTML
+                    caption=f'{video_title}\n<a href="{caption_url}">original link</a>\nRequested by: {sender_display}',
+                    parse_mode=ParseMode.HTML,
                 )
+
             await _delete_message_if_exists(status_message)
             await update.message.delete()
-            _remove_file_if_exists(output_file_path)
-            await download_video_720p_h264(video_url, output_path=output_file_path)
-            file_to_send_path = output_file_path
-            cleanup_paths = {output_file_path}
-            try:
-                file_to_send_path = await compress_video_if_needed(output_file_path)
-                cleanup_paths.add(file_to_send_path)
-
-                await status_message.edit_text("Download completed successfully. Sending the video...")
-
-                # if video url is bilibili, also try to get the permanent URL and replace the video_url in the caption with the permanent URL
-                if re.match(BILIBILI_URL_REGEX, video_url):
-                    permanent_url = await get_bilibili_permanent_url(video_url)
-                    if permanent_url:
-                        video_url = permanent_url
-
-                with open(file_to_send_path, 'rb') as video:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=video,
-                        reply_to_message_id=update.message.message_id,
-                        caption=f'{video_title}\n<a href="{video_url}">original link</a>\nRequested by: {update.effective_user.full_name}',
-                        parse_mode=ParseMode.HTML
-                    )
-                await _delete_message_if_exists(status_message)
-                await update.message.delete()
-            finally:
-                for path in cleanup_paths:
-                    _remove_file_if_exists(path)
         except Exception as e:
             logger.error(f"Error during video download or sending: {e}")
-            await update.message.reply_text("Sorry, I encountered an error while downloading your video.")
+            await update.message.reply_text("Sorry, I encountered an error while processing this media link.")
             await _delete_message_if_exists(status_message)
-            _remove_file_if_exists(output_file_path if 'output_file_path' in locals() else None)
+        finally:
+            for path in cleanup_paths:
+                _remove_file_if_exists(path)
     else:
         if update.effective_chat.type in ['group', 'supergroup']:
             logger.info(f"Non-video-link message in group chat: {message_text}")

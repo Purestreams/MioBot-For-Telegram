@@ -33,6 +33,7 @@ from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
+from app.runtime_config import get_runtime_value
 
 try:  # Optional dependency for Azure support
   from openai import AsyncAzureOpenAI
@@ -140,36 +141,33 @@ def get_settings() -> LLMSettings:
 
 
 def _load_settings_from_env() -> LLMSettings:
-  provider_env = os.getenv("LLM_PROVIDER") or os.getenv("AI_PROVIDER")
+  provider_env = get_runtime_value("LLM_PROVIDER")
   if provider_env:
     provider = _coerce_provider(provider_env)
-  elif os.getenv("OLLAMA_ENDPOINT") or os.getenv("OLLAMA_MODEL"):
+  elif get_runtime_value("OLLAMA_ENDPOINT") or get_runtime_value("OLLAMA_MODEL"):
     provider = LLMProvider.OLLAMA
-  elif os.getenv("ARK_API_KEY"):
+  elif get_runtime_value("ARK_API_KEY"):
     provider = LLMProvider.ARK
-  elif os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
+  elif get_runtime_value("AZURE_OPENAI_API_KEY") and get_runtime_value("AZURE_OPENAI_ENDPOINT"):
     provider = LLMProvider.AZURE
   else:
     provider = LLMProvider.ARK
 
   settings = LLMSettings(provider=provider)
 
-  settings.azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-  settings.azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
-  settings.azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-04-01-preview")
-  settings.azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"))
+  settings.azure_endpoint = get_runtime_value("AZURE_OPENAI_ENDPOINT")
+  settings.azure_api_key = get_runtime_value("AZURE_OPENAI_API_KEY")
+  settings.azure_api_version = get_runtime_value("AZURE_OPENAI_API_VERSION")
+  settings.azure_deployment = get_runtime_value("AZURE_OPENAI_DEPLOYMENT") or get_runtime_value("AZURE_OPENAI_DEPLOYMENT_NAME")
 
-  settings.ark_endpoint = os.getenv(
-    "ARK_API_ENDPOINT",
-    settings.ark_endpoint,
-  )
-  settings.ark_api_key = os.getenv("ARK_API_KEY", settings.ark_api_key)
-  settings.ark_model = os.getenv("ARK_MODEL", settings.ark_model)
+  settings.ark_endpoint = get_runtime_value("ARK_API_ENDPOINT") or settings.ark_endpoint
+  settings.ark_api_key = get_runtime_value("ARK_API_KEY") or None
+  settings.ark_model = get_runtime_value("ARK_MODEL") or None
 
-  settings.ollama_endpoint = os.getenv("OLLAMA_ENDPOINT", settings.ollama_endpoint)
-  settings.ollama_model = os.getenv("OLLAMA_MODEL", settings.ollama_model)
+  settings.ollama_endpoint = get_runtime_value("OLLAMA_ENDPOINT") or settings.ollama_endpoint
+  settings.ollama_model = get_runtime_value("OLLAMA_MODEL") or settings.ollama_model
 
-  timeout_env = os.getenv("LLM_REQUEST_TIMEOUT")
+  timeout_env = get_runtime_value("LLM_REQUEST_TIMEOUT")
   if timeout_env:
     try:
       settings.request_timeout = float(timeout_env)

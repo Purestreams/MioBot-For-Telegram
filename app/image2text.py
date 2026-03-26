@@ -4,6 +4,7 @@ import os
 from typing import Any, Optional
 
 import httpx
+from app.runtime_config import get_runtime_value
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +63,13 @@ async def image_to_text(
     model: Optional[str] = None,
 ) -> Optional[str]:
     """Convert an image file into text using Ark Responses API."""
-    api_key = os.getenv("ARK_API_KEY")
+    api_key = get_runtime_value("ARK_API_KEY")
     if not api_key:
         logger.warning("ARK_API_KEY is not configured; skipping image-to-text.")
         return None
 
-    response_url = os.getenv("ARK_RESPONSES_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3/responses")
-    selected_model = model or os.getenv("ARK_VISION_MODEL") or os.getenv("ARK_MODEL") or "doubao-seed-1-6-251015"
+    response_url = get_runtime_value("ARK_RESPONSES_ENDPOINT")
+    selected_model = model or get_runtime_value("ARK_VISION_MODEL") or get_runtime_value("ARK_MODEL")
 
     base64_file = _read_base64_file(image_path)
     mime_type = _guess_mime_type(image_path)

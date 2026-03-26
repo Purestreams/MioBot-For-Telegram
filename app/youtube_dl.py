@@ -1,13 +1,23 @@
 import yt_dlp
 import asyncio
 import functools
-from typing import Union
+from typing import Optional
 import httpx
 import re
 import os
 import subprocess
+import logging
 
 TELEGRAM_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024
+logger = logging.getLogger(__name__)
+
+BILIBILI_URL_REGEX = (
+    r'(https?://)?(?:www\.|m\.)?'
+    r'(bilibili\.com/|b23\.tv/)'
+    r'(?:video/|watch\?bvid=)?'
+    r'([A-Za-z0-9_-]{6,12})'
+    r'(?:[/?#][^\s]*)?'
+)
 
 async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
     """
@@ -40,15 +50,15 @@ async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"Starting download for: {url}")
+            logger.info("Starting download for: %s", url)
             # Run the synchronous download method in a separate thread
             await loop.run_in_executor(
                 None, functools.partial(ydl.download, [url])
             )
-            print("Download completed successfully.")
-            # Return the title of the video
+            logger.info("Download completed successfully")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logger.error("Video download failed for %s: %s", url, e)
+        raise
 
 
 async def compress_video_if_needed(input_path: str, max_size_bytes: int = TELEGRAM_VIDEO_MAX_SIZE_BYTES) -> str:
@@ -111,7 +121,7 @@ async def compress_video_if_needed(input_path: str, max_size_bytes: int = TELEGR
 
     return compressed_path
 
-async def get_video_title(url: str) -> Union[str, None]:
+async def get_video_title(url: str) -> Optional[str]:
     """
     Extracts the title of a video from a URL without downloading.
 
@@ -132,16 +142,34 @@ async def get_video_title(url: str) -> Union[str, None]:
             info_dict = await loop.run_in_executor(
                 None, lambda: ydl.extract_info(url, download=False)
             )
-            title = info_dict.get('title')
+            title = (info_dict or {}).get('title')
+            if not isinstance(title, str) or not title.strip():
+                return None
             title = ''.join(c for c in title if c.isalnum() or c.isspace())
             title = title.replace(' ', '_')
             title = title.strip()
             return title
     except Exception as e:
-        print(f"An error occurred while fetching video title: {e}")
+        logger.warning("Failed to fetch video title for %s: %s", url, e)
         return None
+
+
+async def resolve_caption_url(video_url: str) -> str:
+    """Resolve canonical Bilibili URL for caption display when available."""
+    if re.match(BILIBILI_URL_REGEX, video_url):
+        permanent_url = await get_bilibili_permanent_url(video_url)
+        if permanent_url:
+            return permanent_url
+    return video_url
+
+
+async def download_video_to_file(video_url: str, output_file_path: str) -> str:
+    """Download supported video media and return a display title."""
+    video_title = await get_video_title(video_url)
+    await download_video_720p_h264(video_url, output_path=output_file_path)
+    return video_title or "Video"
     
-async def get_bilibili_permanent_url(url: str) -> Union[str, None]:
+async def get_bilibili_permanent_url(url: str) -> Optional[str]:
     """
     Fetches the permanent URL for a Bilibili video.
 
@@ -151,26 +179,24 @@ async def get_bilibili_permanent_url(url: str) -> Union[str, None]:
     Returns:
         str: The permanent URL of the video, or None if it can't be fetched.
     """
-    try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.head(url)
-            #return str(response.url)
-    except Exception as e:
-        print(f"An error occurred while fetching permanent URL: {e}")
+    if not isinstance(url, str) or not url.strip():
         return None
-    
-    if 'location' in response.headers:
-        return get_bilibili_permanent_url(response.headers['location'])
-    else:
-        #return response.url
-        pattern = r'https?://www\.bilibili\.com/video/[^/?]+'
 
-        match = re.search(pattern, str(response.url))
-        if match:
-            return match.group(0)
-        else:
-            print(f"Could not extract permanent URL from: {response.url}")
-            return None
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+            response = await client.head(url)
+            response.raise_for_status()
+    except Exception as e:
+        logger.warning("Failed to resolve Bilibili URL %s: %s", url, e)
+        return None
+
+    pattern = r'https?://www\.bilibili\.com/video/[^/?]+'
+    match = re.search(pattern, str(response.url))
+    if match:
+        return match.group(0)
+
+    logger.warning("Could not extract Bilibili permanent URL from: %s", response.url)
+    return None
 
 
 if __name__ == '__main__':

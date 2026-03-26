@@ -3,10 +3,16 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
-sys.modules.setdefault("yt_dlp", SimpleNamespace(YoutubeDL=object))
-sys.modules.setdefault("httpx", SimpleNamespace(AsyncClient=object))
+
+yt_dlp_stub = ModuleType("yt_dlp")
+yt_dlp_stub.YoutubeDL = object
+httpx_stub = ModuleType("httpx")
+httpx_stub.AsyncClient = object
+sys.modules.setdefault("yt_dlp", yt_dlp_stub)
+sys.modules.setdefault("httpx", httpx_stub)
+
 from app.youtube_dl import compress_video_if_needed
 
 

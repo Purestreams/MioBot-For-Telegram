@@ -1,5 +1,6 @@
 import asyncio
 import random
+import logging
 import httpx
 
 # API URLs
@@ -18,6 +19,7 @@ DEFAULT_HEADERS = {
 }
 
 STATUS_FORCELIST = {429, 500, 502, 503, 504}
+logger = logging.getLogger(__name__)
 
 _aclient: httpx.AsyncClient | None = None
 
@@ -87,7 +89,7 @@ async def get_Price_Coinbase(list_tokens: list) -> dict:
             if amount is not None:
                 output[token] = round(float(amount), 3)
         except Exception as e:
-            print(f"Error fetching price for {token}: {e}")
+            logger.warning("Error fetching Coinbase price for %s: %s", token, e)
     return output
 
 

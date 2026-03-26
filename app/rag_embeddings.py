@@ -1,22 +1,20 @@
 import asyncio
 import logging
-import os
 import importlib
 import zlib
 from typing import Optional
 
 import numpy as np
+from app.runtime_config import get_runtime_int, get_runtime_value
 
 logger = logging.getLogger(__name__)
 
 _FASTEMBED_AVAILABLE: Optional[bool] = None
 
 
-_DEFAULT_EMBED_MODEL = os.getenv(
-    "EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-)
-_EMBED_BACKEND = os.getenv("EMBED_BACKEND", "fastembed")  # fastembed|hash
-_HASH_DIM = int(os.getenv("EMBED_HASH_DIM", "512"))
+_DEFAULT_EMBED_MODEL = get_runtime_value("EMBED_MODEL")
+_EMBED_BACKEND = get_runtime_value("EMBED_BACKEND")  # fastembed|hash
+_HASH_DIM = get_runtime_int("EMBED_HASH_DIM", 512)
 
 _embedder = None
 _embedder_model_name: Optional[str] = None

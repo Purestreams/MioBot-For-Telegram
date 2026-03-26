@@ -30,7 +30,7 @@ Async Telegram bot that:
 
 ## Catgirl Persona
 
-You can edit the information in `info.txt` to customize the bot's background knowledge. Seperate each piece of information with a new line. The bot will use this information to generate replies.
+You can edit the information in `config/info.txt` to customize the bot's background knowledge. Separate each piece of information with a new line. The bot will use this information to generate replies.
 
 ## Features
 
@@ -84,7 +84,8 @@ Themes: `formal_code` (default) or `cute_anime` (see CSS in [`app.md2jpg.md_to_i
 | Twitter/X media extraction | [app/twitter_downloader.py](app/twitter_downloader.py) |
 | Reply decision + generation | [app/reply2message.py](app/reply2message.py) |
 | SQLite persistence | [app/database.py](app/database.py) |
-| Secrets template | [secret.py.template](secret.py.template) |
+| Runtime secret template | [config/runtime.env.template](config/runtime.env.template) |
+| Runtime config loader | [app/runtime_config.py](app/runtime_config.py) |
 
 Key symbols:
 - [`app.md2jpg.md_to_image`](app/md2jpg.py)
@@ -100,31 +101,27 @@ Key symbols:
 
 ## Installation
 
-1. Python 3.11+ (pycache indicates 3.13 compatible).
-2. Clone repository.
-3. Create virtual environment:
+1. Install Python 3.11+.
+2. Install uv (https://docs.astral.sh/uv/getting-started/installation/).
+3. Clone repository.
+4. Sync environment and dependencies:
    ```
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-4. Install Python dependencies:
-   ```
-   bash pip_install.sh
+   uv sync
    ```
 5. Install Playwright browser:
    ```
-   playwright install chromium
+   uv run playwright install chromium
    ```
 6. Ensure FFmpeg available (for yt-dlp post-processing):
    ```
    # Debian/Ubuntu
    sudo apt-get update && sudo apt-get install -y ffmpeg
    ```
-7. Copy secrets:
+7. Configure runtime secrets in config folder:
    ```
-   cp secret.py.template secret.py
+   cp config/runtime.env.template config/runtime.local.env
    ```
-   Fill Azure + Telegram values in [`secret.py`](secret.py.template).
+   Fill Azure/Telegram/API values in `config/runtime.local.env`.
 
 ---
 
@@ -134,17 +131,48 @@ Set deployment name in [main.py](main.py):
 ```
 AZURE_OPENAI_DEPLOYMENT_NAME = "your-deployment"
 ```
-API details passed from [`secret.pass_secret_variables`](secret.py.template) into runtime constants in [main.py](main.py).
+API details are loaded at startup from config env files by [app/runtime_config.py](app/runtime_config.py) and injected into runtime env before bot initialization.
 
 ---
 
 ## Running
 
 ```
-python main.py
+uv run miobot
 ```
 
-On first run SQLite file `message_history.db` created by [`app.database.init_db`](app/database.py). Output images/videos stored temporarily in `output/`.
+Alternative (equivalent):
+```
+uv run python main.py
+```
+
+On first run SQLite file `data/message_history.db` is created by [`app.database.init_db`](app/database.py). You can override this via `DB_FILE` in runtime env. Output images/videos are stored temporarily in `output/`.
+
+---
+
+## Docker
+
+Build image:
+
+```bash
+docker build -t miobot:latest .
+```
+
+Run with mounted runtime config + persistent storage:
+
+```bash
+docker run --rm -it \
+   --name miobot \
+   -v "$PWD/config/runtime.local.env:/app/config/runtime.local.env:ro" \
+   -v "$PWD/data:/app/data" \
+   -v "$PWD/output:/app/output" \
+   miobot:latest
+```
+
+Notes:
+- Mount `config/runtime.local.env` so secrets stay outside the image.
+- Mount `data/` to persist SQLite history across container restarts.
+- Mount `output/` to keep generated images and downloaded media on host.
 
 ---
 
@@ -201,7 +229,7 @@ Ideas:
 
 ## Security Notes
 
-- Do not commit `secret.py`.
+- Do not commit `config/runtime.local.env` or cookie files in `config/`.
 - Current design keeps API keys only in memory.
 - Consider Dockerizing & injecting secrets via environment variables instead of Python file.
 
@@ -211,7 +239,7 @@ Ideas:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Playwright error | Browser not installed | Run `playwright install chromium` |
+| Playwright error | Browser not installed | Run `uv run playwright install chromium` |
 | Video fails | Missing ffmpeg | Install ffmpeg |
 | No AI replies | Deployment name mismatch | Check `AZURE_OPENAI_DEPLOYMENT_NAME` |
 | Unicode issues | Font fallback missing | Add Noto fonts system-wide if needed |
@@ -248,7 +276,15 @@ Plain text request:
 
 ## Dependency Reference
 
-See [pip_install.sh](pip_install.sh). Core libs: python-telegram-bot (async), markdown2, playwright, Pillow, yt-dlp, openai (Azure), aiosqlite, requests, bs4.
+Dependencies are managed via [pyproject.toml](pyproject.toml). A `uv.lock` file is generated after `uv sync`.
+
+Core libs: python-telegram-bot (async), markdown2, playwright, Pillow, yt-dlp, httpx, aiosqlite, numpy, requests.
+
+---
+
+## Refactoring Aims
+
+Refactoring targets are tracked in [REFACTORING_AIMS.md](REFACTORING_AIMS.md).
 
 ---
 

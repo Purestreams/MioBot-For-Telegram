@@ -221,3 +221,9 @@ __marimo__/
 #output/prescription*
 
 output/prescription*
+
+# Local runtime secret files
+config/runtime.env
+config/runtime.local.env
+config/*.secret
+config/*cookies*.txt

@@ -1,8 +1,89 @@
 import json
 import logging
+from pathlib import Path
 from typing import Optional, Union
 
 from app.ai_model import chat_completion
+
+
+logger = logging.getLogger(__name__)
+INFO_FILE_PATH = Path(__file__).resolve().parent.parent / "config" / "info.txt"
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if not lines:
+        return stripped
+
+    # Remove opening fence (``` or ```json) and closing fence if present.
+    body_lines = lines[1:]
+    if body_lines and body_lines[-1].strip().startswith("```"):
+        body_lines = body_lines[:-1]
+    return "\n".join(body_lines).strip()
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    in_string = False
+    escape = False
+    depth = 0
+    start = -1
+
+    for i, ch in enumerate(text):
+        if start == -1:
+            if ch == "{":
+                start = i
+                depth = 1
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+
+    return None
+
+
+def _parse_reply_payload(result_text: str) -> Optional[dict]:
+    candidates = []
+    raw = (result_text or "").strip()
+    if raw:
+        candidates.append(raw)
+
+    unfenced = _strip_markdown_code_fence(raw)
+    if unfenced and unfenced != raw:
+        candidates.append(unfenced)
+
+    extracted = _extract_first_json_object(unfenced or raw)
+    if extracted:
+        candidates.append(extracted)
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    return None
 
 
 def _build_user_prompt(
@@ -52,15 +133,15 @@ async def should_reply_and_generate(
     else:
         reply_logic_prompt = "must_reply = False"
 
-    # Read info.txt and convert each non-empty line to a markdown list item "- {line}"
+    # Read config/info.txt and convert each non-empty line to a markdown list item "- {line}"
     try:
-        with open("info.txt", "r", encoding="utf-8") as f:
+        with open(INFO_FILE_PATH, "r", encoding="utf-8") as f:
             _lines = [ln.strip() for ln in f if ln.strip()]
     except FileNotFoundError:
-        logging.warning("info.txt not found; using empty information.")
+        logger.warning("config/info.txt not found; using empty information.")
         _lines = []
     except Exception as e:
-        logging.error(f"Failed to read info.txt: {e}")
+        logger.error("Failed to read config/info.txt: %s", e)
         _lines = []
 
     information = "\n".join(f"- {ln}" for ln in _lines)
@@ -202,8 +283,12 @@ Attributes:
         if not result_text:
             return None
 
-        result_json = json.loads(result_text)
-        logging.info(f"Generated response: {result_json}")
+        result_json = _parse_reply_payload(result_text)
+        if result_json is None:
+            logger.warning("Model returned invalid JSON reply payload. Raw prefix: %r", result_text[:200])
+            return None
+
+        logger.info("Generated response: %s", result_json)
         
         if result_json.get("should_reply"):
             return result_json.get("reply_content")
@@ -211,5 +296,5 @@ Attributes:
         return None
 
     except Exception as e:
-        print(f"An error occurred in should_reply_and_generate: {e}")
+        logger.exception("An error occurred in should_reply_and_generate: %s", e)
         return None

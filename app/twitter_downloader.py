@@ -1,53 +1,114 @@
 import html
-import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 import requests
+import yt_dlp
+from yt_dlp.utils import DownloadError
+from app.runtime_config import get_runtime_value
 
 logger = logging.getLogger(__name__)
 
 
 P_TWT_LINK = re.compile(r'https://(?:x|twitter)\.com/(.+?)/status/(\d+)')
 P_CSRF_TOKEN = re.compile(r'ct0=(.+?)(?:;|$)')
-P_PIC_LINK = re.compile(r'''(https://pbs\.twimg\.com/media/(.+?))['"]''')
-P_GIF_LINK = re.compile(r'(https://video\.twimg\.com/tweet_video/(.+?\.mp4))')
-P_VID_LINK = re.compile(r'(https://video\.twimg\.com/ext_tw_video/(\d+)/(?:pu|pr)/vid/(avc1/)?(\d+x\d+)/(.+?\.mp4))')
-P_VID_LINK1 = re.compile(r'(https://video\.twimg\.com/amplify_video/(\d+)/vid/(avc1/)?(\d+x\d+)/(.+?\.mp4))')
-
-SINGLE_PAGE_API = 'https://x.com/i/api/graphql/BbmLpxKh8rX8LNe2LhVujA/TweetDetail'
-HOST_URL = 'https://api.twitter.com/1.1/guest/activate.json'
-
-SINGLE_PAGE_API_PAR = '{{"focalTweetId":"{}","with_rux_injections":false,"includePromotedContent":false,"withCommunity":false,"withQuickPromoteEligibilityTweetFields":false,"withBirdwatchNotes":false,"withSuperFollowsUserFields":true,"withDownvotePerspective":false,"withReactionsMetadata":false,"withReactionsPerspective":false,"withSuperFollowsTweetFields":true,"withVoice":true,"withV2Timeline":true}}'
-SINGLE_PAGE_API_PAR2 = '{"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"responsive_web_home_pinned_timelines_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"c9s_tweet_anatomy_moderator_badge_enabled":true,"tweetypie_unmention_optimization_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_media_download_video_enabled":false,"responsive_web_enhance_cards_enabled":false}'
-SINGLE_PAGE_API_PAR3 = '{"withArticleRichContentState":false}'
+P_PIC_TWITTER_LINK = re.compile(r'(?:https?://)?pic\.twitter\.com/[A-Za-z0-9]+')
+P_META_IMAGE = re.compile(
+    r'<meta\b(?=[^>]*(?:property|name)=["\'](?:og:image|twitter:image)["\'])(?=[^>]*content=["\']([^"\']+)["\'])[^>]*>',
+    re.IGNORECASE,
+)
+P_PBS_IMAGE_LINK = re.compile(r'https?://pbs\.twimg\.com/[^"\'\s<]+', re.IGNORECASE)
 
 
 def is_twitter_status_url(url: str) -> bool:
     return bool(P_TWT_LINK.search(html.unescape(url or '')))
 
 
+def summarize_tweet_text(text_dict: Mapping[str, str]) -> str:
+    tweet_text = next(iter(text_dict.values()), "")
+    return tweet_text.strip()
+
+
+def format_tweet_text_for_reply(tweet_text: str, original_url: str) -> str:
+    text = (tweet_text or "").strip()
+    text = P_PIC_TWITTER_LINK.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    # oEmbed text often appends author/date after " — "; keep only tweet content body.
+    if " — " in text:
+        text = text.split(" — ", 1)[0].strip()
+
+    return html.escape(text)
+
+
+def _extract_twitter_username_from_url(original_url: str) -> str:
+    decoded_url = html.unescape(original_url or "")
+    match = P_TWT_LINK.search(decoded_url)
+    if not match:
+        return "twitter_user"
+    return match.group(1)
+
+
+def build_twitter_caption(tweet_caption_html: str, sender_display: str, original_url: str) -> str:
+    safe_url = html.escape(original_url, quote=True)
+    twitter_username = html.escape(_extract_twitter_username_from_url(original_url))
+    posted_by_line = f'-- Posted by <a href="{safe_url}">@{twitter_username}</a>'
+    sender_line = f"Requested by {html.escape(sender_display)}"
+
+    if tweet_caption_html:
+        return f"{tweet_caption_html}\n{posted_by_line}\n\n{sender_line}"
+    return f"{posted_by_line}\n\n{sender_line}"
+
+
 class TwitterDownloader:
-    def __init__(self, cookie: Optional[str] = None, proxies: Optional[dict] = None):
-        self.auth_token = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
-        self.cookie = cookie or os.getenv('TWITTER_COOKIE', '')
+    def __init__(
+        self,
+        cookie: Optional[str] = None,
+        proxies: Optional[dict] = None,
+        cookie_file: Optional[str] = None,
+    ):
+        self.cookie = cookie or get_runtime_value('TWITTER_COOKIE')
         self.proxies = proxies or {}
+        default_cookie_file = os.path.join('config', 'x.com_cookies.txt')
+        self.cookie_file = cookie_file or get_runtime_value('TWITTER_COOKIE_FILE') or default_cookie_file
 
         self.session = requests.Session()
         if self.proxies:
             self.session.proxies.update(self.proxies)
 
-        self.headers = {
-            'authorization': self.auth_token,
-            'Cookie': self.cookie,
+    def _build_ydl_opts(self) -> Dict[str, Any]:
+        opts: Dict[str, Any] = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'extract_flat': False,
+        }
+
+        headers: Dict[str, str] = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
         }
-        csrf_token = self._extract_csrf_token(self.cookie)
-        if csrf_token:
-            self.headers['x-csrf-token'] = csrf_token
-        self.session.headers.update(self.headers)
+        if self.cookie_file and os.path.isfile(self.cookie_file):
+            # Prefer cookie file format exported from browser for stable auth.
+            opts['cookiefile'] = self.cookie_file
+        elif self.cookie:
+            headers['Cookie'] = self.cookie
+            csrf_token = self._extract_csrf_token(self.cookie)
+            if csrf_token:
+                headers['x-csrf-token'] = csrf_token
+        opts['http_headers'] = headers
+
+        if self.proxies:
+            proxy = next((p for p in self.proxies.values() if p), None)
+            if proxy:
+                opts['proxy'] = proxy
+
+        return opts
 
     @staticmethod
     def _extract_csrf_token(cookie_str: str) -> Optional[str]:
@@ -57,99 +118,332 @@ class TwitterDownloader:
         return match[0] if match else None
 
     def _activate_guest_token(self) -> None:
-        if self.cookie and 'x-csrf-token' in self.headers:
-            return
-        try:
-            response = self.session.post(HOST_URL, timeout=5)
-            response.raise_for_status()
-            guest_token = response.json().get('guest_token')
-            if guest_token:
-                self.session.headers.update({'x-guest-token': guest_token})
-        except Exception as e:
-            logger.error(f'Error fetching guest token: {e}')
+        # yt-dlp handles Twitter/X extraction without manual guest-token bootstrapping.
+        return
 
-    def _parse_tweet_content(self, tw_content: dict, twt_id: str) -> Tuple[Dict, Dict, Dict, Dict]:
-        pic_dict, gif_dict, vid_dict, text_dict = {}, {}, {}, {}
-        str_content = json.dumps(tw_content)
+    @staticmethod
+    def _extract_filename(url: str, fallback: str) -> str:
+        file_name = url.split('?', 1)[0].rsplit('/', 1)[-1]
+        return file_name or fallback
 
-        pic_links = P_PIC_LINK.findall(str_content)
-        for link, filename in pic_links:
-            pic_dict[filename] = {'url': f'{link}?name=orig', 'twtId': twt_id}
+    def _parse_ydlp_info(self, info: Mapping[str, Any], twt_id: str) -> Tuple[Dict, Dict, Dict, Dict]:
+        pic_dict: Dict[str, Dict[str, str]] = {}
+        gif_dict: Dict[str, Dict[str, str]] = {}
+        vid_dict: Dict[str, Dict[str, str]] = {}
+        text_dict: Dict[str, str] = {}
 
-        gif_links = P_GIF_LINK.findall(str_content)
-        for link, filename in gif_links:
-            gif_dict[filename] = {'url': link, 'twtId': twt_id}
+        raw_entries = info.get('entries')
+        entries: List[Mapping[str, Any]]
+        if isinstance(raw_entries, list):
+            entries = [entry for entry in raw_entries if isinstance(entry, dict)]
+            if not entries:
+                entries = [info]
+        else:
+            entries = [info]
 
-        vid_links = P_VID_LINK.findall(str_content) + P_VID_LINK1.findall(str_content)
-        if vid_links:
-            best_choices: Dict[str, Dict[str, Any]] = {}
-            for link_match in vid_links:
-                url, file_id, _, resolution_str, filename = link_match[:5]
-                best_choices.setdefault(file_id, {'resolution': 0, 'file_name': None, 'url': None})
-                try:
-                    width, height = map(int, resolution_str.split('x'))
-                    res_val = width * height
-                    if res_val > best_choices[file_id]['resolution']:
-                        best_choices[file_id].update({'resolution': res_val, 'file_name': filename, 'url': url})
-                except Exception:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            entry_id = str(entry.get('id') or twt_id)
+            text_value = entry.get('description') or entry.get('title')
+            if text_value:
+                text_dict[entry_id] = text_value
+
+            # Twitter images appear as pbs.twimg.com thumbnails in yt-dlp metadata.
+            for thumb in entry.get('thumbnails') or []:
+                thumb_url = thumb.get('url') if isinstance(thumb, dict) else None
+                if not thumb_url or 'pbs.twimg.com/media/' not in thumb_url:
                     continue
-            for choice in best_choices.values():
-                if choice['file_name']:
-                    vid_dict[choice['file_name']] = {'url': choice['url'], 'twtId': twt_id}
+                file_name = self._extract_filename(thumb_url, f'{entry_id}.jpg')
+                pic_dict[file_name] = {'url': thumb_url, 'twtId': entry_id}
 
-        try:
-            result_node = tw_content.get('itemContent', {}).get('tweet_results', {}).get('result', {})
-            if 'note_tweet' in result_node:
-                text_dict[twt_id] = result_node['note_tweet']['note_tweet_results']['result']['text']
-            elif 'tweet' in result_node:
-                text_dict[twt_id] = result_node['tweet']['legacy']['full_text']
-            elif 'legacy' in result_node:
-                text_dict[twt_id] = result_node['legacy']['full_text']
-        except Exception as e:
-            logger.debug(f'Failed to parse text for {twt_id}: {e}')
+            best_video: Optional[Dict[str, str]] = None
+            best_resolution = 0
+            for fmt in entry.get('formats') or []:
+                if not isinstance(fmt, dict):
+                    continue
+                fmt_url = fmt.get('url')
+                vcodec = fmt.get('vcodec')
+                ext = fmt.get('ext')
+                if not fmt_url or vcodec in (None, 'none'):
+                    continue
+                if ext and ext != 'mp4':
+                    continue
+
+                width = fmt.get('width') or 0
+                height = fmt.get('height') or 0
+                resolution = int(width) * int(height)
+                if resolution >= best_resolution:
+                    best_resolution = resolution
+                    best_video = {
+                        'url': fmt_url,
+                        'file_name': self._extract_filename(fmt_url, f'{entry_id}.mp4'),
+                        'twtId': entry_id,
+                        'acodec': str(fmt.get('acodec') or ''),
+                    }
+
+            if best_video:
+                media_key = 'gif' if best_video.get('acodec') in ('', 'none') else 'vid'
+                target = gif_dict if media_key == 'gif' else vid_dict
+                target[str(best_video['file_name'])] = {'url': str(best_video['url']), 'twtId': entry_id}
 
         return pic_dict, gif_dict, vid_dict, text_dict
 
-    def get_single_tweet_data(self, twt_id: str) -> Optional[Dict[str, Any]]:
-        params = {
-            'variables': SINGLE_PAGE_API_PAR.format(twt_id),
-            'features': SINGLE_PAGE_API_PAR2,
-            'fieldToggles': SINGLE_PAGE_API_PAR3,
-        }
+    def _fetch_syndication_fallback(self, twt_id: str) -> Optional[Dict[str, Any]]:
+        """Fallback to Twitter syndication API for text/images when yt-dlp cannot extract media."""
+        url = f"https://cdn.syndication.twimg.com/tweet-result?id={twt_id}&lang=en"
         try:
-            response = self.session.get(SINGLE_PAGE_API, params=params, timeout=10)
-            if response.status_code != 200:
-                logger.warning(f'Failed to fetch content for tweet {twt_id}. Status: {response.status_code}')
-                return None
-            page_content = response.text
-            if 'Age-restricted adult content' in page_content or 'Sorry, that page does not exist' in page_content:
-                return None
-            if f'"tweet-{twt_id}"' not in page_content:
+            response = self.session.get(url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
                 return None
 
-            data = response.json()
-            instructions = data.get('data', {}).get('threaded_conversation_with_injections_v2', {}).get('instructions', [])
-            entries = []
-            for instruction in instructions:
-                entries.extend(instruction.get('entries', []))
+            text_value = str(
+                payload.get("text")
+                or payload.get("full_text")
+                or payload.get("display_text")
+                or ""
+            ).strip()
 
-            tw_content = None
-            for entry in entries:
-                if f'tweet-{twt_id}' in entry.get('entryId', ''):
-                    tw_content = entry.get('content')
-                    break
-            if not tw_content and entries:
-                tw_content = entries[0].get('content')
-            if not tw_content:
-                return None
+            pic_list: Dict[str, Dict[str, str]] = {}
+            photos = payload.get("photos")
+            if isinstance(photos, list):
+                for idx, photo in enumerate(photos, start=1):
+                    if not isinstance(photo, dict):
+                        continue
+                    photo_url = photo.get("url")
+                    if not photo_url:
+                        continue
+                    file_name = self._extract_filename(str(photo_url), f"{twt_id}_{idx}.jpg")
+                    pic_list[file_name] = {"url": str(photo_url), "twtId": twt_id}
 
-            pic_list, gif_list, vid_list, text_list = self._parse_tweet_content(tw_content, twt_id)
-            return {'picList': pic_list, 'gifList': gif_list, 'vidList': vid_list, 'textList': text_list}
-        except requests.RequestException as e:
-            logger.error(f'Request error fetching tweet {twt_id}: {e}')
+            media_details = payload.get("mediaDetails")
+            if isinstance(media_details, list):
+                for idx, media in enumerate(media_details, start=1):
+                    if not isinstance(media, dict):
+                        continue
+                    if str(media.get("type") or "").lower() != "photo":
+                        continue
+                    media_url = media.get("media_url_https") or media.get("media_url")
+                    if not media_url:
+                        continue
+                    file_name = self._extract_filename(str(media_url), f"{twt_id}_m_{idx}.jpg")
+                    pic_list[file_name] = {"url": str(media_url), "twtId": twt_id}
+
+            return {
+                "picList": pic_list,
+                "gifList": {},
+                "vidList": {},
+                "textList": ({twt_id: text_value} if text_value else {}),
+            }
+        except Exception as e:
+            logger.error(f"Syndication fallback failed for tweet {twt_id}: {e}")
             return None
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f'Data parse error for tweet {twt_id}: {e}')
+
+    @staticmethod
+    def _strip_html_text(raw_html: str) -> str:
+        text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _fetch_oembed_text_fallback(self, tweet_url: str, twt_id: str) -> Optional[Dict[str, Any]]:
+        encoded_url = urllib.parse.quote(tweet_url, safe="")
+        oembed_url = f"https://publish.twitter.com/oembed?omit_script=1&url={encoded_url}"
+        try:
+            response = self.session.get(oembed_url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return None
+
+            html_block = str(payload.get("html") or "")
+            text_value = self._strip_html_text(html_block)
+            pic_list = self._extract_oembed_pic_list(html_block, twt_id)
+            if not text_value and not pic_list:
+                return None
+
+            return {
+                "picList": pic_list,
+                "gifList": {},
+                "vidList": {},
+                "textList": ({twt_id: text_value} if text_value else {}),
+            }
+        except Exception as e:
+            logger.error(f"oEmbed fallback failed for tweet {twt_id}: {e}")
+            return None
+
+    def _fetch_vxtwitter_fallback(self, twt_id: str) -> Optional[Dict[str, Any]]:
+        api_url = f"https://api.vxtwitter.com/Twitter/status/{twt_id}"
+        try:
+            response = self.session.get(api_url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return None
+
+            text_value = str(payload.get("text") or "").strip()
+            pic_list: Dict[str, Dict[str, str]] = {}
+            gif_list: Dict[str, Dict[str, str]] = {}
+            vid_list: Dict[str, Dict[str, str]] = {}
+
+            media_urls = payload.get("mediaURLs")
+            if isinstance(media_urls, list):
+                for index, media_url in enumerate(media_urls, start=1):
+                    if not isinstance(media_url, str) or not media_url:
+                        continue
+                    file_name = self._extract_filename(media_url, f"{twt_id}_vx_{index}.jpg")
+                    if media_url.lower().endswith(".mp4"):
+                        vid_list[file_name] = {"url": media_url, "twtId": twt_id}
+                    else:
+                        pic_list[file_name] = {"url": media_url, "twtId": twt_id}
+
+            media_extended = payload.get("media_extended")
+            if isinstance(media_extended, list):
+                for index, media in enumerate(media_extended, start=1):
+                    if not isinstance(media, dict):
+                        continue
+                    media_type = str(media.get("type") or "").lower()
+                    media_url = str(media.get("url") or media.get("thumbnail_url") or "").strip()
+                    if not media_url:
+                        continue
+                    file_name = self._extract_filename(media_url, f"{twt_id}_vx_ext_{index}.bin")
+                    if media_type == "image":
+                        pic_list[file_name] = {"url": media_url, "twtId": twt_id}
+                    elif media_type == "gif":
+                        gif_list[file_name] = {"url": media_url, "twtId": twt_id}
+                    elif media_type == "video":
+                        vid_list[file_name] = {"url": media_url, "twtId": twt_id}
+
+            if not pic_list and not gif_list and not vid_list and not text_value:
+                return None
+
+            return {
+                "picList": pic_list,
+                "gifList": gif_list,
+                "vidList": vid_list,
+                "textList": ({twt_id: text_value} if text_value else {}),
+            }
+        except Exception as e:
+            logger.error("vxtwitter fallback failed for tweet %s: %s", twt_id, e)
+            return None
+
+    def _extract_oembed_pic_list(self, html_block: str, twt_id: str) -> Dict[str, Dict[str, str]]:
+        pic_list: Dict[str, Dict[str, str]] = {}
+        if not html_block:
+            return pic_list
+
+        html_text = html.unescape(html_block)
+        for image_url in P_PBS_IMAGE_LINK.findall(html_text):
+            normalized = image_url.replace("&amp;", "&")
+            file_name = self._extract_filename(normalized, f"{twt_id}_oembed.jpg")
+            pic_list[file_name] = {"url": normalized, "twtId": twt_id}
+
+        for index, short_url in enumerate(P_PIC_TWITTER_LINK.findall(html_text), start=1):
+            resolved_url = self._resolve_pic_twitter_to_image_url(short_url)
+            if not resolved_url:
+                continue
+            file_name = self._extract_filename(resolved_url, f"{twt_id}_oembed_{index}.jpg")
+            pic_list[file_name] = {"url": resolved_url, "twtId": twt_id}
+
+        return pic_list
+
+    def _resolve_pic_twitter_to_image_url(self, short_url: str) -> Optional[str]:
+        try:
+            normalized_short_url = short_url if short_url.startswith("http") else f"https://{short_url}"
+            response = self.session.get(normalized_short_url, timeout=20, allow_redirects=True)
+            response.raise_for_status()
+            final_url = str(response.url or "")
+            if "pbs.twimg.com/media/" in final_url:
+                return final_url
+
+            html_text = response.text or ""
+            match = P_META_IMAGE.search(html_text)
+            if not match:
+                return None
+
+            image_url = html.unescape(match.group(1)).strip()
+            if image_url.startswith("//"):
+                image_url = f"https:{image_url}"
+            if image_url.startswith("http") and "pbs.twimg.com/" in image_url:
+                return image_url
+        except Exception as e:
+            logger.warning("Failed to resolve pic.twitter short link %s: %s", short_url, e)
+        return None
+
+    def _enrich_piclist_from_text_short_links(self, data_dict: Dict[str, Any]) -> None:
+        pic_list = data_dict.setdefault("picList", {})
+        text_list = data_dict.get("textList", {})
+        if not isinstance(text_list, dict):
+            return
+
+        matches_found = 0
+        resolved_found = 0
+        for twt_id, text_value in text_list.items():
+            text = str(text_value or "")
+            for index, short_url in enumerate(P_PIC_TWITTER_LINK.findall(text), start=1):
+                matches_found += 1
+                image_url = self._resolve_pic_twitter_to_image_url(short_url)
+                if not image_url:
+                    continue
+                resolved_found += 1
+                file_name = self._extract_filename(image_url, f"{twt_id}_pic_{index}.jpg")
+                pic_list[file_name] = {"url": image_url, "twtId": str(twt_id)}
+
+        if matches_found:
+            logger.info(
+                "pic.twitter short-link enrichment: matches=%d resolved=%d total_images=%d",
+                matches_found,
+                resolved_found,
+                len(pic_list),
+            )
+
+    @staticmethod
+    def _has_payload_content(data: Optional[Dict[str, Any]]) -> bool:
+        if not data:
+            return False
+        return bool(data.get("picList") or data.get("gifList") or data.get("vidList") or data.get("textList"))
+
+    def get_single_tweet_data(self, twt_id: str) -> Optional[Dict[str, Any]]:
+        tweet_url = f'https://x.com/i/status/{twt_id}'
+        try:
+            with yt_dlp.YoutubeDL(cast(Any, self._build_ydl_opts())) as ydl:
+                info = ydl.extract_info(tweet_url, download=False)
+
+            if not isinstance(info, dict):
+                return None
+
+            pic_list, gif_list, vid_list, text_list = self._parse_ydlp_info(info, twt_id)
+            return {'picList': pic_list, 'gifList': gif_list, 'vidList': vid_list, 'textList': text_list}
+        except DownloadError as e:
+            logger.error(f'yt-dlp extraction error for tweet {twt_id}: {e}')
+            fallback = self._fetch_syndication_fallback(twt_id)
+            if self._has_payload_content(fallback):
+                logger.info("Using syndication fallback for tweet %s after yt-dlp error", twt_id)
+                return fallback
+
+            logger.info("Syndication fallback empty for tweet %s, trying oEmbed fallback", twt_id)
+            oembed_data = self._fetch_oembed_text_fallback(tweet_url, twt_id)
+            if self._has_payload_content(oembed_data):
+                logger.info("Using oEmbed text fallback for tweet %s after yt-dlp error", twt_id)
+                if oembed_data and oembed_data.get("picList"):
+                    return oembed_data
+
+            logger.info("oEmbed fallback has no media for tweet %s, trying vxtwitter fallback", twt_id)
+            vx_data = self._fetch_vxtwitter_fallback(twt_id)
+            if self._has_payload_content(vx_data):
+                logger.info("Using vxtwitter fallback for tweet %s after yt-dlp error", twt_id)
+                return vx_data
+
+            if self._has_payload_content(oembed_data):
+                logger.info("Using oEmbed text-only fallback for tweet %s after yt-dlp error", twt_id)
+                return oembed_data
+            return None
+        except Exception as e:
+            logger.error(f'Unexpected extraction error for tweet {twt_id}: {e}')
             return None
 
     def handle_url(self, url: str) -> Optional[Dict[str, Any]]:
@@ -171,7 +465,13 @@ class TwitterDownloader:
         self._activate_guest_token()
         data_dict = self.handle_url(url)
         if not data_dict:
+            logger.error(
+                "Twitter extraction returned no payload for url=%s. Likely deleted/protected/region-restricted tweet or auth issue.",
+                url,
+            )
             return [], {}
+
+        self._enrich_piclist_from_text_short_links(data_dict)
 
         media_list: List[Tuple[str, bytes]] = []
         for item in data_dict.get('picList', {}).values():
@@ -189,4 +489,15 @@ class TwitterDownloader:
                 media_list.append(('vid', self.download_media_bytes(item['url'])))
             except requests.RequestException as e:
                 logger.warning(f"Failed to download Twitter/X video media {item.get('url')}: {e}")
-        return media_list, data_dict.get('textList', {})
+        text_list = data_dict.get('textList', {})
+        if not media_list and not text_list:
+            logger.error(
+                "Twitter extraction produced empty result for url=%s. payload_keys=%s pic=%d gif=%d vid=%d text=%d",
+                url,
+                sorted(list(data_dict.keys())),
+                len(data_dict.get('picList', {})),
+                len(data_dict.get('gifList', {})),
+                len(data_dict.get('vidList', {})),
+                len(text_list),
+            )
+        return media_list, text_list

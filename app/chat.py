@@ -1,17 +1,20 @@
-import os
 import json
 import sys
 import requests
+from app.runtime_config import get_runtime_value
 
 
 class ChatClient:
     def __init__(self, api_key: str | None = None, url: str | None = None):
-        self.api_key = api_key or os.getenv("AZURE_API_KEY")
-        self.url = url or os.getenv("AZURE_API_URL")
+        self.api_key = api_key or get_runtime_value("AZURE_API_KEY") or get_runtime_value("AZURE_OPENAI_API_KEY")
+        self.url = url or get_runtime_value("AZURE_API_URL") or get_runtime_value("AZURE_OPENAI_ENDPOINT")
         if not self.api_key:
-            raise ValueError("AZURE_API_KEY environment variable is not set.")
-        if not url:
-            raise ValueError("URL must be provided. eg. https://*.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview")
+            raise ValueError("API key is required. Set AZURE_OPENAI_API_KEY or AZURE_API_KEY.")
+        if not self.url:
+            raise ValueError(
+                "Endpoint URL is required. Set AZURE_OPENAI_ENDPOINT or AZURE_API_URL, "
+                "or pass url explicitly."
+            )
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",

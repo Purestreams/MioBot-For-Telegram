@@ -8,14 +8,42 @@ from typing import Optional
 import numpy as np
 
 from app.rag_embeddings import embed_text, pack_embedding, unpack_embedding
+from app.runtime_config import get_runtime_bool, get_runtime_int, get_runtime_value
 
-DB_FILE = "message_history.db"
-MESSAGE_REVIEW_BACK = 80
+DB_FILE = get_runtime_value("DB_FILE")
+logger = logging.getLogger(__name__)
 
-# RAG defaults
-RAG_RECENT_N = int(os.getenv("RAG_RECENT_N", "20"))
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "12"))
-RAG_ENABLED = os.getenv("RAG_ENABLED", "1") not in {"0", "false", "False"}
+
+def _db_file_path() -> str:
+    # Prefer runtime env override while preserving compatibility with test monkeypatching.
+    return get_runtime_value("DB_FILE") or DB_FILE
+
+
+def _ensure_db_parent_dir(db_file: str) -> None:
+    parent_dir = os.path.dirname(db_file)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+
+def _get_env_int(name: str, default: int) -> int:
+    value = get_runtime_int(name, default)
+    if value == default:
+        raw = get_runtime_value(name)
+        if raw and raw != str(default):
+            logger.warning("Invalid %s=%r, using default=%d", name, raw, default)
+    return value
+
+
+def _rag_top_k() -> int:
+    return _get_env_int("RAG_TOP_K", 12)
+
+
+def _rag_enabled() -> bool:
+    return get_runtime_bool("RAG_ENABLED", True)
+
+
+def _message_review_back() -> int:
+    return _get_env_int("MESSAGE_REVIEW_BACK", 80)
 
 
 @dataclass(frozen=True)
@@ -41,9 +69,44 @@ async def _enable_foreign_keys(db: aiosqlite.Connection) -> None:
         # Best effort; if it fails, DB still works but cascade deletes won't.
         pass
 
+
+def _get_message_columns(db: sqlite3.Connection) -> set[str]:
+    cursor = db.execute("PRAGMA table_info(messages)")
+    return {str(row[1]) for row in cursor.fetchall()}
+
+
+def _migrate_messages_table(db: sqlite3.Connection) -> None:
+    columns = _get_message_columns(db)
+
+    if "telegram_message_id" not in columns:
+        db.execute("ALTER TABLE messages ADD COLUMN telegram_message_id INTEGER")
+    if "reply_to_telegram_message_id" not in columns:
+        db.execute("ALTER TABLE messages ADD COLUMN reply_to_telegram_message_id INTEGER")
+    if "reply_to_db_message_id" not in columns:
+        db.execute("ALTER TABLE messages ADD COLUMN reply_to_db_message_id INTEGER")
+    if "reply_to_username" not in columns:
+        db.execute("ALTER TABLE messages ADD COLUMN reply_to_username TEXT")
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_tg ON messages (chat_id, telegram_message_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_messages_reply_db ON messages (reply_to_db_message_id)")
+
+    # Best-effort backfill for old rows that embedded reply target in content.
+    db.execute(
+        '''
+        UPDATE messages
+        SET reply_to_username = TRIM(SUBSTR(content, 11, INSTR(SUBSTR(content, 11), ']') - 1))
+        WHERE reply_to_username IS NULL
+          AND content LIKE '[reply_to:%'
+          AND INSTR(SUBSTR(content, 11), ']') > 0
+        '''
+    )
+
 def init_db():
     """Initializes the database and creates the messages table if it doesn't exist."""
-    with sqlite3.connect(DB_FILE) as db:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    with sqlite3.connect(db_file) as db:
         db.execute("PRAGMA foreign_keys = ON")
         db.execute('''
             CREATE TABLE IF NOT EXISTS messages (
@@ -51,9 +114,14 @@ def init_db():
                 chat_id INTEGER NOT NULL,
                 username TEXT NOT NULL,
                 content TEXT NOT NULL,
+                telegram_message_id INTEGER,
+                reply_to_telegram_message_id INTEGER,
+                reply_to_db_message_id INTEGER,
+                reply_to_username TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        _migrate_messages_table(db)
         db.execute('CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON messages (chat_id, timestamp)')
 
         db.execute('''
@@ -71,19 +139,36 @@ def init_db():
         db.execute('CREATE INDEX IF NOT EXISTS idx_embed_chat_msg ON message_embeddings (chat_id, message_id)')
 
         db.commit()
-        # Ensure the table is created
-        print("Database initialized successfully.")
-        #print the latest 5 messages
-        print(db.execute('SELECT * FROM messages ORDER BY timestamp DESC LIMIT 5').fetchall())
+        logger.info("Database initialized: %s", db_file)
 
-async def add_message(chat_id: int, username: str, content: str):
-    """Adds a message to the history and culls old messages."""
-    async with aiosqlite.connect(DB_FILE) as db:
+async def add_message(
+    chat_id: int,
+    username: str,
+    content: str,
+    *,
+    telegram_message_id: Optional[int] = None,
+    reply_to_telegram_message_id: Optional[int] = None,
+    reply_to_username: Optional[str] = None,
+):
+    """Adds a message to the history with optional reply-chain metadata."""
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
         await _enable_foreign_keys(db)
         # Add the new message
         cursor = await db.execute(
-            "INSERT INTO messages (chat_id, username, content) VALUES (?, ?, ?)",
-            (chat_id, username, content)
+            """
+            INSERT INTO messages (
+                chat_id,
+                username,
+                content,
+                telegram_message_id,
+                reply_to_telegram_message_id,
+                reply_to_username
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, username, content, telegram_message_id, reply_to_telegram_message_id, reply_to_username)
         )
 
         lastrowid = cursor.lastrowid
@@ -92,41 +177,54 @@ async def add_message(chat_id: int, username: str, content: str):
             return
         message_id = int(lastrowid)
 
+        # Resolve parent DB row for reply chain when Telegram parent id is known.
+        if reply_to_telegram_message_id is not None:
+            parent_cursor = await db.execute(
+                '''
+                SELECT id
+                FROM messages
+                WHERE chat_id = ? AND telegram_message_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                ''',
+                (chat_id, reply_to_telegram_message_id),
+            )
+            parent_row = await parent_cursor.fetchone()
+            if parent_row:
+                await db.execute(
+                    "UPDATE messages SET reply_to_db_message_id = ? WHERE id = ?",
+                    (int(parent_row[0]), message_id),
+                )
+
         # Store local embedding (best-effort)
         try:
             vec = await embed_text(f"{username}: {content}")
             blob, dim = pack_embedding(vec)
             await db.execute(
                 "INSERT OR REPLACE INTO message_embeddings (message_id, chat_id, embedding, dim, model) VALUES (?, ?, ?, ?, ?)",
-                (message_id, chat_id, blob, dim, os.getenv("EMBED_MODEL")),
+                (message_id, chat_id, blob, dim, get_runtime_value("EMBED_MODEL")),
             )
         except Exception as e:
             logging.warning(f"Embedding failed for message {message_id}: {e}")
         
-        # Keep only the last MESSAGE_REVIEW_BACK messages for the chat
-        await db.execute('''
-            DELETE FROM messages
-            WHERE id IN (
-                SELECT id FROM messages
-                WHERE chat_id = ?
-                ORDER BY timestamp DESC
-                LIMIT -1 OFFSET ?
-            )
-        ''', (chat_id, MESSAGE_REVIEW_BACK))
         await db.commit()
 
 
-async def get_recent_messages(chat_id: int, *, limit: int = RAG_RECENT_N) -> list[MessageRow]:
-    async with aiosqlite.connect(DB_FILE) as db:
+async def get_recent_messages(chat_id: int, *, limit: Optional[int] = None) -> list[MessageRow]:
+    effective_limit = _message_review_back() if limit is None else limit
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
         await _enable_foreign_keys(db)
         cursor = await db.execute(
             '''
             SELECT id, chat_id, username, content, timestamp FROM messages
             WHERE chat_id = ?
-            ORDER BY timestamp DESC
+            ORDER BY id DESC
             LIMIT ?
             ''',
-            (chat_id, limit),
+            (chat_id, effective_limit),
         )
         rows = list(await cursor.fetchall())
         # reverse to chronological
@@ -155,14 +253,17 @@ async def vector_search_messages(
     chat_id: int,
     query: str,
     *,
-    top_k: int = RAG_TOP_K,
+    top_k: Optional[int] = None,
 ) -> list[MessageRow]:
     if not query.strip():
         return []
 
     query_vec = await embed_text(query)
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
         await _enable_foreign_keys(db)
 
         cursor = await db.execute(
@@ -202,9 +303,10 @@ async def vector_search_messages(
         # Fallback if shapes inconsistent
         return []
 
-    idx = _cosine_top_k(query_vec, matrix, top_k=top_k)
+    effective_top_k = _rag_top_k() if top_k is None else top_k
+    idx = _cosine_top_k(query_vec, matrix, top_k=effective_top_k)
     selected = [message_rows[int(i)] for i in idx]
-    selected.sort(key=lambda r: r.timestamp)
+    selected.sort(key=lambda r: r.id)
     return selected
 
 
@@ -212,8 +314,8 @@ async def get_rag_context(
     chat_id: int,
     query: str,
     *,
-    recent_n: int = RAG_RECENT_N,
-    retrieved_k: int = RAG_TOP_K,
+    recent_n: Optional[int] = None,
+    retrieved_k: Optional[int] = None,
 ) -> list[str]:
     """Return context lines where the last line is the newest message.
 
@@ -241,22 +343,25 @@ async def get_prompt_context_parts(
     chat_id: int,
     query: str,
     *,
-    recent_n: int = RAG_RECENT_N,
-    retrieved_k: int = RAG_TOP_K,
+    recent_n: Optional[int] = None,
+    retrieved_k: Optional[int] = None,
 ) -> tuple[list[str], list[str]]:
     """Return context split into recent history and retrieved RAG lines.
 
     Returns:
         (recent_lines, retrieved_lines)
     """
-    recent = await get_recent_messages(chat_id, limit=recent_n)
+    effective_recent_n = _message_review_back() if recent_n is None else recent_n
+    effective_retrieved_k = _rag_top_k() if retrieved_k is None else retrieved_k
+
+    recent = await get_recent_messages(chat_id, limit=effective_recent_n)
 
     retrieved: list[MessageRow] = []
-    if RAG_ENABLED:
+    if _rag_enabled():
         try:
-            retrieved = await vector_search_messages(chat_id, query, top_k=retrieved_k)
+            retrieved = await vector_search_messages(chat_id, query, top_k=effective_retrieved_k)
         except Exception as e:
-            logging.warning(f"Vector search failed: {e}")
+            logger.exception("Vector search failed: %s", e)
             retrieved = []
 
     recent_ids = {m.id for m in recent}
@@ -269,6 +374,6 @@ async def get_prompt_context_parts(
 async def get_messages(chat_id: int) -> list[str]:
     """Retrieves the last messages for a given chat, formatted as strings."""
     # Back-compat: return recent chat only.
-    recent = await get_recent_messages(chat_id, limit=MESSAGE_REVIEW_BACK)
-    logging.info(recent[-1] if recent else "No messages found for this chat.")
+    recent = await get_recent_messages(chat_id, limit=_message_review_back())
+    logger.info(recent[-1] if recent else "No messages found for this chat.")
     return [_format_message(m) for m in recent]

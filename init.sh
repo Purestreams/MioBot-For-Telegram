@@ -4,8 +4,9 @@ set -euo pipefail
 apt-get update
 apt-get install texlive-latex-recommended texlive-fonts-recommended texlive-xetex texlive-latex-extra ffmpeg -y
 
-python3 -m pip install --upgrade pip
-python3 -m pip install python-telegram-bot markdown2 pillow aiofiles aiohttp requests beautifulsoup4 playwright openai aiosqlite reportlab yt-dlp pypdfium2 numpy fastembed onnxruntime --upgrade
+curl -LsSf https://astral.sh/uv/install.sh | sh
+#python3 -m pip install --upgrade pip
+#python3 -m pip install python-telegram-bot markdown2 pillow aiofiles aiohttp requests beautifulsoup4 playwright openai aiosqlite reportlab yt-dlp pypdfium2 numpy fastembed onnxruntime --upgrade
 
 # Playwright optimization:
 # 1) Do not use --with-deps here because system deps are already handled above.
@@ -18,3 +19,6 @@ if find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 1 -type d -name 'chromium_headless
 else
 	playwright install chromium --only-shell
 fi
+
+uv sync
+uv run python main.py

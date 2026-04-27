@@ -4,8 +4,9 @@ import app.youtube_dl as youtube_dl
 
 
 class _Response:
-    def __init__(self, url: str):
+    def __init__(self, url: str, headers=None):
         self.url = url
+        self.headers = headers or {}
 
     def raise_for_status(self):
         return None
@@ -26,7 +27,10 @@ class _Client:
 
 
 def test_get_bilibili_permanent_url_extracts_canonical_url(monkeypatch):
-    response = _Response("https://www.bilibili.com/video/BV1abc1234?p=1")
+    response = _Response(
+        "https://b23.tv/xyz",
+        headers={"location": "https://www.bilibili.com/video/BV1abc1234?p=1"},
+    )
     monkeypatch.setattr(youtube_dl.httpx, "AsyncClient", lambda **kwargs: _Client(response))
 
     result = asyncio.run(youtube_dl.get_bilibili_permanent_url("https://b23.tv/xyz"))

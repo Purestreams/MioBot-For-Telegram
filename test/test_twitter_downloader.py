@@ -45,7 +45,10 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
                 "https://x.com/minokakay/status/2035538892175405329?s=46&amp;t=6C5C8msOW1klCHHbUUlASA"
             )
             self.assertEqual(result, {"ok": True})
-            mocked.assert_called_once_with("2035538892175405329")
+            mocked.assert_called_once_with(
+                "2035538892175405329",
+                "https://x.com/minokakay/status/2035538892175405329?s=46&t=6C5C8msOW1klCHHbUUlASA",
+            )
 
     def test_parse_ydlp_info_selects_highest_resolution_video(self):
         info = {
@@ -78,6 +81,48 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         self.assertEqual(gif, {})
         self.assertIn("high.mp4", vid)
         self.assertNotIn("low.mp4", vid)
+        self.assertEqual(text.get("111"), "hello world")
+
+    def test_parse_ydlp_info_prefers_direct_mp4_over_hls_manifest(self):
+        info = {
+            "id": "111",
+            "description": "hello world",
+            "formats": [
+                {
+                    "format_id": "http-2176",
+                    "url": "https://video.twimg.com/ext_tw_video/111/pu/vid/1280x720/high.mp4",
+                    "ext": "mp4",
+                    "protocol": "https",
+                    "width": 1280,
+                    "height": 720,
+                },
+                {
+                    "format_id": "hls-6017",
+                    "url": "https://video.twimg.com/ext_tw_video/111/pu/pl/1280x720/high.m3u8",
+                    "ext": "mp4",
+                    "protocol": "m3u8_native",
+                    "vcodec": "avc1.640033",
+                    "acodec": "none",
+                    "width": 1280,
+                    "height": 720,
+                },
+                {
+                    "format_id": "hls-audio-128000-Audio",
+                    "url": "https://video.twimg.com/ext_tw_video/111/pu/pl/audio.m3u8",
+                    "ext": "mp4",
+                    "protocol": "m3u8_native",
+                    "vcodec": "none",
+                    "width": None,
+                    "height": None,
+                },
+            ],
+        }
+
+        pic, gif, vid, text = self.downloader._parse_ydlp_info(info, "111")
+        self.assertEqual(pic, {})
+        self.assertEqual(gif, {})
+        self.assertIn("high.mp4", vid)
+        self.assertEqual(vid["high.mp4"]["url"], "https://video.twimg.com/ext_tw_video/111/pu/vid/1280x720/high.mp4")
         self.assertEqual(text.get("111"), "hello world")
 
     def test_get_single_tweet_data_uses_yt_dlp(self):
@@ -175,6 +220,7 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
                     "textList": {"123": "oembed text"},
                 },
             ) as oembed,
+            mock.patch.object(self.downloader, "_fetch_fxtwitter_fallback", return_value=None) as fxt,
         ):
             ydl = ydl_cls.return_value.__enter__.return_value
             ydl.extract_info.side_effect = DownloadError("ERROR: [twitter] 123: No video could be found in this tweet")
@@ -186,6 +232,7 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         self.assertEqual(data["textList"].get("123"), "oembed text")
         syndication.assert_called_once_with("123")
         oembed.assert_called_once()
+        fxt.assert_called_once_with("123")
 
     def test_fetch_oembed_text_fallback_extracts_pbs_image_from_html(self):
         response = mock.Mock()
@@ -244,7 +291,7 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         syndication.assert_called_once_with("123")
         oembed.assert_not_called()
 
-    def test_get_single_tweet_data_prefers_vxtwitter_when_oembed_has_no_media(self):
+    def test_get_single_tweet_data_prefers_fxtwitter_when_oembed_has_no_media(self):
         with (
             mock.patch("app.twitter_downloader.yt_dlp.YoutubeDL") as ydl_cls,
             mock.patch.object(self.downloader, "_fetch_syndication_fallback", return_value={
@@ -265,14 +312,15 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
             ) as oembed,
             mock.patch.object(
                 self.downloader,
-                "_fetch_vxtwitter_fallback",
+                "_fetch_fxtwitter_fallback",
                 return_value={
                     "picList": {"img.jpg": {"url": "https://pbs.twimg.com/media/img.jpg", "twtId": "123"}},
                     "gifList": {},
                     "vidList": {},
-                    "textList": {"123": "vx text"},
+                    "textList": {"123": "fx text"},
                 },
-            ) as vxt,
+            ) as fxt,
+            mock.patch.object(self.downloader, "_fetch_vxtwitter_fallback") as vxt,
         ):
             ydl = ydl_cls.return_value.__enter__.return_value
             ydl.extract_info.side_effect = DownloadError("ERROR: [twitter] 123: Error(s) while querying API: Internal server error")
@@ -284,7 +332,25 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         self.assertIn("img.jpg", data["picList"])
         syndication.assert_called_once_with("123")
         oembed.assert_called_once()
-        vxt.assert_called_once_with("123")
+        fxt.assert_called_once_with("123")
+        vxt.assert_not_called()
+
+    def test_fetch_oembed_text_fallback_normalizes_to_status_url(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "html": '<blockquote><p>hello</p></blockquote>'
+        }
+
+        with mock.patch.object(self.downloader.session, "get", return_value=response) as getter:
+            data = self.downloader._fetch_oembed_text_fallback(
+                "https://x.com/NASA/status/2048166203735040057?s=46&t=abc",
+                "2048166203735040057",
+            )
+
+        self.assertIsNotNone(data)
+        called_url = getter.call_args.args[0]
+        self.assertIn("twitter.com%2FNASA%2Fstatus%2F2048166203735040057", called_url)
 
     def test_fetch_vxtwitter_fallback_parses_image_media(self):
         response = mock.Mock()

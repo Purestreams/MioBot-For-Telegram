@@ -7,9 +7,24 @@ import re
 import os
 import subprocess
 import logging
+from urllib.parse import urljoin
 
 TELEGRAM_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024
 logger = logging.getLogger(__name__)
+
+DEFAULT_HTTP_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/135.0.0.0 Safari/537.36'
+    ),
+}
+
+BILIBILI_HTTP_HEADERS = {
+    **DEFAULT_HTTP_HEADERS,
+    'Referer': 'https://www.bilibili.com/',
+    'Origin': 'https://www.bilibili.com',
+}
 
 BILIBILI_URL_REGEX = (
     r'(https?://)?(?:www\.|m\.)?'
@@ -18,6 +33,33 @@ BILIBILI_URL_REGEX = (
     r'([A-Za-z0-9_-]{6,12})'
     r'(?:[/?#][^\s]*)?'
 )
+
+
+def _is_bilibili_url(url: str) -> bool:
+    return bool(re.match(BILIBILI_URL_REGEX, url or ''))
+
+
+def _extract_bilibili_canonical_url(url: str) -> Optional[str]:
+    match = re.search(r'https?://www\.bilibili\.com/video/[^/?]+', url or '')
+    if not match:
+        return None
+    return match.group(0)
+
+
+def _build_ydl_base_opts(url: str) -> dict:
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noprogress': True,
+        'noplaylist': True,
+        'retries': 3,
+        'fragment_retries': 3,
+        'socket_timeout': 30,
+        'http_headers': dict(DEFAULT_HTTP_HEADERS),
+    }
+    if _is_bilibili_url(url):
+        ydl_opts['http_headers'] = dict(BILIBILI_HTTP_HEADERS)
+    return ydl_opts
 
 async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
     """
@@ -30,19 +72,25 @@ async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
     """
     
     ydl_opts = {
-        # Select the best 720p video with h264 codec and the best audio,
-        # and merge them into an mp4 file.
-        'format': 'bestvideo[height<=720][vcodec^=avc]+bestaudio/best[height<=720][vcodec^=avc]',
+        **_build_ydl_base_opts(url),
+        # Prefer H.264 when available, but keep a broader fallback so site-side
+        # format changes do not turn into hard download failures.
+        'format': (
+            'bestvideo[height<=720][vcodec^=avc1]+bestaudio/'
+            'bestvideo[height<=720][vcodec^=avc]+bestaudio/'
+            'bestvideo[height<=720]+bestaudio/'
+            'best[height<=720]/best'
+        ),
         'merge_output_format': 'mp4',
         'outtmpl': output_path,
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',  # The container format
+            'preferedformat': 'mp4',
         }],
         'postprocessor_args': [
-            '-c:v', 'copy',  # Copy the video stream without re-encoding
-            '-c:a', 'aac',   # Re-encode the audio to AAC
-            '-b:a', '128k',  # Set the audio bitrate to 128Kbps
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '128k',
         ],
     }
 
@@ -131,10 +179,7 @@ async def get_video_title(url: str) -> Optional[str]:
     Returns:
         str: The title of the video, or None if it can't be fetched.
     """
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-    }
+    ydl_opts = _build_ydl_base_opts(url)
     loop = asyncio.get_running_loop()
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -182,20 +227,33 @@ async def get_bilibili_permanent_url(url: str) -> Optional[str]:
     if not isinstance(url, str) or not url.strip():
         return None
 
+    canonical_from_input = _extract_bilibili_canonical_url(url)
+    if canonical_from_input:
+        return canonical_from_input
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=20.0,
+            headers=BILIBILI_HTTP_HEADERS,
+        ) as client:
             response = await client.head(url)
             response.raise_for_status()
     except Exception as e:
         logger.warning("Failed to resolve Bilibili URL %s: %s", url, e)
         return None
 
-    pattern = r'https?://www\.bilibili\.com/video/[^/?]+'
-    match = re.search(pattern, str(response.url))
-    if match:
-        return match.group(0)
+    response_headers = getattr(response, 'headers', {}) or {}
+    location = response_headers.get('location', '')
+    resolved_url = str(response.url)
+    if location:
+        resolved_url = urljoin(str(response.url), location)
 
-    logger.warning("Could not extract Bilibili permanent URL from: %s", response.url)
+    canonical_url = _extract_bilibili_canonical_url(resolved_url)
+    if canonical_url:
+        return canonical_url
+
+    logger.warning("Could not extract Bilibili permanent URL from: %s", resolved_url)
     return None
 
 

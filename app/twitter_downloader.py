@@ -22,6 +22,15 @@ P_META_IMAGE = re.compile(
 )
 P_PBS_IMAGE_LINK = re.compile(r'https?://pbs\.twimg\.com/[^"\'\s<]+', re.IGNORECASE)
 
+DEFAULT_HTTP_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/135.0.0.0 Safari/537.36'
+    ),
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
 
 def is_twitter_status_url(url: str) -> bool:
     return bool(P_TWT_LINK.search(html.unescape(url or '')))
@@ -88,11 +97,12 @@ class TwitterDownloader:
             'skip_download': True,
             'noplaylist': True,
             'extract_flat': False,
+            'retries': 3,
+            'fragment_retries': 3,
+            'socket_timeout': 30,
         }
 
-        headers: Dict[str, str] = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-        }
+        headers: Dict[str, str] = dict(DEFAULT_HTTP_HEADERS)
         if self.cookie_file and os.path.isfile(self.cookie_file):
             # Prefer cookie file format exported from browser for stable auth.
             opts['cookiefile'] = self.cookie_file
@@ -126,6 +136,83 @@ class TwitterDownloader:
         file_name = url.split('?', 1)[0].rsplit('/', 1)[-1]
         return file_name or fallback
 
+    @staticmethod
+    def _looks_like_hls_manifest(url: str, protocol: str) -> bool:
+        lowered_url = str(url or '').lower()
+        lowered_protocol = str(protocol or '').lower()
+        return lowered_url.endswith('.m3u8') or 'm3u8' in lowered_protocol
+
+    @classmethod
+    def _select_best_direct_video_format(cls, formats: List[Mapping[str, Any]]) -> Optional[Dict[str, str]]:
+        best_video: Optional[Dict[str, str]] = None
+        best_score: Tuple[int, int, int, int] = (-1, -1, -1, -1)
+
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+
+            fmt_url = str(fmt.get('url') or '').strip()
+            if not fmt_url:
+                continue
+
+            protocol = str(fmt.get('protocol') or '')
+            ext = str(fmt.get('ext') or '')
+            width = int(fmt.get('width') or 0)
+            height = int(fmt.get('height') or 0)
+            format_id = str(fmt.get('format_id') or '')
+            vcodec = fmt.get('vcodec')
+            is_audio_only = (
+                vcodec == 'none'
+                or (
+                    vcodec is None
+                    and width == 0
+                    and height == 0
+                    and 'audio' in format_id.lower()
+                )
+            )
+            if is_audio_only:
+                continue
+
+            is_direct_http = protocol in {'http', 'https'}
+            is_hls = cls._looks_like_hls_manifest(fmt_url, protocol)
+            is_mp4 = ext == 'mp4' or fmt_url.lower().split('?', 1)[0].endswith('.mp4')
+            bitrate = int(fmt.get('tbr') or fmt.get('abr') or 0)
+            resolution = width * height
+            score = (1 if is_direct_http else 0, 1 if is_mp4 else 0, 0 if is_hls else 1, resolution + bitrate)
+            if score <= best_score:
+                continue
+
+            best_score = score
+            best_video = {
+                'url': fmt_url,
+                'file_name': cls._extract_filename(fmt_url, 'video.mp4'),
+                'acodec': str(fmt.get('acodec') or ''),
+            }
+
+        return best_video
+
+    @staticmethod
+    def _has_audio_only_formats(formats: List[Mapping[str, Any]]) -> bool:
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+            format_id = str(fmt.get('format_id') or '').lower()
+            width = int(fmt.get('width') or 0)
+            height = int(fmt.get('height') or 0)
+            vcodec = fmt.get('vcodec')
+            if vcodec == 'none' or ('audio' in format_id and width == 0 and height == 0):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_status_url_for_oembed(tweet_url: str, twt_id: str) -> str:
+        decoded_url = html.unescape(tweet_url or '').strip()
+        match = P_TWT_LINK.search(decoded_url)
+        if match:
+            username = match.group(1)
+            return f'https://twitter.com/{username}/status/{match.group(2)}'
+        return f'https://twitter.com/i/status/{twt_id}'
+
     def _parse_ydlp_info(self, info: Mapping[str, Any], twt_id: str) -> Tuple[Dict, Dict, Dict, Dict]:
         pic_dict: Dict[str, Dict[str, str]] = {}
         gif_dict: Dict[str, Dict[str, str]] = {}
@@ -158,33 +245,13 @@ class TwitterDownloader:
                 file_name = self._extract_filename(thumb_url, f'{entry_id}.jpg')
                 pic_dict[file_name] = {'url': thumb_url, 'twtId': entry_id}
 
-            best_video: Optional[Dict[str, str]] = None
-            best_resolution = 0
-            for fmt in entry.get('formats') or []:
-                if not isinstance(fmt, dict):
-                    continue
-                fmt_url = fmt.get('url')
-                vcodec = fmt.get('vcodec')
-                ext = fmt.get('ext')
-                if not fmt_url or vcodec in (None, 'none'):
-                    continue
-                if ext and ext != 'mp4':
-                    continue
-
-                width = fmt.get('width') or 0
-                height = fmt.get('height') or 0
-                resolution = int(width) * int(height)
-                if resolution >= best_resolution:
-                    best_resolution = resolution
-                    best_video = {
-                        'url': fmt_url,
-                        'file_name': self._extract_filename(fmt_url, f'{entry_id}.mp4'),
-                        'twtId': entry_id,
-                        'acodec': str(fmt.get('acodec') or ''),
-                    }
+            entry_formats = [fmt for fmt in (entry.get('formats') or []) if isinstance(fmt, dict)]
+            best_video = self._select_best_direct_video_format(entry_formats)
 
             if best_video:
-                media_key = 'gif' if best_video.get('acodec') in ('', 'none') else 'vid'
+                media_key = 'gif'
+                if best_video.get('acodec') not in ('', 'none') or self._has_audio_only_formats(entry_formats):
+                    media_key = 'vid'
                 target = gif_dict if media_key == 'gif' else vid_dict
                 target[str(best_video['file_name'])] = {'url': str(best_video['url']), 'twtId': entry_id}
 
@@ -251,10 +318,11 @@ class TwitterDownloader:
         return text
 
     def _fetch_oembed_text_fallback(self, tweet_url: str, twt_id: str) -> Optional[Dict[str, Any]]:
-        encoded_url = urllib.parse.quote(tweet_url, safe="")
+        normalized_tweet_url = self._normalize_status_url_for_oembed(tweet_url, twt_id)
+        encoded_url = urllib.parse.quote(normalized_tweet_url, safe="")
         oembed_url = f"https://publish.twitter.com/oembed?omit_script=1&url={encoded_url}"
         try:
-            response = self.session.get(oembed_url, timeout=20)
+            response = self.session.get(oembed_url, timeout=20, headers=DEFAULT_HTTP_HEADERS)
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):
@@ -274,6 +342,77 @@ class TwitterDownloader:
             }
         except Exception as e:
             logger.error(f"oEmbed fallback failed for tweet {twt_id}: {e}")
+            return None
+
+    def _fetch_fxtwitter_fallback(self, twt_id: str) -> Optional[Dict[str, Any]]:
+        api_url = f"https://api.fxtwitter.com/2/status/{twt_id}"
+        try:
+            response = self.session.get(api_url, timeout=20, headers=DEFAULT_HTTP_HEADERS)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or int(payload.get('code') or 0) != 200:
+                return None
+
+            status = payload.get('status')
+            if not isinstance(status, dict):
+                return None
+
+            text_value = str(status.get('raw_text') or status.get('text') or '').strip()
+            media_payload = status.get('media')
+            if not isinstance(media_payload, dict):
+                media_payload = {}
+
+            pic_list: Dict[str, Dict[str, str]] = {}
+            gif_list: Dict[str, Dict[str, str]] = {}
+            vid_list: Dict[str, Dict[str, str]] = {}
+
+            for index, item in enumerate(media_payload.get('all') or [], start=1):
+                if not isinstance(item, dict):
+                    continue
+
+                media_type = str(item.get('type') or '').lower()
+                media_url = str(item.get('url') or '').strip()
+                formats = item.get('formats')
+                if isinstance(formats, list):
+                    direct_formats = [fmt for fmt in formats if isinstance(fmt, dict)]
+                    best_direct = None
+                    best_bitrate = -1
+                    for fmt in direct_formats:
+                        fmt_url = str(fmt.get('url') or '').strip()
+                        if not fmt_url:
+                            continue
+                        container = str(fmt.get('container') or '').lower()
+                        if container != 'mp4' or self._looks_like_hls_manifest(fmt_url, ''):
+                            continue
+                        bitrate = int(fmt.get('bitrate') or 0)
+                        if bitrate >= best_bitrate:
+                            best_bitrate = bitrate
+                            best_direct = fmt_url
+                    if best_direct:
+                        media_url = best_direct
+
+                if not media_url:
+                    continue
+
+                file_name = self._extract_filename(media_url, f'{twt_id}_fx_{index}.bin')
+                if media_type == 'image':
+                    pic_list[file_name] = {'url': media_url, 'twtId': twt_id}
+                elif media_type == 'gif':
+                    gif_list[file_name] = {'url': media_url, 'twtId': twt_id}
+                elif media_type == 'video':
+                    vid_list[file_name] = {'url': media_url, 'twtId': twt_id}
+
+            if not pic_list and not gif_list and not vid_list and not text_value:
+                return None
+
+            return {
+                'picList': pic_list,
+                'gifList': gif_list,
+                'vidList': vid_list,
+                'textList': ({twt_id: text_value} if text_value else {}),
+            }
+        except Exception as e:
+            logger.error("fxtwitter fallback failed for tweet %s: %s", twt_id, e)
             return None
 
     def _fetch_vxtwitter_fallback(self, twt_id: str) -> Optional[Dict[str, Any]]:
@@ -407,11 +546,12 @@ class TwitterDownloader:
             return False
         return bool(data.get("picList") or data.get("gifList") or data.get("vidList") or data.get("textList"))
 
-    def get_single_tweet_data(self, twt_id: str) -> Optional[Dict[str, Any]]:
-        tweet_url = f'https://x.com/i/status/{twt_id}'
+    def get_single_tweet_data(self, twt_id: str, tweet_url: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        extraction_url = f'https://x.com/i/status/{twt_id}'
+        fallback_url = tweet_url or extraction_url
         try:
             with yt_dlp.YoutubeDL(cast(Any, self._build_ydl_opts())) as ydl:
-                info = ydl.extract_info(tweet_url, download=False)
+                info = ydl.extract_info(extraction_url, download=False)
 
             if not isinstance(info, dict):
                 return None
@@ -426,13 +566,19 @@ class TwitterDownloader:
                 return fallback
 
             logger.info("Syndication fallback empty for tweet %s, trying oEmbed fallback", twt_id)
-            oembed_data = self._fetch_oembed_text_fallback(tweet_url, twt_id)
+            oembed_data = self._fetch_oembed_text_fallback(fallback_url, twt_id)
             if self._has_payload_content(oembed_data):
                 logger.info("Using oEmbed text fallback for tweet %s after yt-dlp error", twt_id)
                 if oembed_data and oembed_data.get("picList"):
                     return oembed_data
 
-            logger.info("oEmbed fallback has no media for tweet %s, trying vxtwitter fallback", twt_id)
+            logger.info("oEmbed fallback has no media for tweet %s, trying fxtwitter fallback", twt_id)
+            fx_data = self._fetch_fxtwitter_fallback(twt_id)
+            if self._has_payload_content(fx_data):
+                logger.info("Using fxtwitter fallback for tweet %s after yt-dlp error", twt_id)
+                return fx_data
+
+            logger.info("fxtwitter fallback empty for tweet %s, trying vxtwitter fallback", twt_id)
             vx_data = self._fetch_vxtwitter_fallback(twt_id)
             if self._has_payload_content(vx_data):
                 logger.info("Using vxtwitter fallback for tweet %s after yt-dlp error", twt_id)
@@ -452,7 +598,7 @@ class TwitterDownloader:
         if twt_match:
             twt_id = twt_match[0][1]
             logger.info(f'Identified tweet URL. Tweet ID: {twt_id}')
-            return self.get_single_tweet_data(twt_id)
+            return self.get_single_tweet_data(twt_id, decoded_url)
         logger.warning(f'Unsupported or unrecognized Twitter URL: {decoded_url}')
         return None
 

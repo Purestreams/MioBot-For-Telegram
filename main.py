@@ -116,6 +116,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+TELEGRAM_CAPTION_LIMIT = 1024
+
+
+def _truncate_caption_text(text: str, max_chars: int = TELEGRAM_CAPTION_LIMIT) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
 
 
 async def _handle_twitter_media_message(
@@ -481,13 +488,16 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
 
             await status_message.edit_text("Download completed successfully. Sending the video...")
             caption_url = await resolve_caption_url(video_url)
+            video_caption = _truncate_caption_text(
+                f'{video_title}\n<a href="{caption_url}">original link</a>\nRequested by: {sender_display}'
+            )
 
             with open(file_to_send_path, 'rb') as video:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=video,
                     reply_to_message_id=update.message.message_id,
-                    caption=f'{video_title}\n<a href="{caption_url}">original link</a>\nRequested by: {sender_display}',
+                    caption=video_caption,
                     parse_mode=ParseMode.HTML,
                 )
 

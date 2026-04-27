@@ -35,6 +35,15 @@ def test_tweet_text_summary_prefers_first_value():
     assert summary == "hello twitter"
 
 
+def test_truncate_caption_text_caps_telegram_caption_length():
+    caption = "x" * (main.TELEGRAM_CAPTION_LIMIT + 50)
+
+    truncated = main._truncate_caption_text(caption)
+
+    assert len(truncated) == main.TELEGRAM_CAPTION_LIMIT
+    assert truncated.endswith("...")
+
+
 def test_format_tweet_text_for_reply_keeps_tweet_body_only():
     formatted = format_tweet_text_for_reply(
         "Manus CEO没有政治敏感度，说让你开会你真的去开会…… 这下好了，这辈子出不去了 — 面包🍞 (@himself65) March 25, 2026",

@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import app.youtube_dl as youtube_dl
 
@@ -63,3 +64,23 @@ def test_download_video_to_file_returns_fallback_title(monkeypatch):
 
     assert title == "Video"
     assert called == {"url": "https://example.com/v", "output_path": "output/test.mp4"}
+
+
+def test_normalize_output_path_truncates_overlong_filename(tmp_path: Path):
+    long_name = "a" * 400 + ".mp4"
+
+    normalized_path = youtube_dl._normalize_output_path(str(tmp_path / long_name))
+
+    assert Path(normalized_path).parent == tmp_path
+    assert len(Path(normalized_path).name.encode("utf-8")) <= youtube_dl.MAX_FILENAME_BYTES
+    assert normalized_path.endswith(".mp4")
+
+
+def test_build_compressed_output_path_keeps_filename_within_limit(tmp_path: Path):
+    long_input = tmp_path / (("中" * 180) + ".mp4")
+
+    compressed_path = youtube_dl._build_compressed_output_path(str(long_input))
+
+    assert Path(compressed_path).parent == tmp_path
+    assert len(Path(compressed_path).name.encode("utf-8")) <= youtube_dl.MAX_FILENAME_BYTES
+    assert compressed_path.endswith("_compressed.mp4")

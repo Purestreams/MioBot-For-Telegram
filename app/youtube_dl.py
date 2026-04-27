@@ -5,11 +5,13 @@ from typing import Optional
 import httpx
 import re
 import os
+import hashlib
 import subprocess
 import logging
 from urllib.parse import urljoin
 
 TELEGRAM_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024
+MAX_FILENAME_BYTES = 240
 logger = logging.getLogger(__name__)
 
 DEFAULT_HTTP_HEADERS = {
@@ -61,6 +63,60 @@ def _build_ydl_base_opts(url: str) -> dict:
         ydl_opts['http_headers'] = dict(BILIBILI_HTTP_HEADERS)
     return ydl_opts
 
+
+def _truncate_filename_component(component: str, extension: str = '', *, suffix: str = '') -> str:
+    normalized_component = (component or '').strip() or 'video'
+    extension = extension or ''
+    suffix = suffix or ''
+
+    full_name = f'{normalized_component}{suffix}{extension}'
+    if len(os.fsencode(full_name)) <= MAX_FILENAME_BYTES:
+        return normalized_component
+
+    digest = hashlib.sha1(os.fsencode(full_name)).hexdigest()[:10]
+    marker = f'_{digest}'
+    reserved_bytes = len(os.fsencode(f'{suffix}{marker}{extension}'))
+    budget = max(16, MAX_FILENAME_BYTES - reserved_bytes)
+
+    encoded = os.fsencode(normalized_component)
+    truncated = encoded[:budget]
+    while truncated:
+        try:
+            truncated_component = truncated.decode('utf-8')
+            break
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    else:
+        truncated_component = 'video'
+
+    truncated_component = truncated_component.rstrip(' ._') or 'video'
+    return f'{truncated_component}{marker}'
+
+
+def _normalize_output_path(output_path: str) -> str:
+    if not output_path:
+        return output_path
+
+    directory, filename = os.path.split(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    if not filename or '%(' in filename:
+        return output_path
+
+    stem, extension = os.path.splitext(filename)
+    normalized_stem = _truncate_filename_component(stem, extension)
+    if normalized_stem == stem:
+        return output_path
+    return os.path.join(directory, f'{normalized_stem}{extension}')
+
+
+def _build_compressed_output_path(input_path: str) -> str:
+    directory, filename = os.path.split(input_path)
+    stem, _ = os.path.splitext(filename)
+    compressed_stem = _truncate_filename_component(stem, '.mp4', suffix='_compressed')
+    return os.path.join(directory, f'{compressed_stem}_compressed.mp4')
+
 async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
     """
     Downloads a video from a URL to a 720p H.264 MP4 file asynchronously.
@@ -71,6 +127,8 @@ async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
                            Defaults to the video's title.
     """
     
+    normalized_output_path = _normalize_output_path(output_path)
+
     ydl_opts = {
         **_build_ydl_base_opts(url),
         # Prefer H.264 when available, but keep a broader fallback so site-side
@@ -82,7 +140,7 @@ async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
             'best[height<=720]/best'
         ),
         'merge_output_format': 'mp4',
-        'outtmpl': output_path,
+        'outtmpl': normalized_output_path,
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
             'preferedformat': 'mp4',
@@ -126,8 +184,7 @@ async def compress_video_if_needed(input_path: str, max_size_bytes: int = TELEGR
     if os.path.getsize(input_path) <= max_size_bytes:
         return input_path
 
-    base, _ = os.path.splitext(input_path)
-    compressed_path = f"{base}_compressed.mp4"
+    compressed_path = _build_compressed_output_path(input_path)
 
     cmd = [
         "ffmpeg",
@@ -211,7 +268,7 @@ async def resolve_caption_url(video_url: str) -> str:
 async def download_video_to_file(video_url: str, output_file_path: str) -> str:
     """Download supported video media and return a display title."""
     video_title = await get_video_title(video_url)
-    await download_video_720p_h264(video_url, output_path=output_file_path)
+    await download_video_720p_h264(video_url, output_path=_normalize_output_path(output_file_path))
     return video_title or "Video"
     
 async def get_bilibili_permanent_url(url: str) -> Optional[str]:

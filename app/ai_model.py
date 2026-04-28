@@ -33,7 +33,7 @@ from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
-from app.runtime_config import get_runtime_value
+from app.runtime_config import get_runtime_bool, get_runtime_value
 
 try:  # Optional dependency for Azure support
   from openai import AsyncAzureOpenAI
@@ -56,6 +56,7 @@ class LLMSettings:
   """Configuration for the active LLM provider."""
 
   provider: LLMProvider
+  enable_thinking: bool = False
   azure_endpoint: Optional[str] = None
   azure_api_key: Optional[str] = None
   azure_api_version: Optional[str] = None
@@ -85,6 +86,7 @@ _azure_client: Any = None
 def configure_llm(
   *,
   provider: Optional[str | LLMProvider] = None,
+  enable_thinking: Optional[bool] = None,
   azure_endpoint: Optional[str] = None,
   azure_api_key: Optional[str] = None,
   azure_api_version: Optional[str] = None,
@@ -104,6 +106,8 @@ def configure_llm(
 
   if provider is not None:
     settings.provider = _coerce_provider(provider)
+  if enable_thinking is not None:
+    settings.enable_thinking = bool(enable_thinking)
   # When provider is omitted, keep the env-selected provider from
   # _load_settings_from_env() instead of overriding based on credentials.
 
@@ -154,6 +158,7 @@ def _load_settings_from_env() -> LLMSettings:
     provider = LLMProvider.ARK
 
   settings = LLMSettings(provider=provider)
+  settings.enable_thinking = get_runtime_bool("LLM_ENABLE_THINKING", False)
 
   settings.azure_endpoint = get_runtime_value("AZURE_OPENAI_ENDPOINT")
   settings.azure_api_key = get_runtime_value("AZURE_OPENAI_API_KEY")
@@ -373,7 +378,7 @@ async def _chat_completion_ark(
     "response_format": ark_response_format,
     "tools": tools,
     "tool_choice": tool_choice,
-    "thinking": {"type": "disabled"},
+    "thinking": {"type": "enabled" if settings.enable_thinking else "disabled"},
   }
 
   if extra_body:

@@ -12,6 +12,7 @@ _BOOTSTRAPPED = False
 # Centralized runtime defaults. Keep config/runtime.env(.template) aligned.
 DEFAULTS = {
     "LLM_PROVIDER": "ark",
+    "LLM_ENABLE_THINKING": "0",
     "AZURE_OPENAI_API_VERSION": "2024-04-01-preview",
     "AZURE_OPENAI_DEPLOYMENT_NAME": "gpt-5-mini",
     "ARK_API_ENDPOINT": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",

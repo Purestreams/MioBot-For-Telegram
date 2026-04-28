@@ -44,6 +44,7 @@ from app.database import (
     get_sticker_text,
     init_db,
     log_embedding_health_report,
+    reindex_message_embeddings,
     upsert_sticker_text,
 )
 from app.image2text import image_to_text, sticker_to_text
@@ -162,8 +163,10 @@ def _build_group_reply_runtime_state(
     trigger_type: str,
     direct_addressed: bool,
 ) -> list[str]:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
     return [
-        f"current_time_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}",
+        f"current_date_utc: {now_utc.date().isoformat()}",
+        f"current_weekday_utc: {now_utc.strftime('%A')}",
         f"sender_display: {sender_display}",
         f"trigger_type: {trigger_type}",
         f"direct_addressed: {str(direct_addressed).lower()}",
@@ -734,8 +737,6 @@ async def handle_photo_for_group_ai_reply(update: Update, context: ContextTypes.
             synthesized_text,
             additional_context=[
                 "input_type: image",
-                f"image_message_id: {update.message.message_id}",
-                f"captured_at_unix: {int(time.time())}",
             ],
         )
     except Exception as e:
@@ -760,7 +761,6 @@ async def handle_sticker_for_group_ai_reply(update: Update, context: ContextType
         synthesized_text,
         additional_context=[
             "input_type: sticker",
-            f"sticker_file_unique_id: {getattr(sticker, 'file_unique_id', '(unknown)')}",
             f"sticker_emoji: {getattr(sticker, 'emoji', '(none)') or '(none)'}",
             f"sticker_set_name: {getattr(sticker, 'set_name', '(none)') or '(none)'}",
             f"sticker_cached: {str(description_source == 'cache').lower()}",
@@ -884,6 +884,24 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("crypto", handle_crypto_command))
 
 
+async def _ensure_embedding_index_ready() -> None:
+    report = await log_embedding_health_report()
+    if not report.get("needs_reindex"):
+        return
+
+    logger.warning(
+        "Detected legacy or drifted embeddings in %s. Reindexing automatically before bot startup.",
+        report.get("db_file", "(unknown db)"),
+    )
+    result = await reindex_message_embeddings()
+    logger.info(
+        "Automatic embedding reindex finished. reindexed=%s signature=%s",
+        result.get("reindexed"),
+        result.get("signature"),
+    )
+    await log_embedding_health_report()
+
+
 def main() -> None:
     """Start the bot."""
 
@@ -891,7 +909,7 @@ def main() -> None:
 
     # Initialize the database
     init_db()
-    asyncio.run(log_embedding_health_report())
+    asyncio.run(_ensure_embedding_index_ready())
 
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()

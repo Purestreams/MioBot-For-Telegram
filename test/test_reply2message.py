@@ -13,17 +13,24 @@ def test_build_user_prompt_contains_all_sections():
     prompt = reply2message._build_user_prompt(
         ["m1", "m2"],
         rag_related_messages=["r1"],
-        additional_context=["a1"],
+        additional_context=["a1", "user_personal_memory:\nlikes tea"],
         runtime_state=["s1"],
+        direct_address_state=["is_mentioned: true"],
     )
-    assert "PART 1: HISTORY MESSAGE" in prompt
-    assert "m1\nm2" in prompt
+    assert "PART 1: EARLIER HISTORY" in prompt
+    assert "m1" in prompt
     assert "PART 2: RAG RELATED MESSAGE" in prompt
     assert "r1" in prompt
-    assert "PART 3: ADDITIONAL IMPORTANT CONTEXT" in prompt
+    assert "PART 3: DURABLE CONTEXT" in prompt
+    assert "likes tea" in prompt
+    assert "PART 4: MESSAGE-SPECIFIC CONTEXT" in prompt
     assert "a1" in prompt
-    assert "PART 4: RUNTIME STATE" in prompt
+    assert "PART 5: DIRECT ADDRESS FLAGS" in prompt
+    assert "is_mentioned: true" in prompt
+    assert "PART 6: RUNTIME STATE" in prompt
     assert "s1" in prompt
+    assert "PART 7: LATEST MESSAGE TO RESPOND TO" in prompt
+    assert prompt.rstrip().endswith("m2")
 
 
 def test_should_activate_reply_returns_true_when_model_says_yes(monkeypatch, tmp_path):
@@ -48,8 +55,10 @@ def test_should_activate_reply_returns_true_when_model_says_yes(monkeypatch, tmp
 
     assert result is True
     system_prompt = called["messages"][0]["content"]
-    assert "is_mentioned = True" in system_prompt
-    assert "directly_addressed = True" in system_prompt
+    user_prompt = called["messages"][1]["content"]
+    assert "LATEST MESSAGE TO RESPOND TO" in system_prompt
+    assert "is_mentioned: true" in user_prompt
+    assert "directly_addressed: true" in user_prompt
 
 
 def test_should_activate_reply_returns_false_on_invalid_json(monkeypatch, tmp_path):

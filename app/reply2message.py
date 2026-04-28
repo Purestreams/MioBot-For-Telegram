@@ -98,60 +98,92 @@ def _load_information_lines() -> list[str]:
     return []
 
 
+def _build_direct_address_state(*, is_reply_to_bot: bool, is_mentioned: bool) -> list[str]:
+    directly_addressed = is_reply_to_bot or is_mentioned
+    return [
+        f"is_reply_to_bot: {str(is_reply_to_bot).lower()}",
+        f"is_mentioned: {str(is_mentioned).lower()}",
+        f"directly_addressed: {str(directly_addressed).lower()}",
+    ]
+
+
+def _split_latest_message(message_history: list[str]) -> tuple[list[str], str]:
+    if not message_history:
+        return [], "(empty)"
+    return message_history[:-1], message_history[-1]
+
+
+def _split_additional_context(additional_context: Optional[list[str]]) -> tuple[list[str], list[str]]:
+    durable_context: list[str] = []
+    message_specific_context: list[str] = []
+
+    for line in additional_context or []:
+        if line.startswith("user_memory_key:") or line.startswith("user_personal_memory:"):
+            durable_context.append(line)
+        else:
+            message_specific_context.append(line)
+
+    return durable_context, message_specific_context
+
+
 def _build_user_prompt(
     message_history: list[str],
     rag_related_messages: Optional[list[str]] = None,
     additional_context: Optional[list[str]] = None,
     runtime_state: Optional[list[str]] = None,
+    direct_address_state: Optional[list[str]] = None,
 ) -> str:
-    history_block = "\n".join(message_history) if message_history else "(empty)"
+    earlier_history, latest_message = _split_latest_message(message_history)
+    durable_context, message_specific_context = _split_additional_context(additional_context)
+
+    history_block = "\n".join(earlier_history) if earlier_history else "(empty)"
     rag_block = "\n".join(rag_related_messages or []) if rag_related_messages else "(empty)"
-    additional_block = "\n".join(additional_context or []) if additional_context else "(none)"
+    durable_block = "\n".join(durable_context) if durable_context else "(none)"
+    message_specific_block = "\n".join(message_specific_context) if message_specific_context else "(none)"
+    direct_address_block = "\n".join(direct_address_state or []) if direct_address_state else "(none)"
     runtime_block = "\n".join(runtime_state or []) if runtime_state else "(none)"
 
     return (
-        "Here is the prompt context in 4 parts plus optional extras:\n\n"
-        "### PART 1: HISTORY MESSAGE\n"
+        "Here is the prompt context in 7 parts. The final section is the newest message.\n\n"
+        "### PART 1: EARLIER HISTORY\n"
         f"{history_block}\n\n"
         "### PART 2: RAG RELATED MESSAGE\n"
         f"{rag_block}\n\n"
-        "### PART 3: ADDITIONAL IMPORTANT CONTEXT\n"
-        f"{additional_block}\n\n"
-        "### PART 4: RUNTIME STATE\n"
-        f"{runtime_block}\n"
+        "### PART 3: DURABLE CONTEXT\n"
+        f"{durable_block}\n\n"
+        "### PART 4: MESSAGE-SPECIFIC CONTEXT\n"
+        f"{message_specific_block}\n\n"
+        "### PART 5: DIRECT ADDRESS FLAGS\n"
+        f"{direct_address_block}\n\n"
+        "### PART 6: RUNTIME STATE\n"
+        f"{runtime_block}\n\n"
+        "### PART 7: LATEST MESSAGE TO RESPOND TO\n"
+        f"{latest_message}\n"
     )
 
 
-def _build_probe_system_prompt(*, is_reply_to_bot: bool, is_mentioned: bool) -> str:
-    directly_addressed = is_reply_to_bot or is_mentioned
+def _build_probe_system_prompt() -> str:
     return f"""
 You decide whether Mioo / 小小宫 should reply to the latest message in a Telegram group chat.
 
 Rules:
 - Return valid JSON with exactly two keys: \"should_reply\" and \"reason\".
-- The message history is ordered from oldest to newest. The last line is the latest message.
+- The section named \"LATEST MESSAGE TO RESPOND TO\" is the newest message.
+- The section named \"EARLIER HISTORY\" excludes that newest message and remains ordered from oldest to newest.
 - Decide only whether the bot should reply. Do not draft the reply itself.
 - Prefer silence unless the latest message clearly invites the bot in.
 - Reply when the latest message directly addresses the bot, asks the bot a question, gives the bot a task, or continues an active back-and-forth with the bot.
 - Stay silent for low-signal chat, acknowledgements, emoji-only reactions, or human-to-human banter that does not need the bot.
 - If the chat clearly says not to reply, prefer silence.
 - Keep \"reason\" short and specific.
-
-Direct address flags:
-- is_reply_to_bot = {is_reply_to_bot}
-- is_mentioned = {is_mentioned}
-- directly_addressed = {directly_addressed}
 """.strip()
 
 
 def _build_generation_system_prompt(
     *,
     information_lines: list[str],
-    is_reply_to_bot: bool,
-    is_mentioned: bool,
 ) -> str:
     information = "\n".join(f"- {line}" for line in information_lines) if information_lines else "(none)"
-    directly_addressed = is_reply_to_bot or is_mentioned
     return f"""
 You are Mioo, also called 小小宫 in Chinese, speaking as a participant in a Telegram group chat.
 
@@ -169,12 +201,8 @@ Rules:
 - Keep the Mioo / 小小宫 identity light, warm, and understated.
 - If directly addressed, answer the direct ask instead of staying silent.
 - If you refer to yourself in Chinese, use 小小宫. Otherwise use Mioo.
+- Use the direct-address flags and runtime state from the user context only as supporting context.
 - Return only the final reply text.
-
-Direct address flags:
-- is_reply_to_bot = {is_reply_to_bot}
-- is_mentioned = {is_mentioned}
-- directly_addressed = {directly_addressed}
 """.strip()
 
 
@@ -216,15 +244,16 @@ async def should_activate_reply(
     runtime_state: Optional[list[str]] = None,
     model: Optional[str] = None,
 ) -> bool:
+    direct_address_state = _build_direct_address_state(
+        is_reply_to_bot=is_reply_to_bot,
+        is_mentioned=is_mentioned,
+    )
     try:
         completion = await chat_completion(
             messages=[
                 {
                     "role": "system",
-                    "content": _build_probe_system_prompt(
-                        is_reply_to_bot=is_reply_to_bot,
-                        is_mentioned=is_mentioned,
-                    ),
+                    "content": _build_probe_system_prompt(),
                 },
                 {
                     "role": "user",
@@ -233,6 +262,7 @@ async def should_activate_reply(
                         rag_related_messages=rag_related_messages,
                         additional_context=additional_context,
                         runtime_state=runtime_state,
+                        direct_address_state=direct_address_state,
                     ),
                 },
             ],
@@ -262,6 +292,10 @@ async def generate_group_reply(
     runtime_state: Optional[list[str]] = None,
     model: Optional[str] = None,
 ) -> Optional[str]:
+    direct_address_state = _build_direct_address_state(
+        is_reply_to_bot=is_reply_to_bot,
+        is_mentioned=is_mentioned,
+    )
     try:
         completion = await chat_completion(
             messages=[
@@ -269,8 +303,6 @@ async def generate_group_reply(
                     "role": "system",
                     "content": _build_generation_system_prompt(
                         information_lines=_load_information_lines(),
-                        is_reply_to_bot=is_reply_to_bot,
-                        is_mentioned=is_mentioned,
                     ),
                 },
                 {
@@ -280,6 +312,7 @@ async def generate_group_reply(
                         rag_related_messages=rag_related_messages,
                         additional_context=additional_context,
                         runtime_state=runtime_state,
+                        direct_address_state=direct_address_state,
                     ),
                 },
             ],

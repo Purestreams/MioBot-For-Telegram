@@ -223,3 +223,4 @@ __marimo__/
 output/prescription*
 
 *.mp4.part
+output/*

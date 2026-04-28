@@ -372,6 +372,28 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         self.assertIn("sample2.jpg", data["picList"])
         self.assertEqual(data["textList"].get("123"), "tweet text")
 
+    def test_fetch_fxtwitter_fallback_normalizes_structured_text_payload(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "code": 200,
+            "status": {
+                "raw_text": {
+                    "text": "plain body",
+                    "display_text_range": [0, 10],
+                    "facets": [],
+                },
+                "media": {},
+            },
+        }
+
+        with mock.patch.object(self.downloader.session, "get", return_value=response):
+            data = self.downloader._fetch_fxtwitter_fallback("123")
+
+        self.assertIsNotNone(data)
+        assert data is not None
+        self.assertEqual(data["textList"].get("123"), "plain body")
+
     def test_extract_twitter_media_returns_empty_when_unhandled_url(self):
         with mock.patch.object(self.downloader, "_activate_guest_token") as activate:
             media, text = self.downloader.extract_twitter_media("https://example.com/not-twitter")

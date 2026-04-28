@@ -25,8 +25,6 @@ DEFAULTS = {
     "MESSAGE_REVIEW_BACK": "80",
     "RAG_TOP_K": "12",
     "EMBED_MODEL": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    "EMBED_BACKEND": "fastembed",
-    "EMBED_HASH_DIM": "512",
 }
 
 

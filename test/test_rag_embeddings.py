@@ -1,15 +1,18 @@
 import asyncio
 
 import numpy as np
+import pytest
 
 import app.rag_embeddings as rag
 
 
-def test_hash_embed_empty_returns_zero_vector(monkeypatch):
-    monkeypatch.setattr(rag, "_HASH_DIM", 16)
-    vec = rag._hash_embed("")
-    assert vec.shape == (16,)
-    assert np.allclose(vec, np.zeros((16,), dtype=np.float32))
+class _FakeEmbedder:
+    def __init__(self, vector):
+        self._vector = vector
+
+    def embed(self, texts):
+        for _ in texts:
+            yield self._vector
 
 
 def test_pack_unpack_roundtrip():
@@ -19,9 +22,31 @@ def test_pack_unpack_roundtrip():
     assert np.allclose(out, vec)
 
 
-def test_embed_text_uses_hash_backend_when_configured(monkeypatch):
-    monkeypatch.setattr(rag, "_EMBED_BACKEND", "hash")
-    monkeypatch.setattr(rag, "_HASH_DIM", 32)
-    out = asyncio.run(rag.embed_text("hello world"))
-    assert out.shape == (32,)
-    assert np.linalg.norm(out) > 0
+def test_get_embedder_raises_when_fastembed_is_missing(monkeypatch):
+    monkeypatch.setattr(rag, "_FASTEMBED_AVAILABLE", False)
+
+    with pytest.raises(RuntimeError, match="fastembed is required"):
+        asyncio.run(rag.get_embedder())
+
+
+def test_get_embedder_rejects_non_fastembed_backend(monkeypatch):
+    monkeypatch.setenv("EMBED_BACKEND", "hash")
+    monkeypatch.setattr(rag, "_FASTEMBED_AVAILABLE", True)
+
+    with pytest.raises(RuntimeError, match="requires fastembed only"):
+        asyncio.run(rag.get_embedder())
+
+
+def test_embed_text_with_metadata_uses_fastembed(monkeypatch):
+    async def fake_get_embedder(model_name=None):
+        return _FakeEmbedder(np.array([0.4, 0.6], dtype=np.float32))
+
+    monkeypatch.delenv("EMBED_BACKEND", raising=False)
+    monkeypatch.setattr(rag, "get_embedder", fake_get_embedder)
+
+    vector, metadata = asyncio.run(rag.embed_text_with_metadata("hello world", model_name="demo-model"))
+
+    assert np.allclose(vector, np.array([0.4, 0.6], dtype=np.float32))
+    assert metadata.backend == "fastembed"
+    assert metadata.model == "demo-model"
+    assert metadata.signature == "fastembed:demo-model"

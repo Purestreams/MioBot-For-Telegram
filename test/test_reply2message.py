@@ -14,6 +14,7 @@ def test_build_user_prompt_contains_all_sections():
         ["m1", "m2"],
         rag_related_messages=["r1"],
         additional_context=["a1"],
+        runtime_state=["s1"],
     )
     assert "PART 1: HISTORY MESSAGE" in prompt
     assert "m1\nm2" in prompt
@@ -21,9 +22,11 @@ def test_build_user_prompt_contains_all_sections():
     assert "r1" in prompt
     assert "PART 3: ADDITIONAL IMPORTANT CONTEXT" in prompt
     assert "a1" in prompt
+    assert "PART 4: RUNTIME STATE" in prompt
+    assert "s1" in prompt
 
 
-def test_should_reply_and_generate_returns_reply_when_model_says_yes(monkeypatch, tmp_path):
+def test_should_activate_reply_returns_true_when_model_says_yes(monkeypatch, tmp_path):
     info_file = tmp_path / "info.txt"
     info_file.write_text("line1\nline2\n", encoding="utf-8")
 
@@ -37,18 +40,19 @@ def test_should_reply_and_generate_returns_reply_when_model_says_yes(monkeypatch
     monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
 
     result = asyncio.run(
-        reply2message.should_reply_and_generate(
+        reply2message.should_activate_reply(
             ["u: hi"],
-            is_reply_to_bot=True,
+            is_mentioned=True,
         )
     )
 
-    assert result == "nya~"
+    assert result is True
     system_prompt = called["messages"][0]["content"]
-    assert "must_reply = True" in system_prompt
+    assert "is_mentioned = True" in system_prompt
+    assert "directly_addressed = True" in system_prompt
 
 
-def test_should_reply_and_generate_returns_none_on_invalid_json(monkeypatch, tmp_path):
+def test_should_activate_reply_returns_false_on_invalid_json(monkeypatch, tmp_path):
     info_file = tmp_path / "info.txt"
     info_file.write_text("x\n", encoding="utf-8")
 
@@ -58,35 +62,79 @@ def test_should_reply_and_generate_returns_none_on_invalid_json(monkeypatch, tmp
     monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
     monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
 
+    result = asyncio.run(reply2message.should_activate_reply(["u: hi"]))
+    assert result is False
+
+
+def test_should_activate_reply_parses_fenced_json(monkeypatch, tmp_path):
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("x\n", encoding="utf-8")
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        return _Completion("""```json\n{\"should_reply\": true, \"reason\": \"direct ask\"}\n```""")
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
+
+    result = asyncio.run(reply2message.should_activate_reply(["u: hi"]))
+    assert result is True
+
+
+def test_should_activate_reply_parses_json_with_prefixed_text(monkeypatch, tmp_path):
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("x\n", encoding="utf-8")
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        return _Completion('Sure, here is the payload: {"should_reply": true, "reason": "question"}')
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
+
+    result = asyncio.run(reply2message.should_activate_reply(["u: hi"]))
+    assert result is True
+
+
+def test_should_reply_and_generate_stops_when_probe_says_no(monkeypatch):
+    calls = {"probe": 0, "generate": 0}
+
+    async def fake_should_activate_reply(*args, **kwargs):
+        calls["probe"] += 1
+        return False
+
+    async def fake_generate_group_reply(*args, **kwargs):
+        calls["generate"] += 1
+        return "nya~"
+
+    monkeypatch.setattr(reply2message, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(reply2message, "generate_group_reply", fake_generate_group_reply)
+
     result = asyncio.run(reply2message.should_reply_and_generate(["u: hi"]))
+
     assert result is None
+    assert calls == {"probe": 1, "generate": 0}
 
 
-def test_should_reply_and_generate_parses_fenced_json(monkeypatch, tmp_path):
-    info_file = tmp_path / "info.txt"
-    info_file.write_text("x\n", encoding="utf-8")
+def test_should_reply_and_generate_skips_probe_for_direct_trigger(monkeypatch):
+    called = {}
 
-    async def fake_chat_completion(*, messages, **kwargs):
-        return _Completion("""```json\n{\"should_reply\": true, \"reply_content\": \"nya~\"}\n```""")
+    async def fail_should_activate_reply(*args, **kwargs):
+        raise AssertionError("probe should not run for direct triggers")
 
-    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
-    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
+    async def fake_generate_group_reply(*args, **kwargs):
+        called["kwargs"] = kwargs
+        return "nya~"
 
-    result = asyncio.run(reply2message.should_reply_and_generate(["u: hi"]))
-    assert result == "nya~"
+    monkeypatch.setattr(reply2message, "should_activate_reply", fail_should_activate_reply)
+    monkeypatch.setattr(reply2message, "generate_group_reply", fake_generate_group_reply)
 
-
-def test_should_reply_and_generate_parses_json_with_prefixed_text(monkeypatch, tmp_path):
-    info_file = tmp_path / "info.txt"
-    info_file.write_text("x\n", encoding="utf-8")
-
-    async def fake_chat_completion(*, messages, **kwargs):
-        return _Completion(
-            'Sure, here is the payload: {"should_reply": true, "reply_content": "meow"}'
+    result = asyncio.run(
+        reply2message.should_reply_and_generate(
+            ["u: hi"],
+            is_mentioned=True,
+            runtime_state=["trigger_type: alias_mention"],
         )
+    )
 
-    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
-    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
-
-    result = asyncio.run(reply2message.should_reply_and_generate(["u: hi"]))
-    assert result == "meow"
+    assert result == "nya~"
+    assert called["kwargs"]["is_mentioned"] is True
+    assert called["kwargs"]["runtime_state"] == ["trigger_type: alias_mention"]

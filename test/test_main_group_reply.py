@@ -1,4 +1,6 @@
 import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import main
@@ -10,6 +12,8 @@ class _FakeMessage:
         self.reply_to_message: Optional[Any] = None
         self.text = text
         self.caption = None
+        self.photo = None
+        self.sticker = None
         self.from_user: Optional[Any] = None
         self.message_id = message_id
 
@@ -41,32 +45,45 @@ class _FakeUpdate:
 def test_group_reply_pipeline_calls_rag_and_replies(monkeypatch):
     update = _FakeUpdate()
 
-    calls = {"add": 0, "rag": 0, "reply": 0}
+    calls = {"add": 0, "context": [], "probe": 0, "generate": 0}
+    captured = {"add_kwargs": []}
 
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         calls["add"] += 1
+        captured["add_kwargs"].append(kwargs)
 
     async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
-        calls["rag"] += 1
+        calls["context"].append(query)
         return ["[t] user: hello"], ["[t] user: cats and fish"]
 
-    async def fake_should_reply_and_generate(**kwargs):
-        calls["reply"] += 1
+    async def fake_should_activate_reply(**kwargs):
+        calls["probe"] += 1
+        return True
+
+    async def fake_generate_group_reply(**kwargs):
+        calls["generate"] += 1
+        assert any("user_personal_memory:" in line for line in (kwargs.get("additional_context") or []))
         return "nya~"
+
+    async def fake_refresh_user_memory_if_due(**kwargs):
+        assert kwargs["telegram_user_key"] == "tg_user:999"
+        return "likes short answers"
 
     monkeypatch.setattr(main, "add_message", fake_add_message)
     monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
-    monkeypatch.setattr(main, "should_reply_and_generate", fake_should_reply_and_generate)
-    monkeypatch.setattr(main.random, "randint", lambda a, b: 1)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
 
     update_any: Any = update
     asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "hello cats"))
 
-    # one add for user message, one add for bot reply
     assert calls["add"] == 2
-    assert calls["rag"] == 1
-    assert calls["reply"] == 1
+    assert calls["context"] == ["", "hello cats"]
+    assert calls["probe"] == 1
+    assert calls["generate"] == 1
     assert update.message.replies == ["nya~"]
+    assert captured["add_kwargs"][0]["telegram_user_key"] == "tg_user:999"
 
 
 def test_group_reply_pipeline_includes_reply_relation_context(monkeypatch):
@@ -86,20 +103,27 @@ def test_group_reply_pipeline_includes_reply_relation_context(monkeypatch):
     async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
         return ["[t] user: hello"], []
 
-    async def fake_should_reply_and_generate(**kwargs):
+    async def fake_should_activate_reply(**kwargs):
+        return True
+
+    async def fake_generate_group_reply(**kwargs):
         captured["additional_context"] = kwargs.get("additional_context")
         return None
 
+    async def fake_refresh_user_memory_if_due(**kwargs):
+        return "prefers direct answers"
+
     monkeypatch.setattr(main, "add_message", fake_add_message)
     monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
-    monkeypatch.setattr(main, "should_reply_and_generate", fake_should_reply_and_generate)
-    monkeypatch.setattr(main.random, "randint", lambda a, b: 1)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
 
     update_any: Any = update
     asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "A replying to B"))
 
     assert captured["added"]
-    assert captured["added"][0].startswith("[reply_to: UserB @user_b] Message B content")
+    assert captured["added"][0] == "A replying to B"
     assert captured["additional_context"] is not None
     assert any("message_relation" in line for line in captured["additional_context"])
     assert any(
@@ -108,3 +132,182 @@ def test_group_reply_pipeline_includes_reply_relation_context(monkeypatch):
     )
     assert any("message_reply_relation: message 101 replies to message 55" in line for line in captured["additional_context"])
     assert any("replied_to_author: UserB @user_b" in line for line in captured["additional_context"])
+    assert any("replied_to_content: Message B content" in line for line in captured["additional_context"])
+    assert any("user_personal_memory:" in line for line in captured["additional_context"])
+
+
+def test_group_reply_pipeline_stops_after_negative_probe(monkeypatch):
+    update = _FakeUpdate()
+
+    calls = {"add": 0, "context": [], "probe": 0, "generate": 0}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        calls["add"] += 1
+
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+        calls["context"].append(query)
+        return ["[t] user: hello"], []
+
+    async def fake_should_activate_reply(**kwargs):
+        calls["probe"] += 1
+        return False
+
+    async def fake_generate_group_reply(**kwargs):
+        calls["generate"] += 1
+        return "should not happen"
+
+    async def fake_refresh_user_memory_if_due(**kwargs):
+        return None
+
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
+
+    update_any: Any = update
+    asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "hello cats"))
+
+    assert calls["add"] == 1
+    assert calls["context"] == [""]
+    assert calls["probe"] == 1
+    assert calls["generate"] == 0
+    assert update.message.replies == []
+
+
+def test_group_reply_pipeline_direct_mention_bypasses_probe(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="mioo look here", message_id=77)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+
+    calls = {"probe": 0, "generate": 0, "context": []}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        return None
+
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+        calls["context"].append(query)
+        return ["[t] user: hello"], ["[t] user: mioo look here"]
+
+    async def fake_should_activate_reply(**kwargs):
+        calls["probe"] += 1
+        return True
+
+    async def fake_generate_group_reply(**kwargs):
+        calls["generate"] += 1
+        assert kwargs["is_mentioned"] is True
+        assert kwargs["runtime_state"] is not None
+        assert any("trigger_type: alias_mention" in line for line in kwargs["runtime_state"])
+        assert any("user_personal_memory:" in line for line in (kwargs.get("additional_context") or []))
+        return "在呢"
+
+    async def fake_refresh_user_memory_if_due(**kwargs):
+        return "often pings Mioo directly"
+
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
+
+    update_any: Any = update
+    asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "mioo look here"))
+
+    assert calls["probe"] == 0
+    assert calls["generate"] == 1
+    assert calls["context"] == ["mioo look here"]
+    assert update.message.replies == ["在呢"]
+
+
+def test_handle_sticker_for_group_ai_reply_uses_cached_description(monkeypatch):
+    update = _FakeUpdate()
+    update.message.sticker = SimpleNamespace(
+        file_unique_id="sticker-1",
+        file_id="file-1",
+        emoji="🙂",
+        set_name="mio_pack",
+        is_animated=False,
+        is_video=False,
+        thumbnail=None,
+    )
+    captured = {}
+
+    async def fake_get_sticker_text(file_unique_id):
+        assert file_unique_id == "sticker-1"
+        return "smiling cat waving"
+
+    async def fake_pipeline(update_arg, message_text, *, additional_context=None):
+        captured["message_text"] = message_text
+        captured["additional_context"] = additional_context
+
+    monkeypatch.setattr(main, "get_sticker_text", fake_get_sticker_text)
+    monkeypatch.setattr(main, "_handle_group_ai_reply_pipeline", fake_pipeline)
+
+    update_any: Any = update
+    context_any: Any = SimpleNamespace(bot=None)
+    asyncio.run(main.handle_sticker_for_group_ai_reply(update_any, context_any))
+
+    assert captured["message_text"] == "sticker: smiling cat waving"
+    assert any("input_type: sticker" in line for line in captured["additional_context"])
+    assert any("sticker_cached: true" in line for line in captured["additional_context"])
+
+
+def test_handle_sticker_for_group_ai_reply_reads_and_caches_new_sticker(monkeypatch, tmp_path):
+    update = _FakeUpdate()
+    update.message.sticker = SimpleNamespace(
+        file_unique_id="sticker-2",
+        file_id="file-2",
+        emoji="😾",
+        set_name="mio_pack",
+        is_animated=False,
+        is_video=False,
+        thumbnail=None,
+    )
+
+    cached = {"upsert": None, "message_text": None, "context": None, "downloaded": None}
+    sticker_path = tmp_path / "sticker.webp"
+
+    class _FakeTelegramFile:
+        async def download_to_drive(self, custom_path):
+            Path(custom_path).write_bytes(b"img")
+            cached["downloaded"] = custom_path
+            return custom_path
+
+    class _FakeBot:
+        async def get_file(self, file_id):
+            assert file_id == "file-2"
+            return _FakeTelegramFile()
+
+    async def fake_get_sticker_text(file_unique_id):
+        assert file_unique_id == "sticker-2"
+        return None
+
+    async def fake_upsert_sticker_text(file_unique_id, **kwargs):
+        cached["upsert"] = {"file_unique_id": file_unique_id, **kwargs}
+
+    async def fake_sticker_to_text(image_path, *, emoji=None, set_name=None, model=None):
+        assert Path(image_path).exists()
+        assert emoji == "😾"
+        assert set_name == "mio_pack"
+        return "angry cat glaring"
+
+    async def fake_pipeline(update_arg, message_text, *, additional_context=None):
+        cached["message_text"] = message_text
+        cached["context"] = additional_context
+
+    monkeypatch.setattr(main, "get_sticker_text", fake_get_sticker_text)
+    monkeypatch.setattr(main, "upsert_sticker_text", fake_upsert_sticker_text)
+    monkeypatch.setattr(main, "sticker_to_text", fake_sticker_to_text)
+    monkeypatch.setattr(main, "_handle_group_ai_reply_pipeline", fake_pipeline)
+    monkeypatch.setattr(main, "_build_output_path", lambda prefix, message_id, extension="jpg": str(sticker_path))
+
+    update_any: Any = update
+    context_any: Any = SimpleNamespace(bot=_FakeBot())
+    asyncio.run(main.handle_sticker_for_group_ai_reply(update_any, context_any))
+
+    assert cached["message_text"] == "sticker: angry cat glaring"
+    assert cached["upsert"] is not None
+    assert cached["upsert"]["description"] == "angry cat glaring"
+    assert cached["upsert"]["description_source"] == "sticker_file"
+    assert any("sticker_cached: false" in line for line in cached["context"])
+    assert not sticker_path.exists()

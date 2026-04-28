@@ -30,6 +30,26 @@ def test_build_rag_query_uses_keywords():
     assert query == "hello world"
 
 
+def test_classify_group_reply_trigger_detects_username_mention():
+    trigger = main._classify_group_reply_trigger("hey @MioooooooooBot look here", "MioooooooooBot")
+    assert trigger == "username_mention"
+
+
+def test_classify_group_reply_trigger_detects_alias_mention():
+    trigger = main._classify_group_reply_trigger("mioo look here", "MioooooooooBot")
+    assert trigger == "alias_mention"
+
+
+def test_classify_group_reply_trigger_ignores_embedded_alias_text():
+    trigger = main._classify_group_reply_trigger("amiooops should stay ambient", "MioooooooooBot")
+    assert trigger == "ambient"
+
+
+def test_telegram_user_key_from_user_uses_stable_telegram_user_id():
+    user = SimpleNamespace(id=123456789, username="alice")
+    assert main._telegram_user_key_from_user(user) == "tg_user:123456789"
+
+
 def test_tweet_text_summary_prefers_first_value():
     summary = summarize_tweet_text({"1": "hello twitter"})
     assert summary == "hello twitter"
@@ -388,3 +408,57 @@ def test_handle_twitter_media_message_sends_video_when_text_empty(monkeypatch):
     assert bot.messages == []
     assert status.deleted is True
     assert message.deleted is True
+
+
+def test_handle_text_for_youtube_or_group_sends_detailed_error(monkeypatch):
+    class _FakeStatusMessage:
+        def __init__(self, text):
+            self.text = text
+            self.deleted = False
+            self.edits = []
+
+        async def edit_text(self, text):
+            self.edits.append(text)
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeMessage:
+        def __init__(self, text):
+            self.text = text
+            self.message_id = 321
+            self.deleted = False
+            self.reply_calls = []
+            self.status_messages = []
+
+        async def reply_text(self, text, **kwargs):
+            self.reply_calls.append({"text": text, "kwargs": kwargs})
+            status = _FakeStatusMessage(text)
+            self.status_messages.append(status)
+            return status
+
+        async def delete(self):
+            self.deleted = True
+
+    message = _FakeMessage("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1, type="group"),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=1),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace())
+
+    async def fake_download_video_to_file(url, output_path):
+        raise ValueError("yt-dlp failed: HTTP Error 403: Forbidden")
+
+    monkeypatch.setattr(main, "_extract_video_url", lambda text: "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    monkeypatch.setattr(main, "is_twitter_status_url", lambda url: False)
+    monkeypatch.setattr(main, "download_video_to_file", fake_download_video_to_file)
+
+    asyncio.run(main.handle_text_for_youtube_or_group(update, context))
+
+    assert len(message.reply_calls) == 2
+    assert message.reply_calls[0]["text"] == "Downloading your video, please wait a moment..."
+    assert message.reply_calls[1]["text"].startswith("Media link processing failed.\n")
+    assert "ValueError: yt-dlp failed: HTTP Error 403: Forbidden" in message.reply_calls[1]["text"]
+    assert message.status_messages[0].deleted is True

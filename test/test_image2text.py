@@ -1,4 +1,4 @@
-from app.image2text import _extract_text_from_responses_payload, _guess_mime_type
+from app.image2text import _build_sticker_prompt, _extract_text_from_responses_payload, _guess_mime_type
 
 
 def test_guess_mime_type_by_extension():
@@ -29,3 +29,9 @@ def test_extract_text_from_nested_output_blocks():
 
 def test_extract_text_returns_empty_for_unrecognized_payload():
     assert _extract_text_from_responses_payload({"output": []}) == ""
+
+
+def test_build_sticker_prompt_includes_optional_hints():
+    prompt = _build_sticker_prompt(emoji="🙂", set_name="mio_pack")
+    assert "Known sticker emoji: 🙂." in prompt
+    assert "Sticker set name: mio_pack." in prompt

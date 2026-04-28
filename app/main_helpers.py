@@ -80,6 +80,26 @@ def _is_reply_to_this_bot(update, bot_username: Optional[str]) -> bool:
     )
 
 
+def _classify_group_reply_trigger(message_text: Optional[str], bot_username: Optional[str]) -> str:
+    text = (message_text or "").strip()
+    if not text:
+        return "ambient"
+
+    normalized_username = (bot_username or "").strip().lstrip("@")
+    if normalized_username:
+        username_pattern = rf"(?<![A-Za-z0-9_])@{re.escape(normalized_username)}(?![A-Za-z0-9_])"
+        if re.search(username_pattern, text, flags=re.IGNORECASE):
+            return "username_mention"
+
+    if re.search(r"(?<![A-Za-z0-9_])mioo(?![A-Za-z0-9_])", text, flags=re.IGNORECASE):
+        return "alias_mention"
+
+    if "小小宫" in text:
+        return "alias_mention"
+
+    return "ambient"
+
+
 def _display_name_from_user(user) -> str:
     if not user:
         return "unknown_user @unknown"
@@ -101,6 +121,13 @@ def _display_name_from_user(user) -> str:
         handle = f"@[{id_part}]"
 
     return f"{nickname} {handle}"
+
+
+def _telegram_user_key_from_user(user) -> Optional[str]:
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return None
+    return f"tg_user:{user_id}"
 
 
 def _single_line_text(text: Optional[str], *, max_chars: int = 240) -> str:
@@ -126,7 +153,6 @@ def _build_reply_relation_payload(update, message_text: str) -> tuple[str, list[
     replied_content = _single_line_text(getattr(replied_message, "text", None) or getattr(replied_message, "caption", None))
     current_content = _single_line_text(message_text)
 
-    stored_content = f"[reply_to: {replied_author}] {replied_content}\n{message_text}"
     relation_context = [
         "message_relation: current message replies to another message",
         f"user_reply_relation: {current_author} replies to {replied_author}",
@@ -135,7 +161,7 @@ def _build_reply_relation_payload(update, message_text: str) -> tuple[str, list[
         f"replied_to_content: {replied_content}",
         f"current_message_content: {current_content}",
     ]
-    return stored_content, relation_context
+    return message_text, relation_context
 
 
 def _match_command_payload(message_text: str, regex_pattern: str) -> Optional[str]:

@@ -41,6 +41,23 @@ def summarize_tweet_text(text_dict: Mapping[str, str]) -> str:
     return tweet_text.strip()
 
 
+def _extract_text_from_rich_payload(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("text", "raw_text", "full_text", "display_text"):
+            extracted = _extract_text_from_rich_payload(value.get(key))
+            if extracted:
+                return extracted
+        return ""
+    if isinstance(value, list):
+        parts = [_extract_text_from_rich_payload(item) for item in value]
+        return " ".join(part for part in parts if part).strip()
+    return str(value).strip()
+
+
 def format_tweet_text_for_reply(tweet_text: str, original_url: str) -> str:
     text = (tweet_text or "").strip()
     text = P_PIC_TWITTER_LINK.sub("", text)
@@ -267,12 +284,12 @@ class TwitterDownloader:
             if not isinstance(payload, dict):
                 return None
 
-            text_value = str(
+            text_value = _extract_text_from_rich_payload(
                 payload.get("text")
                 or payload.get("full_text")
                 or payload.get("display_text")
                 or ""
-            ).strip()
+            )
 
             pic_list: Dict[str, Dict[str, str]] = {}
             photos = payload.get("photos")
@@ -357,7 +374,7 @@ class TwitterDownloader:
             if not isinstance(status, dict):
                 return None
 
-            text_value = str(status.get('raw_text') or status.get('text') or '').strip()
+            text_value = _extract_text_from_rich_payload(status.get('raw_text') or status.get('text') or '')
             media_payload = status.get('media')
             if not isinstance(media_payload, dict):
                 media_payload = {}
@@ -424,7 +441,7 @@ class TwitterDownloader:
             if not isinstance(payload, dict):
                 return None
 
-            text_value = str(payload.get("text") or "").strip()
+            text_value = _extract_text_from_rich_payload(payload.get("text") or "")
             pic_list: Dict[str, Dict[str, str]] = {}
             gif_list: Dict[str, Dict[str, str]] = {}
             vid_list: Dict[str, Dict[str, str]] = {}

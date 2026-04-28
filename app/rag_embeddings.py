@@ -1,11 +1,11 @@
 import asyncio
+from dataclasses import dataclass
 import logging
 import importlib
-import zlib
 from typing import Optional
 
 import numpy as np
-from app.runtime_config import get_runtime_int, get_runtime_value
+from app.runtime_config import get_runtime_value
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +13,31 @@ _FASTEMBED_AVAILABLE: Optional[bool] = None
 
 
 _DEFAULT_EMBED_MODEL = get_runtime_value("EMBED_MODEL")
-_EMBED_BACKEND = get_runtime_value("EMBED_BACKEND")  # fastembed|hash
-_HASH_DIM = get_runtime_int("EMBED_HASH_DIM", 512)
 
 _embedder = None
 _embedder_model_name: Optional[str] = None
 _embedder_lock = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class EmbeddingMetadata:
+    backend: str
+    model: str
+    dim: int
+    signature: str
+
+
+def _configured_embed_backend() -> str:
+    backend = (get_runtime_value("EMBED_BACKEND") or "fastembed").strip().lower()
+    return backend or "fastembed"
+
+
+def _validate_embed_backend_config() -> None:
+    backend = _configured_embed_backend()
+    if backend != "fastembed":
+        raise RuntimeError(
+            f"Unsupported EMBED_BACKEND={backend!r}. MioBot now requires fastembed only."
+        )
 
 
 def _fastembed_is_available() -> bool:
@@ -38,10 +57,11 @@ async def get_embedder(model_name: Optional[str] = None):
 
     Uses a single instance to avoid repeatedly loading the ONNX runtime + model.
     """
+    _validate_embed_backend_config()
     if not _fastembed_is_available():
         raise RuntimeError(
-            "fastembed is not available in this Python environment. "
-            "(On Python 3.14, onnxruntime wheels may be unavailable.)"
+            "fastembed is required for MioBot embeddings but is not available in this Python environment. "
+            "Install fastembed in the active environment before starting the bot."
         )
 
     chosen = model_name or _DEFAULT_EMBED_MODEL
@@ -65,43 +85,44 @@ async def get_embedder(model_name: Optional[str] = None):
 async def embed_text(text: str, *, model_name: Optional[str] = None) -> np.ndarray:
     """Embed a single piece of text to a float32 numpy vector.
 
-    Preferred backend: fastembed (local ONNX embeddings).
-    Fallback backend: pure-numpy hashed char-ngram vector (still vector search, fully local).
+    MioBot requires fastembed for semantic retrieval.
     """
-    backend = _EMBED_BACKEND
-    if backend == "fastembed" and _fastembed_is_available():
-        embedder = await get_embedder(model_name=model_name)
-
-        def _embed_sync() -> np.ndarray:
-            vec = next(embedder.embed([text]))
-            return np.asarray(vec, dtype=np.float32)
-
-        return await asyncio.to_thread(_embed_sync)
-
-    return await asyncio.to_thread(_hash_embed, text)
+    vector, _ = await embed_text_with_metadata(text, model_name=model_name)
+    return vector
 
 
-def _hash_embed(text: str) -> np.ndarray:
-    s = (text or "").strip().lower()
-    if not s:
-        return np.zeros((_HASH_DIM,), dtype=np.float32)
+async def embed_text_with_metadata(
+    text: str,
+    *,
+    model_name: Optional[str] = None,
+) -> tuple[np.ndarray, EmbeddingMetadata]:
+    """Embed text and return the vector plus the actual runtime embedding metadata."""
+    embedder = await get_embedder(model_name=model_name)
+    chosen_model = model_name or _DEFAULT_EMBED_MODEL
 
-    vec = np.zeros((_HASH_DIM,), dtype=np.float32)
-    b = s.encode("utf-8", errors="ignore")
+    def _embed_sync() -> np.ndarray:
+        vec = next(embedder.embed([text]))
+        return np.asarray(vec, dtype=np.float32)
 
-    # Character n-grams (3..5) over bytes gives reasonable multilingual robustness.
-    for n in (3, 4, 5):
-        if len(b) < n:
-            continue
-        for i in range(0, len(b) - n + 1):
-            ng = b[i : i + n]
-            idx = zlib.crc32(ng) % _HASH_DIM
-            vec[idx] += 1.0
+    vector = await asyncio.to_thread(_embed_sync)
+    metadata = EmbeddingMetadata(
+        backend="fastembed",
+        model=chosen_model,
+        dim=int(vector.shape[0]),
+        signature=f"fastembed:{chosen_model}",
+    )
+    return vector, metadata
 
-    norm = float(np.linalg.norm(vec))
-    if norm > 0:
-        vec /= norm
-    return vec
+
+async def get_runtime_embedding_metadata(*, model_name: Optional[str] = None) -> EmbeddingMetadata:
+    """Return metadata describing the embedding backend currently used at runtime."""
+    _, metadata = await embed_text_with_metadata("embedding healthcheck", model_name=model_name)
+    return metadata
+
+
+async def ensure_fastembed_ready(*, model_name: Optional[str] = None) -> EmbeddingMetadata:
+    """Validate fastembed availability and model initialization for startup fail-fast checks."""
+    return await get_runtime_embedding_metadata(model_name=model_name)
 
 
 def pack_embedding(vec: np.ndarray) -> tuple[bytes, int]:

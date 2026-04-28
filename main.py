@@ -1,11 +1,11 @@
 """Telegram bot entrypoint and handler orchestration."""
 
 # general imports
+import asyncio
 import datetime
 import io
 import logging
 import os
-import random
 import time
 from typing import Optional
 
@@ -35,9 +35,18 @@ from app.youtube_dl import (
     compress_video_if_needed,
     resolve_caption_url,
 )
-from app.reply2message import should_reply_and_generate
-from app.database import init_db, add_message, get_prompt_context_parts
-from app.image2text import image_to_text
+from app.reply2message import generate_group_reply, should_activate_reply
+from app.rag_embeddings import ensure_fastembed_ready
+from app.user_memory import refresh_user_memory_if_due
+from app.database import (
+    add_message,
+    get_prompt_context_parts,
+    get_sticker_text,
+    init_db,
+    log_embedding_health_report,
+    upsert_sticker_text,
+)
+from app.image2text import image_to_text, sticker_to_text
 
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
@@ -52,7 +61,9 @@ from app.main_helpers import (
     _delete_message_if_exists,
     _extract_video_url,
     _is_reply_to_this_bot,
+    _classify_group_reply_trigger,
     _display_name_from_user,
+    _telegram_user_key_from_user,
     _build_reply_relation_payload,
     _match_command_payload,
     _build_rag_query_from_message,
@@ -117,12 +128,123 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_TEXT_LIMIT = 4096
 
 
 def _truncate_caption_text(text: str, max_chars: int = TELEGRAM_CAPTION_LIMIT) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3].rstrip() + "..."
+
+
+def _build_detailed_media_error_message(exc: Exception, *, max_chars: int = TELEGRAM_TEXT_LIMIT) -> str:
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+
+    while current and id(current) not in seen:
+        seen.add(id(current))
+        detail = str(current).strip() or repr(current)
+        label = type(current).__name__
+        parts.append(f"{label}: {detail}" if detail else label)
+        current = current.__cause__ or current.__context__
+
+    error_text = "\nCaused by:\n".join(parts) if parts else type(exc).__name__
+    message = f"Media link processing failed.\n{error_text}"
+    if len(message) <= max_chars:
+        return message
+    return message[: max_chars - 3].rstrip() + "..."
+
+
+def _build_group_reply_runtime_state(
+    *,
+    sender_display: str,
+    trigger_type: str,
+    direct_addressed: bool,
+) -> list[str]:
+    return [
+        f"current_time_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}",
+        f"sender_display: {sender_display}",
+        f"trigger_type: {trigger_type}",
+        f"direct_addressed: {str(direct_addressed).lower()}",
+    ]
+
+
+def _fallback_sticker_description(sticker) -> str:
+    parts: list[str] = []
+    if getattr(sticker, "is_animated", False):
+        parts.append("animated sticker")
+    elif getattr(sticker, "is_video", False):
+        parts.append("video sticker")
+    else:
+        parts.append("sticker")
+
+    emoji = getattr(sticker, "emoji", None)
+    if emoji:
+        parts.append(f"emoji {emoji}")
+
+    set_name = getattr(sticker, "set_name", None)
+    if set_name:
+        parts.append(f"from set {set_name}")
+
+    return ", ".join(parts)
+
+
+async def _describe_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
+    if not update.message or not update.message.sticker:
+        return "sticker", "fallback"
+
+    sticker = update.message.sticker
+    file_unique_id = getattr(sticker, "file_unique_id", None) or ""
+    cached_description = await get_sticker_text(file_unique_id)
+    if cached_description:
+        return cached_description, "cache"
+
+    visual_file_id = getattr(sticker, "file_id", None)
+    extension = "webp"
+    source = "sticker_file"
+
+    if getattr(sticker, "is_animated", False) or getattr(sticker, "is_video", False):
+        thumbnail = getattr(sticker, "thumbnail", None)
+        if thumbnail and getattr(thumbnail, "file_id", None):
+            visual_file_id = thumbnail.file_id
+            extension = "jpg"
+            source = "thumbnail"
+        else:
+            visual_file_id = None
+
+    description = None
+    output_path = None
+    try:
+        if visual_file_id and context.bot:
+            output_path = _build_output_path("sticker", update.message.message_id, extension=extension)
+            tg_file = await context.bot.get_file(visual_file_id)
+            await tg_file.download_to_drive(custom_path=output_path)
+            description = await sticker_to_text(
+                output_path,
+                emoji=getattr(sticker, "emoji", None),
+                set_name=getattr(sticker, "set_name", None),
+            )
+    except Exception as exc:
+        logger.warning("Sticker understanding failed for %s: %s", file_unique_id or "(unknown)", exc)
+    finally:
+        _remove_file_if_exists(output_path)
+
+    if not description:
+        description = _fallback_sticker_description(sticker)
+        source = "fallback"
+
+    await upsert_sticker_text(
+        file_unique_id=file_unique_id,
+        file_id=getattr(sticker, "file_id", None),
+        emoji=getattr(sticker, "emoji", None),
+        set_name=getattr(sticker, "set_name", None),
+        description=description,
+        description_source=source,
+        is_animated=bool(getattr(sticker, "is_animated", False)),
+        is_video=bool(getattr(sticker, "is_video", False)),
+    )
+    return description, source
 
 
 async def _handle_twitter_media_message(
@@ -398,38 +520,71 @@ async def _handle_group_ai_reply_pipeline(
 
     chat_id = update.effective_chat.id
     sender_display = _display_name_from_user(update.effective_user)
+    telegram_user_key = _telegram_user_key_from_user(update.effective_user)
     stored_message_text, relation_context = _build_reply_relation_payload(update, message_text)
     merged_additional_context = list(additional_context or []) + relation_context
     replied_message = update.message.reply_to_message
     reply_to_tg_id = getattr(replied_message, "message_id", None) if replied_message else None
     reply_to_username = _display_name_from_user(getattr(replied_message, "from_user", None)) if replied_message else None
+    raw_user_text = (getattr(update.message, "text", None) or getattr(update.message, "caption", None) or "").strip()
+
+    if telegram_user_key:
+        try:
+            personal_memory = await refresh_user_memory_if_due(
+                telegram_user_key=telegram_user_key,
+                latest_display_name=sender_display,
+            )
+            if personal_memory:
+                merged_additional_context.append(f"user_memory_key: {telegram_user_key}")
+                merged_additional_context.append(f"user_personal_memory:\n{personal_memory}")
+        except Exception as exc:
+            logger.exception("Failed to refresh personal memory for %s: %s", telegram_user_key, exc)
 
     logger.info("Adding message to history for %s", sender_display)
     await add_message(
         chat_id=chat_id,
         username=sender_display,
         content=stored_message_text,
+        telegram_user_key=telegram_user_key,
         telegram_message_id=getattr(update.message, "message_id", None),
         reply_to_telegram_message_id=reply_to_tg_id,
         reply_to_username=reply_to_username,
     )
 
     is_reply_to_bot = _is_reply_to_this_bot(update, TELEGRAM_BOT_USERNAME)
-    if is_reply_to_bot:
-        logger.info("User %s replied to the bot.", sender_display)
+    trigger_type = "reply_to_bot" if is_reply_to_bot else _classify_group_reply_trigger(raw_user_text, TELEGRAM_BOT_USERNAME)
+    is_mentioned = trigger_type in {"username_mention", "alias_mention"}
+    is_directly_addressed = is_reply_to_bot or is_mentioned
+    runtime_state = _build_group_reply_runtime_state(
+        sender_display=sender_display,
+        trigger_type=trigger_type,
+        direct_addressed=is_directly_addressed,
+    )
 
-    # 1 in 5 chance to consider replying, unless it's a reply to the bot.
-    if not is_reply_to_bot and random.randint(1, 5) != 1:
-        return
+    if is_directly_addressed:
+        logger.info("User %s directly triggered the bot via %s.", sender_display, trigger_type)
+    else:
+        probe_history_messages, _ = await get_prompt_context_parts(chat_id, query="")
+        should_reply = await should_activate_reply(
+            message_history=probe_history_messages,
+            additional_context=merged_additional_context or None,
+            runtime_state=runtime_state,
+            is_reply_to_bot=is_reply_to_bot,
+            is_mentioned=is_mentioned,
+        )
+        if not should_reply:
+            return
 
     rag_query = _build_rag_query_from_message(message_text)
     history_messages, rag_related_messages = await get_prompt_context_parts(chat_id, query=rag_query)
 
-    ai_reply = await should_reply_and_generate(
+    ai_reply = await generate_group_reply(
         message_history=history_messages,
         rag_related_messages=rag_related_messages,
         additional_context=merged_additional_context or None,
         is_reply_to_bot=is_reply_to_bot,
+        is_mentioned=is_mentioned,
+        runtime_state=runtime_state,
     )
 
     if ai_reply:
@@ -504,8 +659,8 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
             await _delete_message_if_exists(status_message)
             await update.message.delete()
         except Exception as e:
-            logger.error(f"Error during video download or sending: {e}")
-            await update.message.reply_text("Sorry, I encountered an error while processing this media link.")
+            logger.exception("Error during video download or sending")
+            await update.message.reply_text(_build_detailed_media_error_message(e))
             await _delete_message_if_exists(status_message)
         finally:
             for path in cleanup_paths:
@@ -557,6 +712,32 @@ async def handle_photo_for_group_ai_reply(update: Update, context: ContextTypes.
         logger.error(f"Error handling group image message: {e}")
     finally:
         _remove_file_if_exists(photo_path)
+
+
+async def handle_sticker_for_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram stickers in groups by caching a textual description and reusing group reply flow."""
+    if not update.message or not update.message.sticker:
+        return
+    if not _is_group_chat(update):
+        return
+
+    sticker = update.message.sticker
+    description, description_source = await _describe_sticker(update, context)
+    synthesized_text = f"sticker: {description}"
+
+    await _handle_group_ai_reply_pipeline(
+        update,
+        synthesized_text,
+        additional_context=[
+            "input_type: sticker",
+            f"sticker_file_unique_id: {getattr(sticker, 'file_unique_id', '(unknown)')}",
+            f"sticker_emoji: {getattr(sticker, 'emoji', '(none)') or '(none)'}",
+            f"sticker_set_name: {getattr(sticker, 'set_name', '(none)') or '(none)'}",
+            f"sticker_cached: {str(description_source == 'cache').lower()}",
+            f"sticker_description_source: {description_source}",
+            f"sticker_description: {description}",
+        ],
+    )
 
 
 async def handle_crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -666,6 +847,9 @@ def register_handlers(application: Application) -> None:
     # Group images: convert to text and pass through AI reply process
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo_for_group_ai_reply))
 
+    # Group stickers: cache sticker descriptions and pass them through AI reply process
+    application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_for_group_ai_reply))
+
     # Cryto info command
     application.add_handler(CommandHandler("crypto", handle_crypto_command))
 
@@ -673,8 +857,11 @@ def register_handlers(application: Application) -> None:
 def main() -> None:
     """Start the bot."""
 
+    asyncio.run(ensure_fastembed_ready())
+
     # Initialize the database
     init_db()
+    asyncio.run(log_embedding_health_report())
 
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()

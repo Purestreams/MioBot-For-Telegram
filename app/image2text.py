@@ -52,6 +52,23 @@ def _extract_text_from_responses_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _build_sticker_prompt(*, emoji: Optional[str] = None, set_name: Optional[str] = None) -> str:
+    hints: list[str] = []
+    if emoji:
+        hints.append(f"Known sticker emoji: {emoji}.")
+    if set_name:
+        hints.append(f"Sticker set name: {set_name}.")
+
+    prompt = (
+        "Describe this Telegram sticker in one short plain-text line. "
+        "Mention the main subject, notable visible text if any, and the emotion or reaction it conveys. "
+        "Do not use bullet points, labels, markdown, or JSON."
+    )
+    if hints:
+        prompt += " " + " ".join(hints)
+    return prompt
+
+
 async def image_to_text(
     image_path: str,
     *,
@@ -108,3 +125,21 @@ async def image_to_text(
     except Exception as e:
         logger.warning(f"image_to_text failed: {e}")
         return None
+
+
+async def sticker_to_text(
+    image_path: str,
+    *,
+    emoji: Optional[str] = None,
+    set_name: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[str]:
+    """Describe a Telegram sticker in a single natural-language line."""
+    description = await image_to_text(
+        image_path,
+        prompt=_build_sticker_prompt(emoji=emoji, set_name=set_name),
+        model=model,
+    )
+    if not description:
+        return None
+    return " ".join(description.split()) or None

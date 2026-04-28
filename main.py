@@ -601,6 +601,74 @@ async def _handle_group_ai_reply_pipeline(
         except Exception as e:
             logger.error(f"Error sending AI reply: {e}")
 
+
+def _schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coroutine) -> None:
+    application = getattr(context, "application", None)
+    if application is not None and hasattr(application, "create_task"):
+        application.create_task(coroutine)
+        return
+    asyncio.create_task(coroutine)
+
+
+async def _process_video_link_request(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    video_url: str,
+    sender_display: str,
+    status_message,
+) -> None:
+    cleanup_paths: set[str] = set()
+    try:
+        if is_twitter_status_url(video_url):
+            await _handle_twitter_media_message(
+                update=update,
+                context=context,
+                video_url=video_url,
+                sender_display=sender_display,
+                status_message=status_message,
+            )
+            return
+
+        if not update.message or not update.effective_chat:
+            return
+
+        output_file_name = f"{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
+        output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
+
+        video_title = await download_video_to_file(video_url, output_file_path)
+
+        cleanup_paths.add(output_file_path)
+
+        file_to_send_path = await compress_video_if_needed(output_file_path)
+        cleanup_paths.add(file_to_send_path)
+
+        await status_message.edit_text("Download completed successfully. Sending the video...")
+        caption_url = await resolve_caption_url(video_url)
+        video_caption = _truncate_caption_text(
+            f'{video_title}\n<a href="{caption_url}">original link</a>\nRequested by: {sender_display}'
+        )
+
+        with open(file_to_send_path, 'rb') as video:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=video,
+                reply_to_message_id=update.message.message_id,
+                caption=video_caption,
+                parse_mode=ParseMode.HTML,
+            )
+
+        await _delete_message_if_exists(status_message)
+        await update.message.delete()
+    except Exception as e:
+        logger.exception("Error during video download or sending")
+        if getattr(update, "message", None):
+            await update.message.reply_text(_build_detailed_media_error_message(e))
+        await _delete_message_if_exists(status_message)
+    finally:
+        for path in cleanup_paths:
+            _remove_file_if_exists(path)
+
 # Handle text messages: download video links (YouTube/Bilibili/Twitter), else pass to group AI handler
 async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages: download supported video links, else pass to group AI handler."""
@@ -615,56 +683,18 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
     video_url = _extract_video_url(message_text)
 
     if video_url:
-        status_message = None
-        output_file_path = ""
-        cleanup_paths: set[str] = set()
-        try:
-            status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
-
-            if is_twitter_status_url(video_url):
-                await _handle_twitter_media_message(
-                    update=update,
-                    context=context,
-                    video_url=video_url,
-                    sender_display=sender_display,
-                    status_message=status_message,
-                )
-                return
-
-            output_file_name = f"{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
-            output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
-
-            video_title = await download_video_to_file(video_url, output_file_path)
-
-            cleanup_paths.add(output_file_path)
-
-            file_to_send_path = await compress_video_if_needed(output_file_path)
-            cleanup_paths.add(file_to_send_path)
-
-            await status_message.edit_text("Download completed successfully. Sending the video...")
-            caption_url = await resolve_caption_url(video_url)
-            video_caption = _truncate_caption_text(
-                f'{video_title}\n<a href="{caption_url}">original link</a>\nRequested by: {sender_display}'
-            )
-
-            with open(file_to_send_path, 'rb') as video:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=video,
-                    reply_to_message_id=update.message.message_id,
-                    caption=video_caption,
-                    parse_mode=ParseMode.HTML,
-                )
-
-            await _delete_message_if_exists(status_message)
-            await update.message.delete()
-        except Exception as e:
-            logger.exception("Error during video download or sending")
-            await update.message.reply_text(_build_detailed_media_error_message(e))
-            await _delete_message_if_exists(status_message)
-        finally:
-            for path in cleanup_paths:
-                _remove_file_if_exists(path)
+        status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
+        _schedule_background_task(
+            context,
+            _process_video_link_request(
+                update=update,
+                context=context,
+                video_url=video_url,
+                sender_display=sender_display,
+                status_message=status_message,
+            ),
+        )
+        return
     else:
         if update.effective_chat.type in ['group', 'supergroup']:
             logger.info(f"Non-video-link message in group chat: {message_text}")

@@ -11,6 +11,7 @@ import logging
 from urllib.parse import urljoin
 
 TELEGRAM_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024
+COMPRESSION_TARGET_RATIO = 0.96
 MAX_FILENAME_BYTES = 240
 logger = logging.getLogger(__name__)
 
@@ -186,43 +187,83 @@ async def compress_video_if_needed(input_path: str, max_size_bytes: int = TELEGR
 
     compressed_path = _build_compressed_output_path(input_path)
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "28",
-        "-c:a", "aac",
-        "-b:a", "96k",
-        "-movflags", "+faststart",
-        "-fs", str(max_size_bytes),
-        compressed_path,
+    target_size_bytes = min(max_size_bytes, max(1, int(max_size_bytes * COMPRESSION_TARGET_RATIO)))
+    compression_attempts = [
+        {"preset": "fast", "crf": "30", "audio_bitrate": "96k", "video_filter": None},
+        {
+            "preset": "medium",
+            "crf": "34",
+            "audio_bitrate": "80k",
+            "video_filter": "scale=-2:480:force_original_aspect_ratio=decrease",
+        },
+        {
+            "preset": "medium",
+            "crf": "36",
+            "audio_bitrate": "64k",
+            "video_filter": "scale=-2:360:force_original_aspect_ratio=decrease",
+        },
     ]
 
     loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(
-            None,
-            functools.partial(
-                subprocess.run,
-                cmd,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            ),
+    last_size_bytes: Optional[int] = None
+    for attempt_number, attempt in enumerate(compression_attempts, start=1):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+        ]
+        if attempt["video_filter"]:
+            cmd.extend(["-vf", str(attempt["video_filter"])])
+        cmd.extend(
+            [
+                "-c:v", "libx264",
+                "-preset", str(attempt["preset"]),
+                "-crf", str(attempt["crf"]),
+                "-c:a", "aac",
+                "-b:a", str(attempt["audio_bitrate"]),
+                "-movflags", "+faststart",
+                "-fs", str(target_size_bytes),
+                compressed_path,
+            ]
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError("ffmpeg is required to compress oversized videos.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"Failed to compress video: {exc.stderr}") from exc
 
-    if not os.path.exists(compressed_path):
-        raise RuntimeError("Compressed video file was not created.")
-    if os.path.getsize(compressed_path) > max_size_bytes:
-        size_limit_mb = max_size_bytes / (1024 * 1024)
-        raise RuntimeError(f"Compressed video still exceeds the {size_limit_mb:.1f}MB limit.")
+        try:
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    subprocess.run,
+                    cmd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required to compress oversized videos.") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"Failed to compress video: {exc.stderr}") from exc
+
+        if not os.path.exists(compressed_path):
+            raise RuntimeError("Compressed video file was not created.")
+
+        last_size_bytes = os.path.getsize(compressed_path)
+        if last_size_bytes <= max_size_bytes:
+            return compressed_path
+
+        logger.info(
+            "Compression attempt %d still exceeds Telegram size limit: %.2fMB > %.2fMB",
+            attempt_number,
+            last_size_bytes / (1024 * 1024),
+            max_size_bytes / (1024 * 1024),
+        )
+
+    size_limit_mb = max_size_bytes / (1024 * 1024)
+    current_size_mb = (last_size_bytes or 0) / (1024 * 1024)
+    raise RuntimeError(
+        f"Compressed video still exceeds the {size_limit_mb:.1f}MB limit after {len(compression_attempts)} attempts "
+        f"(current size: {current_size_mb:.1f}MB)."
+    )
 
     return compressed_path
 

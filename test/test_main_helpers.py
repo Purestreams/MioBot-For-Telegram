@@ -446,7 +446,15 @@ def test_handle_text_for_youtube_or_group_sends_detailed_error(monkeypatch):
         effective_chat=SimpleNamespace(id=1, type="group"),
         effective_user=SimpleNamespace(full_name="Tester", username="tester", id=1),
     )
-    context = SimpleNamespace(bot=SimpleNamespace())
+    tasks = []
+
+    class _FakeApplication:
+        def create_task(self, coro):
+            task = asyncio.create_task(coro)
+            tasks.append(task)
+            return task
+
+    context = SimpleNamespace(bot=SimpleNamespace(), application=_FakeApplication())
 
     async def fake_download_video_to_file(url, output_path):
         raise ValueError("yt-dlp failed: HTTP Error 403: Forbidden")
@@ -455,10 +463,61 @@ def test_handle_text_for_youtube_or_group_sends_detailed_error(monkeypatch):
     monkeypatch.setattr(main, "is_twitter_status_url", lambda url: False)
     monkeypatch.setattr(main, "download_video_to_file", fake_download_video_to_file)
 
-    asyncio.run(main.handle_text_for_youtube_or_group(update, context))
+    async def _run():
+        await main.handle_text_for_youtube_or_group(update, context)
+        assert len(tasks) == 1
+        await tasks[0]
+
+    asyncio.run(_run())
 
     assert len(message.reply_calls) == 2
     assert message.reply_calls[0]["text"] == "Downloading your video, please wait a moment..."
     assert message.reply_calls[1]["text"].startswith("Media link processing failed.\n")
     assert "ValueError: yt-dlp failed: HTTP Error 403: Forbidden" in message.reply_calls[1]["text"]
     assert message.status_messages[0].deleted is True
+
+
+def test_handle_text_for_youtube_or_group_schedules_video_processing_in_background(monkeypatch):
+    class _FakeStatusMessage:
+        def __init__(self, text):
+            self.text = text
+
+        async def edit_text(self, text):
+            return None
+
+        async def delete(self):
+            return None
+
+    class _FakeMessage:
+        def __init__(self, text):
+            self.text = text
+            self.message_id = 654
+            self.reply_calls = []
+
+        async def reply_text(self, text, **kwargs):
+            self.reply_calls.append({"text": text, "kwargs": kwargs})
+            return _FakeStatusMessage(text)
+
+    scheduled = {}
+    message = _FakeMessage("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1, type="group"),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=1),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace())
+
+    def fake_schedule_background_task(context_arg, coro):
+        scheduled["context"] = context_arg
+        scheduled["coro"] = coro
+        coro.close()
+
+    monkeypatch.setattr(main, "_extract_video_url", lambda text: "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    monkeypatch.setattr(main, "_schedule_background_task", fake_schedule_background_task)
+
+    asyncio.run(main.handle_text_for_youtube_or_group(update, context))
+
+    assert len(message.reply_calls) == 1
+    assert message.reply_calls[0]["text"] == "Downloading your video, please wait a moment..."
+    assert scheduled["context"] is context
+    assert scheduled["coro"] is not None

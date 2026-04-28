@@ -52,6 +52,55 @@ class TestCompressVideoIfNeeded(unittest.IsolatedAsyncioTestCase):
             if os.path.exists(compressed_path):
                 os.remove(compressed_path)
 
+    async def test_retries_with_more_aggressive_settings_when_first_attempt_is_still_oversized(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(b"x" * 4096)
+            input_path = tmp.name
+
+        compressed_path = input_path.replace(".mp4", "_compressed.mp4")
+        commands = []
+
+        def _fake_subprocess_run(cmd, *args, **kwargs):
+            commands.append(cmd)
+            with open(compressed_path, "wb") as f:
+                if len(commands) == 1:
+                    f.write(b"y" * 1500)
+                else:
+                    f.write(b"z" * 800)
+
+        try:
+            with patch("app.youtube_dl.subprocess.run", side_effect=_fake_subprocess_run):
+                result = await compress_video_if_needed(input_path, max_size_bytes=1024)
+            self.assertEqual(result, compressed_path)
+            self.assertEqual(len(commands), 2)
+            self.assertIn("scale=-2:480:force_original_aspect_ratio=decrease", commands[1])
+        finally:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            if os.path.exists(compressed_path):
+                os.remove(compressed_path)
+
+    async def test_raises_after_all_compression_attempts_still_exceed_limit(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(b"x" * 4096)
+            input_path = tmp.name
+
+        compressed_path = input_path.replace(".mp4", "_compressed.mp4")
+
+        def _fake_subprocess_run(*args, **kwargs):
+            with open(compressed_path, "wb") as f:
+                f.write(b"y" * 1500)
+
+        try:
+            with patch("app.youtube_dl.subprocess.run", side_effect=_fake_subprocess_run):
+                with self.assertRaisesRegex(RuntimeError, "still exceeds the 0.0MB limit after 3 attempts"):
+                    await compress_video_if_needed(input_path, max_size_bytes=1024)
+        finally:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            if os.path.exists(compressed_path):
+                os.remove(compressed_path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,11 @@
 import base64
+import asyncio
 import logging
 import os
 from typing import Any, Optional
 
 import httpx
-from app.runtime_config import get_runtime_value
+from app.runtime_config import get_ark_responses_endpoint, get_runtime_value
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +86,10 @@ async def image_to_text(
         logger.warning("ARK_API_KEY is not configured; skipping image-to-text.")
         return None
 
-    response_url = get_runtime_value("ARK_RESPONSES_ENDPOINT")
+    response_url = get_ark_responses_endpoint()
     selected_model = model or get_runtime_value("ARK_VISION_MODEL") or get_runtime_value("ARK_MODEL")
 
-    base64_file = _read_base64_file(image_path)
+    base64_file = await asyncio.to_thread(_read_base64_file, image_path)
     mime_type = _guess_mime_type(image_path)
 
     payload = {

@@ -19,9 +19,9 @@ def test_build_user_prompt_contains_all_sections():
     )
     assert "PART 1: EARLIER HISTORY" in prompt
     assert "m1" in prompt
-    assert "PART 2: RAG RELATED MESSAGE" in prompt
+    assert "PART 3: RAG RELATED MESSAGES" in prompt
     assert "r1" in prompt
-    assert "PART 3: DURABLE CONTEXT" in prompt
+    assert "PART 2: DURABLE CONTEXT" in prompt
     assert "likes tea" in prompt
     assert "PART 4: MESSAGE-SPECIFIC CONTEXT" in prompt
     assert "a1" in prompt
@@ -31,6 +31,26 @@ def test_build_user_prompt_contains_all_sections():
     assert "s1" in prompt
     assert "PART 7: LATEST MESSAGE TO RESPOND TO" in prompt
     assert prompt.rstrip().endswith("m2")
+
+
+def test_build_user_prompt_orders_cache_stable_context_before_volatile_context():
+    prompt = reply2message._build_user_prompt(
+        ["old message", "newest message"],
+        rag_related_messages=["dynamic rag"],
+        additional_context=[
+            "user_personal_memory:\nstable memory",
+            "replied_to_content: volatile reply context",
+        ],
+        runtime_state=["current_date_utc: 2026-04-30"],
+        direct_address_state=["directly_addressed: true"],
+    )
+
+    assert prompt.index("PART 1: EARLIER HISTORY") < prompt.index("PART 2: DURABLE CONTEXT")
+    assert prompt.index("PART 2: DURABLE CONTEXT") < prompt.index("PART 3: RAG RELATED MESSAGES")
+    assert prompt.index("PART 3: RAG RELATED MESSAGES") < prompt.index("PART 4: MESSAGE-SPECIFIC CONTEXT")
+    assert prompt.index("PART 4: MESSAGE-SPECIFIC CONTEXT") < prompt.index("PART 5: DIRECT ADDRESS FLAGS")
+    assert prompt.index("PART 6: RUNTIME STATE") < prompt.index("PART 7: LATEST MESSAGE TO RESPOND TO")
+    assert prompt.rstrip().endswith("newest message")
 
 
 def test_should_activate_reply_returns_true_when_model_says_yes(monkeypatch, tmp_path):

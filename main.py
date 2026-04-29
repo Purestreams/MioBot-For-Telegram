@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 
 # private imports
-from app.runtime_config import bootstrap_runtime_environment, get_runtime_value
+from app.runtime_config import bootstrap_runtime_environment, get_ark_chat_completions_endpoint, get_runtime_value
 
 # Load config/runtime env before importing modules that read env at import time.
 bootstrap_runtime_environment()
@@ -37,14 +37,29 @@ from app.youtube_dl import (
 )
 from app.reply2message import generate_group_reply, should_activate_reply
 from app.rag_embeddings import ensure_fastembed_ready
-from app.user_memory import refresh_user_memory_if_due
+from app.user_memory import (
+    accept_user_memory_candidate,
+    extract_user_memory_candidate_from_message,
+    get_personal_memory_context,
+    refresh_user_memory_if_due,
+    reject_user_memory_candidate,
+)
 from app.database import (
     add_message,
+    archive_user_memory_fact,
+    get_latest_display_name_for_user,
     get_prompt_context_parts,
     get_sticker_text,
+    get_user_memory,
+    get_user_memory_facts,
     init_db,
+    list_user_memory_candidates,
+    list_user_memory_overviews,
     log_embedding_health_report,
     reindex_message_embeddings,
+    search_user_memories,
+    update_user_memory_fact,
+    upsert_user_memory,
     upsert_sticker_text,
 )
 from app.image2text import image_to_text, sticker_to_text
@@ -76,7 +91,7 @@ AZURE_OPENAI_ENDPOINT = get_runtime_value("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = get_runtime_value("AZURE_OPENAI_API_KEY")
 TELEGRAM_BOT_USERNAME = get_runtime_value("TELEGRAM_BOT_USERNAME")
 TELEGRAM_BOT_KEY = get_runtime_value("TELEGRAM_BOT_KEY")
-ARK_ENDPOINT = get_runtime_value("ARK_API_ENDPOINT")
+ARK_ENDPOINT = get_ark_chat_completions_endpoint()
 ARK_API_KEY = get_runtime_value("ARK_API_KEY")
 
 AZURE_OPENAI_API_VERSION = get_runtime_value("AZURE_OPENAI_API_VERSION")
@@ -130,6 +145,380 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_TEXT_LIMIT = 4096
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+_USER_MEMORY_REFRESH_KEYS: set[str] = set()
+
+
+def _configured_admin_user_ids() -> set[int]:
+    raw_value = get_runtime_value("TELEGRAM_ADMIN_USER_IDS")
+    admin_ids: set[int] = set()
+    for token in raw_value.replace(",", " ").split():
+        value = token.strip()
+        if value.startswith("tg_user:"):
+            value = value.split(":", 1)[1]
+        try:
+            admin_ids.add(int(value))
+        except ValueError:
+            continue
+    return admin_ids
+
+
+def _configured_admin_usernames() -> set[str]:
+    raw_value = get_runtime_value("TELEGRAM_ADMIN_USER_IDS")
+    usernames: set[str] = set()
+    for token in raw_value.replace(",", " ").split():
+        value = token.strip()
+        if not value or value.startswith("tg_user:") or value.isdigit():
+            continue
+        usernames.add(value.lstrip("@").lower())
+    return usernames
+
+
+def _has_configured_admins() -> bool:
+    return bool(_configured_admin_user_ids() or _configured_admin_usernames())
+
+
+def _is_private_chat(update: Update) -> bool:
+    return getattr(update.effective_chat, "type", None) == "private"
+
+
+def _is_admin_update(update: Update) -> bool:
+    user_id = getattr(update.effective_user, "id", None)
+    if isinstance(user_id, int) and user_id in _configured_admin_user_ids():
+        return True
+    username = str(getattr(update.effective_user, "username", "") or "").lstrip("@").lower()
+    return bool(username and username in _configured_admin_usernames())
+
+
+def _admin_command_args(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    return [str(arg) for arg in (getattr(context, "args", None) or [])]
+
+
+def _normalize_admin_memory_key(value: str) -> str:
+    candidate = (value or "").strip()
+    if candidate.startswith("tg_user:"):
+        return candidate
+    if candidate.isdigit():
+        return f"tg_user:{candidate}"
+    return candidate
+
+
+def _admin_payload_after_first_arg(args: list[str]) -> str:
+    if len(args) <= 1:
+        return ""
+    return " ".join(args[1:]).strip()
+
+
+def _compact_admin_text(text: str, *, max_chars: int = 700) -> str:
+    value = (text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+def _truncate_admin_reply(text: str) -> str:
+    if len(text) <= TELEGRAM_TEXT_LIMIT:
+        return text
+    return text[: TELEGRAM_TEXT_LIMIT - 3].rstrip() + "..."
+
+
+async def _ensure_admin_private_chat(update: Update) -> bool:
+    if not update.message:
+        return False
+    if not _is_private_chat(update):
+        await update.message.reply_text("Memory admin commands are only available in a private chat.")
+        return False
+    if not _has_configured_admins():
+        await update.message.reply_text("Memory admin commands are disabled. Set TELEGRAM_ADMIN_USER_IDS first.")
+        return False
+    if not _is_admin_update(update):
+        await update.message.reply_text("You are not allowed to use memory admin commands.")
+        return False
+    return True
+
+
+async def handle_memory_admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+    await message.reply_text(
+        "Memory admin commands:\n"
+        "/memory_help - show this help\n"
+        "/memories - list users with message history or memory\n"
+        "/memory <telegram_user_id|tg_user:key> - view one user's memory\n"
+        "/memory_search <keyword> - search summaries and facts\n"
+        "/memory_refresh <telegram_user_id|tg_user:key> - regenerate one user's memory from history\n"
+        "/memory_set <telegram_user_id|tg_user:key> <text> - replace one user's summary memory\n"
+        "/memory_candidates [telegram_user_id|tg_user:key] - list pending memory candidates\n"
+        "/memory_accept <candidate_id> - accept a candidate into facts\n"
+        "/memory_reject <candidate_id> - reject a candidate\n"
+        "/memory_fact_set <fact_id> <text> - edit an active fact\n"
+        "/memory_fact_delete <fact_id> - archive an active fact"
+    )
+
+
+async def handle_memory_admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    rows = await list_user_memory_overviews(limit=40)
+    if not rows:
+        await message.reply_text("No users with message history or memory yet.")
+        return
+
+    lines = [f"Users with message history or memory ({len(rows)} shown):"]
+    for row in rows:
+        display_name = row.latest_display_name or row.telegram_user_key
+        refreshed = row.last_refreshed_date or "never"
+        latest_message = row.latest_message_at or "none"
+        summary_state = "summary=yes" if row.memory_text.strip() else "summary=no"
+        lines.append(
+            f"- {display_name} | {row.telegram_user_key} | facts={row.fact_count} | "
+            f"{summary_state} | refreshed={refreshed} | latest={latest_message}"
+        )
+    await message.reply_text(_truncate_admin_reply("\n".join(lines)))
+
+
+async def handle_memory_admin_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    if not args:
+        await message.reply_text("Usage: /memory <telegram_user_id|tg_user:key>")
+        return
+
+    telegram_user_key = _normalize_admin_memory_key(args[0])
+    current = await get_user_memory(telegram_user_key)
+    facts = await get_user_memory_facts(telegram_user_key, limit=25, min_confidence=0.0)
+    latest_display_name = await get_latest_display_name_for_user(telegram_user_key)
+    if not current and not facts and not latest_display_name:
+        await message.reply_text(f"No memory or message history found for {telegram_user_key}.")
+        return
+
+    display_name = latest_display_name or (current.latest_display_name if current else "") or telegram_user_key
+    lines = [
+        f"Memory for {display_name}",
+        f"key: {telegram_user_key}",
+        f"last_refreshed_date: {current.last_refreshed_date if current else 'never'}",
+        "",
+        "summary:",
+        _compact_admin_text(current.memory_text if current else "") or "(empty)",
+        "",
+        "facts:",
+    ]
+    if facts:
+        for fact in facts:
+            evidence = ",".join(str(message_id) for message_id in fact.evidence_message_ids) or "none"
+            lines.append(
+                f"- #{fact.id} [{fact.fact_type}] {fact.fact_text} "
+                f"(confidence={fact.confidence:.2f}, evidence={evidence})"
+            )
+    else:
+        lines.append("(empty)")
+    await message.reply_text(_truncate_admin_reply("\n".join(lines)))
+
+
+async def handle_memory_admin_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    query = " ".join(_admin_command_args(context)).strip()
+    if not query:
+        await message.reply_text("Usage: /memory_search <keyword>")
+        return
+
+    rows = await search_user_memories(query, limit=25)
+    if not rows:
+        await message.reply_text(f"No memory matches for {query}.")
+        return
+
+    lines = [f"Memory search results for {query} ({len(rows)} shown):"]
+    for row in rows:
+        display_name = row.latest_display_name or row.telegram_user_key
+        lines.append(f"- {display_name} | {row.telegram_user_key} | {row.source}: {_compact_admin_text(row.text, max_chars=220)}")
+    await message.reply_text(_truncate_admin_reply("\n".join(lines)))
+
+
+async def handle_memory_admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    if not args:
+        await message.reply_text("Usage: /memory_refresh <telegram_user_id|tg_user:key>")
+        return
+
+    telegram_user_key = _normalize_admin_memory_key(args[0])
+    latest_display_name = await get_latest_display_name_for_user(telegram_user_key)
+    if not latest_display_name:
+        await message.reply_text(f"No message history found for {telegram_user_key}.")
+        return
+
+    await message.reply_text(f"Refreshing memory for {latest_display_name} ({telegram_user_key})...")
+    memory_text = await refresh_user_memory_if_due(
+        telegram_user_key=telegram_user_key,
+        latest_display_name=latest_display_name,
+        force=True,
+    )
+    await message.reply_text(
+        "Memory refresh finished.\n"
+        f"key: {telegram_user_key}\n"
+        f"summary:\n{_compact_admin_text(memory_text or '(empty)')}"
+    )
+
+
+async def handle_memory_admin_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    if len(args) < 2:
+        await message.reply_text("Usage: /memory_set <telegram_user_id|tg_user:key> <summary text>")
+        return
+
+    telegram_user_key = _normalize_admin_memory_key(args[0])
+    memory_text = _admin_payload_after_first_arg(args)
+    if not memory_text:
+        await message.reply_text("Usage: /memory_set <telegram_user_id|tg_user:key> <summary text>")
+        return
+
+    current = await get_user_memory(telegram_user_key)
+    latest_display_name = await get_latest_display_name_for_user(telegram_user_key)
+    await upsert_user_memory(
+        telegram_user_key,
+        latest_display_name=latest_display_name or (current.latest_display_name if current else "") or telegram_user_key,
+        memory_text=memory_text,
+        last_refreshed_date=current.last_refreshed_date if current else None,
+    )
+    await message.reply_text(
+        "Memory summary updated.\n"
+        f"key: {telegram_user_key}\n"
+        f"summary:\n{_compact_admin_text(memory_text)}"
+    )
+
+
+def _parse_positive_int(value: str) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+async def handle_memory_admin_candidates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    telegram_user_key = _normalize_admin_memory_key(args[0]) if args else None
+    candidates = await list_user_memory_candidates(telegram_user_key, status="pending", limit=30)
+    if not candidates:
+        await message.reply_text("No pending memory candidates.")
+        return
+
+    lines = [f"Pending memory candidates ({len(candidates)} shown):"]
+    for candidate in candidates:
+        evidence = ",".join(str(message_id) for message_id in candidate.evidence_message_ids) or "none"
+        lines.append(
+            f"- #{candidate.id} | {candidate.telegram_user_key} | {candidate.priority}/{candidate.fact_type} | "
+            f"confidence={candidate.confidence:.2f} | evidence={evidence} | "
+            f"{_compact_admin_text(candidate.fact_text, max_chars=220)}"
+        )
+    await message.reply_text(_truncate_admin_reply("\n".join(lines)))
+
+
+async def handle_memory_admin_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    candidate_id = _parse_positive_int(args[0]) if args else None
+    if candidate_id is None:
+        await message.reply_text("Usage: /memory_accept <candidate_id>")
+        return
+
+    accepted = await accept_user_memory_candidate(candidate_id)
+    await message.reply_text(f"Candidate #{candidate_id} accepted." if accepted else f"Candidate #{candidate_id} was not found or is not pending.")
+
+
+async def handle_memory_admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    candidate_id = _parse_positive_int(args[0]) if args else None
+    if candidate_id is None:
+        await message.reply_text("Usage: /memory_reject <candidate_id>")
+        return
+
+    rejected = await reject_user_memory_candidate(candidate_id)
+    await message.reply_text(f"Candidate #{candidate_id} rejected." if rejected else f"Candidate #{candidate_id} was not found.")
+
+
+async def handle_memory_admin_fact_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    fact_id = _parse_positive_int(args[0]) if args else None
+    fact_text = _admin_payload_after_first_arg(args)
+    if fact_id is None or not fact_text:
+        await message.reply_text("Usage: /memory_fact_set <fact_id> <text>")
+        return
+
+    updated = await update_user_memory_fact(fact_id, fact_text=fact_text)
+    await message.reply_text(
+        f"Fact #{fact_id} updated.\n{_compact_admin_text(fact_text)}"
+        if updated
+        else f"Fact #{fact_id} was not found."
+    )
+
+
+async def handle_memory_admin_fact_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    fact_id = _parse_positive_int(args[0]) if args else None
+    if fact_id is None:
+        await message.reply_text("Usage: /memory_fact_delete <fact_id>")
+        return
+
+    archived = await archive_user_memory_fact(fact_id)
+    await message.reply_text(f"Fact #{fact_id} archived." if archived else f"Fact #{fact_id} was not found.")
 
 
 def _truncate_caption_text(text: str, max_chars: int = TELEGRAM_CAPTION_LIMIT) -> str:
@@ -263,7 +652,7 @@ async def _handle_twitter_media_message(
         return False
 
     twitter_downloader = TwitterDownloader()
-    media_list, text_dict = twitter_downloader.extract_twitter_media(video_url)
+    media_list, text_dict = await asyncio.to_thread(twitter_downloader.extract_twitter_media, video_url)
 
     tweet_text = summarize_tweet_text(text_dict)
 
@@ -347,7 +736,7 @@ async def _handle_twitter_media_message(
         )
 
     await _delete_message_if_exists(status_message)
-    await update.message.delete()
+    await _delete_message_if_exists(update.message)
     return True
 
 
@@ -505,7 +894,7 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
     if not update.message or not update.message.text:
         return
 
-    await _handle_group_ai_reply_pipeline(update, update.message.text)
+    await _handle_group_ai_reply_pipeline(update, update.message.text, context=context)
 
 
 async def _handle_group_ai_reply_pipeline(
@@ -513,6 +902,7 @@ async def _handle_group_ai_reply_pipeline(
     message_text: str,
     *,
     additional_context: Optional[list[str]] = None,
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None,
 ) -> None:
     """Shared group-reply flow for text-like content."""
     if not update.message:
@@ -533,18 +923,16 @@ async def _handle_group_ai_reply_pipeline(
 
     if telegram_user_key:
         try:
-            personal_memory = await refresh_user_memory_if_due(
-                telegram_user_key=telegram_user_key,
-                latest_display_name=sender_display,
-            )
+            personal_memory = await get_personal_memory_context(telegram_user_key)
             if personal_memory:
                 merged_additional_context.append(f"user_memory_key: {telegram_user_key}")
                 merged_additional_context.append(f"user_personal_memory:\n{personal_memory}")
         except Exception as exc:
-            logger.exception("Failed to refresh personal memory for %s: %s", telegram_user_key, exc)
+            logger.exception("Failed to read personal memory for %s: %s", telegram_user_key, exc)
+        _schedule_personal_memory_refresh(context, telegram_user_key, sender_display)
 
     logger.info("Adding message to history for %s", sender_display)
-    await add_message(
+    message_db_id = await add_message(
         chat_id=chat_id,
         username=sender_display,
         content=stored_message_text,
@@ -552,6 +940,13 @@ async def _handle_group_ai_reply_pipeline(
         telegram_message_id=getattr(update.message, "message_id", None),
         reply_to_telegram_message_id=reply_to_tg_id,
         reply_to_username=reply_to_username,
+    )
+    _schedule_memory_candidate_extraction(
+        context,
+        telegram_user_key=telegram_user_key,
+        message_text=stored_message_text,
+        message_db_id=message_db_id,
+        latest_display_name=sender_display,
     )
 
     is_reply_to_bot = _is_reply_to_this_bot(update, TELEGRAM_BOT_USERNAME)
@@ -578,7 +973,11 @@ async def _handle_group_ai_reply_pipeline(
         if not should_reply:
             return
 
-    rag_query = _build_rag_query_from_message(message_text)
+    rag_query = _build_rag_query_from_message(
+        message_text,
+        additional_context=merged_additional_context,
+        sender_display=sender_display,
+    )
     history_messages, rag_related_messages = await get_prompt_context_parts(chat_id, query=rag_query)
 
     ai_reply = await generate_group_reply(
@@ -605,12 +1004,86 @@ async def _handle_group_ai_reply_pipeline(
             logger.error(f"Error sending AI reply: {e}")
 
 
-def _schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coroutine) -> None:
+def _schedule_background_task(context: Optional[ContextTypes.DEFAULT_TYPE], coroutine) -> None:
     application = getattr(context, "application", None)
     if application is not None and hasattr(application, "create_task"):
         application.create_task(coroutine)
         return
-    asyncio.create_task(coroutine)
+    task = asyncio.create_task(coroutine)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _extract_memory_candidate_background(
+    *,
+    telegram_user_key: str,
+    message_text: str,
+    message_db_id: Optional[int],
+    latest_display_name: str,
+) -> None:
+    try:
+        candidate_id = await extract_user_memory_candidate_from_message(
+            telegram_user_key=telegram_user_key,
+            message_text=message_text,
+            message_id=message_db_id,
+        )
+        if candidate_id is not None:
+            await refresh_user_memory_if_due(
+                telegram_user_key=telegram_user_key,
+                latest_display_name=latest_display_name,
+            )
+    except Exception as exc:
+        logger.exception("Background memory candidate extraction failed for %s: %s", telegram_user_key, exc)
+
+
+def _schedule_memory_candidate_extraction(
+    context: Optional[ContextTypes.DEFAULT_TYPE],
+    *,
+    telegram_user_key: Optional[str],
+    message_text: str,
+    message_db_id: Optional[int],
+    latest_display_name: str,
+) -> None:
+    if not telegram_user_key or message_db_id is None or not message_text.strip():
+        return
+    _schedule_background_task(
+        context,
+        _extract_memory_candidate_background(
+            telegram_user_key=telegram_user_key,
+            message_text=message_text,
+            message_db_id=message_db_id,
+            latest_display_name=latest_display_name,
+        ),
+    )
+
+
+async def _refresh_user_memory_background(telegram_user_key: str, latest_display_name: str) -> None:
+    try:
+        await refresh_user_memory_if_due(
+            telegram_user_key=telegram_user_key,
+            latest_display_name=latest_display_name,
+        )
+    except Exception as exc:
+        logger.exception("Background personal memory refresh failed for %s: %s", telegram_user_key, exc)
+    finally:
+        _USER_MEMORY_REFRESH_KEYS.discard(telegram_user_key)
+
+
+def _schedule_personal_memory_refresh(
+    context: Optional[ContextTypes.DEFAULT_TYPE],
+    telegram_user_key: Optional[str],
+    latest_display_name: str,
+) -> None:
+    if not telegram_user_key or telegram_user_key in _USER_MEMORY_REFRESH_KEYS:
+        return
+    _USER_MEMORY_REFRESH_KEYS.add(telegram_user_key)
+    _schedule_background_task(
+        context,
+        _refresh_user_memory_background(
+            telegram_user_key=telegram_user_key,
+            latest_display_name=latest_display_name,
+        ),
+    )
 
 
 async def _process_video_link_request(
@@ -662,11 +1135,12 @@ async def _process_video_link_request(
             )
 
         await _delete_message_if_exists(status_message)
-        await update.message.delete()
+        await _delete_message_if_exists(update.message)
     except Exception as e:
         logger.exception("Error during video download or sending")
-        if getattr(update, "message", None):
-            await update.message.reply_text(_build_detailed_media_error_message(e))
+        message = getattr(update, "message", None)
+        if message:
+            await message.reply_text(_build_detailed_media_error_message(e))
         await _delete_message_if_exists(status_message)
     finally:
         for path in cleanup_paths:
@@ -738,6 +1212,7 @@ async def handle_photo_for_group_ai_reply(update: Update, context: ContextTypes.
             additional_context=[
                 "input_type: image",
             ],
+            context=context,
         )
     except Exception as e:
         logger.error(f"Error handling group image message: {e}")
@@ -767,6 +1242,7 @@ async def handle_sticker_for_group_ai_reply(update: Update, context: ContextType
             f"sticker_description_source: {description_source}",
             f"sticker_description: {description}",
         ],
+        context=context,
     )
 
 
@@ -860,6 +1336,19 @@ def register_handlers(application: Application) -> None:
     """Register all command and message handlers in one place."""
     # on different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
+
+    # Private memory administration commands
+    application.add_handler(CommandHandler("memory_help", handle_memory_admin_help, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memories", handle_memory_admin_list, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory", handle_memory_admin_view, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_search", handle_memory_admin_search, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_refresh", handle_memory_admin_refresh, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_set", handle_memory_admin_set, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_candidates", handle_memory_admin_candidates, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_accept", handle_memory_admin_accept, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_reject", handle_memory_admin_reject, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_fact_set", handle_memory_admin_fact_set, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_fact_delete", handle_memory_admin_fact_delete, filters=filters.ChatType.PRIVATE))
 
     # Commands for rendering to image
     application.add_handler(CommandHandler("md2jpg", handle_md2jpg_and_text2jpg))

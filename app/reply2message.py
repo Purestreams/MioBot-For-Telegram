@@ -144,13 +144,14 @@ def _build_user_prompt(
     runtime_block = "\n".join(runtime_state or []) if runtime_state else "(none)"
 
     return (
-        "Here is the prompt context in 7 parts. The final section is the newest message.\n\n"
+        "Here is the prompt context in 7 parts, ordered from the most reusable context to the most volatile context. "
+        "The final section is the newest message.\n\n"
         "### PART 1: EARLIER HISTORY\n"
         f"{history_block}\n\n"
-        "### PART 2: RAG RELATED MESSAGE\n"
-        f"{rag_block}\n\n"
-        "### PART 3: DURABLE CONTEXT\n"
+        "### PART 2: DURABLE CONTEXT\n"
         f"{durable_block}\n\n"
+        "### PART 3: RAG RELATED MESSAGES\n"
+        f"{rag_block}\n\n"
         "### PART 4: MESSAGE-SPECIFIC CONTEXT\n"
         f"{message_specific_block}\n\n"
         "### PART 5: DIRECT ADDRESS FLAGS\n"

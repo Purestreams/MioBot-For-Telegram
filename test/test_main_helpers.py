@@ -30,6 +30,24 @@ def test_build_rag_query_uses_keywords():
     assert query == "hello world"
 
 
+def test_build_rag_query_includes_message_specific_context():
+    query = main._build_rag_query_from_message(
+        "mioo 看一下",
+        additional_context=[
+            "replied_to_content: previous deployment failed on sqlite lock",
+            "sticker_description: annoyed face with error text",
+            "user_personal_memory:\nshould not become retrieval query",
+        ],
+        sender_display="Alice @alice",
+    )
+
+    assert "mioo" in query
+    assert "previous deployment failed on sqlite lock" in query
+    assert "annoyed face with error text" in query
+    assert "Alice @alice" in query
+    assert "should not become retrieval query" not in query
+
+
 def test_classify_group_reply_trigger_detects_username_mention():
     trigger = main._classify_group_reply_trigger("hey @MioooooooooBot look here", "MioooooooooBot")
     assert trigger == "username_mention"
@@ -158,6 +176,90 @@ def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
     assert bot.videos == []
     assert status.deleted is True
     assert message.deleted is True
+
+
+def test_handle_twitter_media_message_offloads_sync_extraction(monkeypatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.message_id = 124
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeBot:
+        def __init__(self):
+            self.messages = []
+            self.photos = []
+            self.media_groups = []
+            self.videos = []
+            self.documents = []
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+
+        async def send_photo(self, **kwargs):
+            self.photos.append(kwargs)
+
+        async def send_media_group(self, **kwargs):
+            self.media_groups.append(kwargs)
+
+        async def send_video(self, **kwargs):
+            self.videos.append(kwargs)
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+
+    class _FakeStatus:
+        def __init__(self):
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeTwitterDownloader:
+        def extract_twitter_media(self, url):
+            return [], {"1": "text only tweet"}
+
+    captured = {"to_thread": False, "callable_name": None}
+
+    async def fake_to_thread(func, *args, **kwargs):
+        captured["to_thread"] = True
+        captured["callable_name"] = getattr(func, "__name__", None)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
+    monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+
+    message = _FakeMessage()
+    bot = _FakeBot()
+    status = _FakeStatus()
+    update = SimpleNamespace(message=message, effective_chat=SimpleNamespace(id=1))
+    context = SimpleNamespace(bot=bot)
+
+    handled = asyncio.run(
+        main._handle_twitter_media_message(
+            update=update,
+            context=context,
+            video_url="https://x.com/u/status/1",
+            sender_display="Tester @tester",
+            status_message=status,
+        )
+    )
+
+    assert handled is True
+    assert captured == {"to_thread": True, "callable_name": "extract_twitter_media"}
+    assert bot.messages
+    assert status.deleted is True
+    assert message.deleted is True
+
+
+def test_delete_message_if_exists_swallows_cleanup_errors():
+    class _BadMessage:
+        async def delete(self):
+            raise RuntimeError("delete failed")
+
+    asyncio.run(main._delete_message_if_exists(_BadMessage()))
 
 
 def test_handle_twitter_media_message_handles_text_only_tweet(monkeypatch):
@@ -521,3 +623,18 @@ def test_handle_text_for_youtube_or_group_schedules_video_processing_in_backgrou
     assert message.reply_calls[0]["text"] == "Downloading your video, please wait a moment..."
     assert scheduled["context"] is context
     assert scheduled["coro"] is not None
+
+
+def test_schedule_background_task_tracks_fallback_tasks():
+    async def quick_task():
+        return None
+
+    async def _run() -> None:
+        main._BACKGROUND_TASKS.clear()
+        main._schedule_background_task(SimpleNamespace(), quick_task())
+        assert len(main._BACKGROUND_TASKS) == 1
+        await asyncio.gather(*list(main._BACKGROUND_TASKS))
+        await asyncio.sleep(0)
+        assert main._BACKGROUND_TASKS == set()
+
+    asyncio.run(_run())

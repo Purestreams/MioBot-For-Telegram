@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
@@ -17,14 +18,16 @@ DEFAULTS = {
     "AZURE_OPENAI_DEPLOYMENT_NAME": "gpt-5-mini",
     "ARK_API_ENDPOINT": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
     "ARK_MODEL": "doubao-seed-1-8-251228",
-    "ARK_RESPONSES_ENDPOINT": "https://ark.cn-beijing.volces.com/api/v3/responses",
     "ARK_VISION_MODEL": "doubao-seed-1-6-251015",
     "OLLAMA_ENDPOINT": "http://100.69.97.8:11434",
     "OLLAMA_MODEL": "gpt-oss:20b",
     "TELEGRAM_BOT_USERNAME": "MioooooooooBot",
+    "TELEGRAM_ADMIN_USER_IDS": "",
     "DB_FILE": "data/message_history.db",
     "MESSAGE_REVIEW_BACK": "80",
     "RAG_TOP_K": "12",
+    "MEMORY_CANDIDATE_EXTRACTION_ENABLED": "1",
+    "MEMORY_CANDIDATE_AUTO_REFRESH_COUNT": "3",
     "EMBED_MODEL": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 }
 
@@ -70,6 +73,29 @@ def bootstrap_runtime_environment(*, force: bool = False) -> None:
 def get_runtime_value(name: str) -> str:
     bootstrap_runtime_environment()
     return os.getenv(name, "")
+
+
+def _derive_ark_endpoint(endpoint: str, suffix: str) -> str:
+    raw_endpoint = (endpoint or "").strip().rstrip("/")
+    if not raw_endpoint:
+        return ""
+
+    parsed = urlsplit(raw_endpoint)
+    path = parsed.path.rstrip("/")
+    for known_suffix in ("/chat/completions", "/responses"):
+        if path.endswith(known_suffix):
+            path = path[: -len(known_suffix)]
+            break
+
+    return urlunsplit(parsed._replace(path=f"{path}/{suffix.strip('/')}", query="", fragment=""))
+
+
+def get_ark_chat_completions_endpoint() -> str:
+    return _derive_ark_endpoint(get_runtime_value("ARK_API_ENDPOINT"), "chat/completions")
+
+
+def get_ark_responses_endpoint() -> str:
+    return _derive_ark_endpoint(get_runtime_value("ARK_API_ENDPOINT"), "responses")
 
 
 def get_runtime_int(name: str, default: int) -> int:

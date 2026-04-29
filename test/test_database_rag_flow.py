@@ -64,6 +64,44 @@ def test_get_prompt_context_parts_includes_retrieved_history(monkeypatch, isolat
     assert "cats and fish" in rag[0].lower()
 
 
+def test_get_prompt_context_parts_uses_keyword_retrieval_when_embeddings_miss(monkeypatch, tmp_path):
+    db_path = tmp_path / "keyword_rag.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    monkeypatch.setenv("RAG_ENABLED", "1")
+    database.init_db()
+
+    async def fake_embed_message_content(username: str, content: str):
+        return np.array([0.0, 1.0], dtype=np.float32), EmbeddingMetadata(
+            backend="test",
+            model="test-model",
+            dim=2,
+            signature="test:2",
+        )
+
+    async def fake_embed_text_with_metadata(text: str, *, model_name=None):
+        return np.array([1.0, 0.0], dtype=np.float32), EmbeddingMetadata(
+            backend="test",
+            model="test-model",
+            dim=2,
+            signature="test:2",
+        )
+
+    monkeypatch.setattr(database, "_embed_message_content", fake_embed_message_content)
+    monkeypatch.setattr(database, "embed_text_with_metadata", fake_embed_text_with_metadata)
+
+    async def _run() -> tuple[list[str], list[str]]:
+        await database.add_message(200, "u1", "the launch checklist mentions sqlite lock handling")
+        await database.add_message(200, "u2", "unrelated cats and fish")
+        await database.add_message(200, "u3", "current message")
+        return await database.get_prompt_context_parts(200, "sqlite lock", recent_n=1, retrieved_k=2)
+
+    recent, rag = asyncio.run(_run())
+
+    assert len(recent) == 1
+    assert any("sqlite lock handling" in line for line in rag)
+
+
 def test_get_embedding_health_report_flags_signature_drift(monkeypatch, tmp_path):
     db_path = tmp_path / "health.db"
     monkeypatch.setenv("DB_FILE", str(db_path))

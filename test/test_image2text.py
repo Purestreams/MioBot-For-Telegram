@@ -1,3 +1,6 @@
+import asyncio
+
+from app import image2text
 from app.image2text import _build_sticker_prompt, _extract_text_from_responses_payload, _guess_mime_type
 
 
@@ -35,3 +38,46 @@ def test_build_sticker_prompt_includes_optional_hints():
     prompt = _build_sticker_prompt(emoji="🙂", set_name="mio_pack")
     assert "Known sticker emoji: 🙂." in prompt
     assert "Sticker set name: mio_pack." in prompt
+
+
+def test_image_to_text_reads_file_in_worker_thread(monkeypatch, tmp_path):
+    image_path = tmp_path / "sample.jpg"
+    image_path.write_bytes(b"fake image")
+
+    captured = {"to_thread": False, "url": None}
+
+    async def fake_to_thread(func, *args, **kwargs):
+        captured["to_thread"] = True
+        return func(*args, **kwargs)
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"output_text": " image text "}
+
+    class _FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *args, **kwargs):
+            captured["url"] = url
+            return _FakeResponse()
+
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    monkeypatch.setenv("ARK_API_ENDPOINT", "https://example.test/api/v3/chat/completions")
+    monkeypatch.setattr(image2text.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(image2text.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(image2text.image_to_text(str(image_path)))
+
+    assert captured["to_thread"] is True
+    assert captured["url"] == "https://example.test/api/v3/responses"
+    assert result == "image text"

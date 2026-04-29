@@ -47,3 +47,15 @@ def test_set_environment_reads_from_config_runtime_env(monkeypatch):
         assert os.getenv("TELEGRAM_BOT_KEY") == "abc123"
         assert os.getenv("TELEGRAM_BOT_USERNAME") == "botuser"
         assert os.getenv("ARK_API_KEY") == "ark-key"
+
+
+def test_ark_endpoint_helpers_derive_chat_and_responses_urls(monkeypatch):
+    monkeypatch.setenv("ARK_API_ENDPOINT", "https://example.test/api/v3/chat/completions")
+
+    assert runtime_config.get_ark_chat_completions_endpoint() == "https://example.test/api/v3/chat/completions"
+    assert runtime_config.get_ark_responses_endpoint() == "https://example.test/api/v3/responses"
+
+    monkeypatch.setenv("ARK_API_ENDPOINT", "https://example.test/api/v3/responses")
+
+    assert runtime_config.get_ark_chat_completions_endpoint() == "https://example.test/api/v3/chat/completions"
+    assert runtime_config.get_ark_responses_endpoint() == "https://example.test/api/v3/responses"

@@ -1,10 +1,12 @@
 """Utility helpers extracted from main entrypoint logic."""
 
+import logging
 import os
 import re
 from typing import Optional
 
 OUTPUT_DIR = "output"
+logger = logging.getLogger(__name__)
 
 # URL regex patterns
 YOUTUBE_URL_REGEX = (
@@ -38,6 +40,19 @@ RAG_KEYWORD_STOPWORDS = {
     "you", "your", "me", "my", "we", "our", "they", "their", "he", "she", "his", "her",
 }
 
+RAG_QUERY_CONTEXT_PREFIXES = {
+    "user_reply_relation",
+    "message_reply_relation",
+    "replied_to_author",
+    "replied_to_content",
+    "current_message_content",
+    "caption",
+    "sticker_emoji",
+    "sticker_set_name",
+    "sticker_description",
+    "input_type",
+}
+
 
 def _build_output_path(prefix: str, message_id: int, extension: str = "jpg") -> str:
     return os.path.join(OUTPUT_DIR, f"{prefix}_{message_id}.{extension}")
@@ -50,7 +65,10 @@ def _remove_file_if_exists(path) -> None:
 
 async def _delete_message_if_exists(message) -> None:
     if message:
-        await message.delete()
+        try:
+            await message.delete()
+        except Exception as exc:
+            logger.warning("Failed to delete Telegram message during cleanup: %s", exc)
 
 
 def _extract_video_url(message_text: str) -> Optional[str]:
@@ -172,7 +190,7 @@ def _match_command_payload(message_text: str, regex_pattern: str) -> Optional[st
 
 
 def _extract_search_keywords(message_text: str, *, max_keywords: int = 8) -> list[str]:
-    tokens = re.findall(r"[A-Za-z0-9_]{2,}", message_text.lower())
+    tokens = re.findall(r"[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", message_text.lower())
     keywords: list[str] = []
     seen = set()
 
@@ -188,11 +206,43 @@ def _extract_search_keywords(message_text: str, *, max_keywords: int = 8) -> lis
     return keywords
 
 
-def _build_rag_query_from_message(message_text: str) -> str:
+def _build_rag_query_from_message(
+    message_text: str,
+    *,
+    additional_context: Optional[list[str]] = None,
+    sender_display: Optional[str] = None,
+    max_chars: int = 800,
+) -> str:
     keywords = _extract_search_keywords(message_text)
+    parts: list[str] = []
     if keywords:
-        return " ".join(keywords)
-    return message_text
+        parts.append(" ".join(keywords))
+    elif message_text.strip():
+        parts.append(message_text.strip())
+
+    if sender_display:
+        parts.append(sender_display)
+
+    for line in additional_context or []:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        if key.strip() in RAG_QUERY_CONTEXT_PREFIXES and value.strip():
+            parts.append(value.strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        normalized = " ".join(str(part).split())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+
+    query = " | ".join(deduped) if deduped else message_text
+    if len(query) > max_chars:
+        return query[: max_chars - 1].rstrip() + "…"
+    return query
 
 
 def _is_group_chat(update) -> bool:

@@ -65,21 +65,25 @@ def test_group_reply_pipeline_calls_rag_and_replies(monkeypatch):
         assert any("user_personal_memory:" in line for line in (kwargs.get("additional_context") or []))
         return "nya~"
 
-    async def fake_refresh_user_memory_if_due(**kwargs):
-        assert kwargs["telegram_user_key"] == "tg_user:999"
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
+        assert telegram_user_key == "tg_user:999"
         return "likes short answers"
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
+        return None
 
     monkeypatch.setattr(main, "add_message", fake_add_message)
     monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
     monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
     monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
-    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
 
     update_any: Any = update
     asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "hello cats"))
 
     assert calls["add"] == 2
-    assert calls["context"] == ["", "hello cats"]
+    assert calls["context"] == ["", "hello cats | tester @[999]"]
     assert calls["probe"] == 1
     assert calls["generate"] == 1
     assert update.message.replies == ["nya~"]
@@ -110,14 +114,18 @@ def test_group_reply_pipeline_includes_reply_relation_context(monkeypatch):
         captured["additional_context"] = kwargs.get("additional_context")
         return None
 
-    async def fake_refresh_user_memory_if_due(**kwargs):
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
         return "prefers direct answers"
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
+        return None
 
     monkeypatch.setattr(main, "add_message", fake_add_message)
     monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
     monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
     monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
-    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
 
     update_any: Any = update
     asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "A replying to B"))
@@ -156,14 +164,18 @@ def test_group_reply_pipeline_stops_after_negative_probe(monkeypatch):
         calls["generate"] += 1
         return "should not happen"
 
-    async def fake_refresh_user_memory_if_due(**kwargs):
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
+        return None
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
         return None
 
     monkeypatch.setattr(main, "add_message", fake_add_message)
     monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
     monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
     monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
-    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
 
     update_any: Any = update
     asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "hello cats"))
@@ -179,6 +191,7 @@ def test_group_reply_pipeline_direct_mention_bypasses_probe(monkeypatch):
     update = _FakeUpdate()
     update.message = _FakeMessage(text="mioo look here", message_id=77)
     update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
 
     calls = {"probe": 0, "generate": 0, "context": []}
 
@@ -201,22 +214,73 @@ def test_group_reply_pipeline_direct_mention_bypasses_probe(monkeypatch):
         assert any("user_personal_memory:" in line for line in (kwargs.get("additional_context") or []))
         return "在呢"
 
-    async def fake_refresh_user_memory_if_due(**kwargs):
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
         return "often pings Mioo directly"
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
+        return None
 
     monkeypatch.setattr(main, "add_message", fake_add_message)
     monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
     monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
     monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
-    monkeypatch.setattr(main, "refresh_user_memory_if_due", fake_refresh_user_memory_if_due)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
 
     update_any: Any = update
     asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "mioo look here"))
 
     assert calls["probe"] == 0
     assert calls["generate"] == 1
-    assert calls["context"] == ["mioo look here"]
+    assert calls["context"] == ["mioo look here | UserA @user_a"]
     assert update.message.replies == ["在呢"]
+
+
+def test_group_reply_pipeline_uses_cached_memory_and_schedules_refresh(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="mioo help", message_id=88)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
+
+    captured = {"additional_context": [], "probe": 0, "generate": 0, "scheduled": None}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        return None
+
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+        return ["[t] UserA @user_a: mioo help"], []
+
+    async def fake_should_activate_reply(**kwargs):
+        captured["probe"] += 1
+        return True
+
+    async def fake_generate_group_reply(**kwargs):
+        captured["generate"] += 1
+        captured["additional_context"] = kwargs.get("additional_context") or []
+        return "来了"
+
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
+        assert telegram_user_key == "tg_user:10101"
+        return "structured_facts:\n- [preference] likes direct fixes"
+
+    def fake_schedule_personal_memory_refresh(context, telegram_user_key, latest_display_name):
+        captured["scheduled"] = (context, telegram_user_key, latest_display_name)
+
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
+
+    update_any: Any = update
+    asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "mioo help"))
+
+    assert captured["probe"] == 0
+    assert captured["generate"] == 1
+    assert any("user_personal_memory:" in line for line in captured["additional_context"])
+    assert captured["scheduled"] == (None, "tg_user:10101", "UserA @user_a")
+    assert update.message.replies == ["来了"]
 
 
 def test_handle_sticker_for_group_ai_reply_uses_cached_description(monkeypatch):
@@ -236,7 +300,7 @@ def test_handle_sticker_for_group_ai_reply_uses_cached_description(monkeypatch):
         assert file_unique_id == "sticker-1"
         return "smiling cat waving"
 
-    async def fake_pipeline(update_arg, message_text, *, additional_context=None):
+    async def fake_pipeline(update_arg, message_text, *, additional_context=None, context=None):
         captured["message_text"] = message_text
         captured["additional_context"] = additional_context
 
@@ -291,7 +355,7 @@ def test_handle_sticker_for_group_ai_reply_reads_and_caches_new_sticker(monkeypa
         assert set_name == "mio_pack"
         return "angry cat glaring"
 
-    async def fake_pipeline(update_arg, message_text, *, additional_context=None):
+    async def fake_pipeline(update_arg, message_text, *, additional_context=None, context=None):
         cached["message_text"] = message_text
         cached["context"] = additional_context
 

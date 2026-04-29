@@ -1,21 +1,465 @@
 # MioBot
 
-MioBot 是一个异步 Telegram 机器人，当前主要围绕三条能力线工作：
+MioBot is an async Telegram bot for rendering text, downloading media, and joining group conversations with retrieval-augmented context and per-user long-term memory.
 
-- Markdown / 纯文本 / `.txt` / `.md` 转图片
-- YouTube、Bilibili、Twitter/X 链接自动下载与回传
-- 群聊里的轻量多模态回复，底层使用 SQLite + FastEmbed RAG + 用户长期记忆
+The default README language is English. A Chinese version is available below: [中文说明](#中文说明).
 
-English summary: MioBot is an async Telegram bot for text-to-image rendering, media downloading, and context-aware group replies backed by SQLite, FastEmbed, and configurable LLM providers.
+## Highlights
 
-## Current Features
+- Markdown, plain text, `.txt`, and `.md` rendering to image.
+- Automatic YouTube, Bilibili, and Twitter/X media handling.
+- Context-aware group replies powered by recent chat history, hybrid RAG, and personal memory.
+- Photo and sticker understanding through Ark vision models.
+- SQLite-backed message history, embeddings, sticker cache, memory summaries, structured facts, and memory candidates.
+- Private Telegram admin tools for inspecting, regenerating, and editing user memory.
 
-### 1. Markdown / Text -> Image
+## Features
 
-- `/md2jpg` 直接把 Markdown 渲染成图片。
-- `/text2jpg` 先调用当前配置的 LLM 把纯文本整理成 Markdown，再渲染成图片。
-- 上传 `.txt` 或 `.md` 文件也会走同一套渲染链路。
-- 当前 Telegram handler 默认输出 JPG 文件，并使用 `formal_code` 主题。
+### Text To Image
+
+- `/md2jpg` renders Markdown directly to an image.
+- `/text2jpg` asks the configured LLM to convert plain text into Markdown first, then renders it.
+- Uploaded `.txt` and `.md` files use the same rendering pipeline.
+
+Examples:
+
+```text
+/md2jpg ,,,# Title
+Some *markdown* here,,,
+
+/text2jpg ,,,Some plain text here,,,
+```
+
+Related modules: [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py).
+
+### Media Download
+
+- Plain text messages containing YouTube, Bilibili, or Twitter/X links trigger the media flow automatically.
+- YouTube and Bilibili use [app/youtube_dl.py](app/youtube_dl.py), prefer MP4 up to 720p, and try ffmpeg compression when Telegram size limits are exceeded.
+- Twitter/X uses [app/twitter_downloader.py](app/twitter_downloader.py) and supports photos, videos, GIFs, and text-only fallback replies.
+- After successful media delivery, the original link message is deleted.
+
+### Group Replies
+
+Group text, photo, and sticker messages converge into the same reply pipeline in [main.py](main.py):
+
+1. Store the message and reply-chain metadata in SQLite.
+2. Read cached personal memory and schedule background memory maintenance.
+3. Detect direct triggers: replying to the bot, mentioning `@BotUsername`, `mioo`, or `小小宫`.
+4. For ambient messages, run an activation probe before replying.
+5. Build prompt context from recent messages, hybrid RAG results, personal memory, and runtime state.
+6. Generate the reply and store the bot response back into the database.
+
+### Multimodal Context
+
+- Photos are summarized by [app/image2text.py](app/image2text.py) before entering the group reply pipeline.
+- Stickers are described once and cached in `sticker_descriptions`.
+- Vision uses Ark Responses API derived from the single `ARK_API_ENDPOINT` setting. You do not need a separate responses endpoint variable.
+
+### Personal Memory
+
+MioBot keeps memory in layers:
+
+- `user_memories`: compact summary text for prompt injection.
+- `user_memory_facts`: structured long-term facts with type, confidence, evidence message IDs, and active/archive state.
+- `user_memory_candidates`: pending fast/slow candidates extracted from high-signal user messages.
+
+High-signal messages create pending candidates in the background. Fast candidates or enough accumulated slow candidates trigger consolidation into structured facts. Memory refreshes can also archive stale or contradictory fact IDs returned by the model.
+
+### Extra Commands
+
+- `/crypto` returns Coinbase price data and Allez APR snapshots.
+- `/med2jpg` converts natural-language prescription requests into a rendered medical image. This requires optional TeX/PDF dependencies.
+
+## Architecture
+
+| Area | Files | Notes |
+| --- | --- | --- |
+| Entrypoint and handlers | [main.py](main.py) | Telegram setup, handler registration, startup health checks |
+| Runtime config | [app/runtime_config.py](app/runtime_config.py) | Loads env files and derives Ark chat/Responses endpoints |
+| LLM abstraction | [app/ai_model.py](app/ai_model.py) | Ark, Azure OpenAI, and Ollama chat completion wrapper |
+| Rendering | [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py) | Text shaping, HTML rendering, Playwright screenshot |
+| Media | [app/youtube_dl.py](app/youtube_dl.py), [app/twitter_downloader.py](app/twitter_downloader.py) | Download, compression, captions, fallback parsing |
+| Group replies | [app/reply2message.py](app/reply2message.py), [main.py](main.py) | Activation probe and reply generation |
+| Storage and RAG | [app/database.py](app/database.py), [app/rag_embeddings.py](app/rag_embeddings.py) | SQLite, embeddings, vector search, keyword search, reindexing |
+| Personal memory | [app/user_memory.py](app/user_memory.py) | Candidate extraction, summary refresh, structured facts |
+| Vision and stickers | [app/image2text.py](app/image2text.py) | Ark Responses API image/sticker understanding |
+| Shared helpers | [app/main_helpers.py](app/main_helpers.py) | URL parsing, reply metadata, RAG query building |
+
+## Implementation Details
+
+### Startup And Runtime Configuration
+
+Startup begins in [main.py](main.py). The first important step is calling [app/runtime_config.py](app/runtime_config.py) before importing modules that read environment variables at import time. Runtime values are loaded with first-value-wins semantics: an existing process environment value is kept, then `config/runtime.env` is loaded, then `config/runtime.local.env`, then built-in defaults are applied.
+
+The LLM provider is configured once through [app/ai_model.py](app/ai_model.py). `LLM_PROVIDER` selects `ark`, `azure`, or `ollama`. Ark uses one external endpoint, `ARK_API_ENDPOINT`; runtime helpers derive both `/chat/completions` and `/responses` URLs from that value so text and vision stay on the same base endpoint.
+
+Before polling starts, the bot:
+
+1. Verifies FastEmbed can load the configured embedding model.
+2. Initializes or migrates all SQLite tables.
+3. Checks embedding metadata in the database.
+4. Automatically reindexes old or drifted embeddings when the runtime embedding signature no longer matches stored rows.
+5. Registers Telegram command handlers, message handlers, and the global error handler.
+
+### Telegram Handler Layout
+
+[main.py](main.py) owns the Telegram orchestration layer. It registers command handlers first, then document/text/photo/sticker handlers:
+
+- `/start` returns a short capability hint.
+- `/md2jpg` and `/text2jpg` share the same command parser and rendering path.
+- `/med2jpg` calls the prescription generator and renderer.
+- `/crypto` replies with price and APR data from [app/cryto.py](app/cryto.py).
+- `Document.ALL` handles uploaded `.txt` and `.md` files.
+- text messages go through media-link detection first; group text without media links goes into the group reply pipeline.
+- photos and stickers are converted to textual context, then reuse the same group reply pipeline.
+- private memory admin commands are restricted by chat type and `TELEGRAM_ADMIN_USER_IDS`.
+
+The global error handler catches Telegram polling conflicts separately, which makes duplicate bot instances easier to diagnose.
+
+### Text And Markdown Rendering
+
+Text rendering is split into two concerns:
+
+- [app/text2md.py](app/text2md.py) turns plain text into Markdown through the configured LLM.
+- [app/md2jpg.py](app/md2jpg.py) converts Markdown to HTML and captures it as an image with Playwright.
+
+Commands use the `,,,content,,,` wrapper so the bot can distinguish command syntax from the payload. Uploaded `.md` files bypass text-to-Markdown conversion; uploaded `.txt` files are converted first. Temporary output files are written under `output/` and cleaned up after sending or on errors.
+
+### Media Download Flow
+
+Text messages are inspected for supported media URLs by helpers in [app/main_helpers.py](app/main_helpers.py). YouTube and Bilibili links are handled by [app/youtube_dl.py](app/youtube_dl.py), which uses `yt-dlp`, picks a Telegram-friendly MP4 format, and calls ffmpeg compression when the file is too large.
+
+Twitter/X links are handled by [app/twitter_downloader.py](app/twitter_downloader.py). The extractor supports direct tweet parsing plus fallback services. It can return photos, videos, GIFs, or text-only content. Because the extraction stack uses synchronous network and parsing work, [main.py](main.py) runs it through `asyncio.to_thread()` so the async Telegram event loop is not blocked.
+
+After media is sent, status messages and original link messages are deleted best-effort. Cleanup failures are logged but do not break the reply flow.
+
+### Group Reply Pipeline
+
+The core group reply path is `_handle_group_ai_reply_pipeline()` in [main.py](main.py). Text messages, photo summaries, and sticker descriptions all flow through this function.
+
+The pipeline does the following:
+
+1. Builds stable sender identity using the Telegram numeric user ID when available.
+2. Extracts reply-chain metadata, including the parent Telegram message ID and parent display name.
+3. Reads cached personal memory via `get_personal_memory_context()` without waiting for a refresh.
+4. Schedules background personal memory refresh and candidate extraction.
+5. Stores the user message in SQLite and returns the database message ID for evidence tracking.
+6. Detects direct triggers: reply-to-bot, `@BotUsername`, `mioo`, or `小小宫`.
+7. For ambient messages, asks [app/reply2message.py](app/reply2message.py) whether a reply is worthwhile.
+8. Builds a richer RAG query from the current message, sender display, reply context, image summary, and sticker summary.
+9. Fetches recent messages and related historical messages from [app/database.py](app/database.py).
+10. Calls `generate_group_reply()` and stores the bot reply back into `messages`.
+
+This design keeps reply latency low: expensive memory refreshes, candidate extraction, and sync media extraction are moved out of the main async path where possible.
+
+The prompt layout is also shaped for provider-side KV or prompt-cache reuse. Stable instructions stay in the system prompt. The user prompt orders context from more reusable to more volatile: earlier history, durable personal memory, RAG results, message-specific reply/media context, direct-address flags, runtime state, and finally the newest message. This keeps the longest practical prefix stable across adjacent requests while preserving the newest message at the end where the model should focus.
+
+### SQLite Storage Model
+
+[app/database.py](app/database.py) initializes and migrates the local SQLite database. The main tables are:
+
+| Table | Purpose |
+| --- | --- |
+| `messages` | Chat messages, Telegram message IDs, reply-chain metadata, stable user keys |
+| `message_embeddings` | One embedding row per message, including model/backend/signature metadata |
+| `sticker_descriptions` | Cached natural-language sticker descriptions |
+| `user_memories` | Per-user compact memory summary |
+| `user_memory_facts` | Active/archived structured long-term facts with confidence and evidence IDs |
+| `user_memory_candidates` | Pending/accepted/rejected memory candidates extracted from messages |
+
+`add_message()` commits the message row before running embedding generation. That keeps slow embedding work from holding a SQLite write lock. Embedding insertion is best-effort: if embedding fails, the message still remains available for recent context and future memory refreshes.
+
+### RAG Retrieval
+
+RAG uses a hybrid retrieval strategy:
+
+- recent context comes from chronological `messages` rows in the same chat;
+- vector search uses FastEmbed vectors stored in `message_embeddings`;
+- keyword search scans recent historical messages for lexical overlap;
+- vector and keyword results are merged, deduplicated, and trimmed by context budgets.
+
+The RAG query is not just the raw user message. [app/main_helpers.py](app/main_helpers.py) extracts keywords and augments the query with relevant message-specific context, including reply targets, image text, sticker descriptions, and sender display. This makes retrieval more likely to find the conversation thread the user is actually referring to.
+
+The `miobot-rag` CLI exposes health and reindex commands. Health checks compare stored embedding signatures against the current runtime embedding signature; reindex rebuilds embeddings globally or for one chat.
+
+### Personal Memory System
+
+[app/user_memory.py](app/user_memory.py) manages long-term user memory. It intentionally separates memory into three layers:
+
+1. `user_memory_candidates`: lightweight pending facts extracted from high-signal user messages.
+2. `user_memory_facts`: durable structured facts used as the primary source of truth.
+3. `user_memories.memory_text`: a compact summary used directly in prompts.
+
+Candidate extraction is rule-based and runs in the background after a message is stored. Messages containing signals like `remember`, `from now on`, `我喜欢`, `以后`, `项目`, or `目标` can produce candidates. Explicit future preference language creates `fast` candidates; weaker durable signals create `slow` candidates.
+
+Memory refresh consolidates pending candidates, existing facts, and historical messages through the configured LLM. The expected JSON output contains:
+
+```json
+{
+  "memory_text": "short durable summary lines",
+  "facts": [
+    {
+      "type": "preference",
+      "text": "Prefers concise implementation plans",
+      "confidence": 0.84,
+      "evidence_message_ids": [123]
+    }
+  ],
+  "archive_fact_ids": [12]
+}
+```
+
+`archive_fact_ids` lets the model deactivate stale or contradictory facts instead of keeping conflicting memories active. Empty memories bootstrap from all previous messages for that user. Manual `/memory_refresh` forces regeneration from history.
+
+### Memory Admin Tools
+
+Private admin commands are implemented in [main.py](main.py). Access control checks both chat type and the configured admin list. The list accepts Telegram numeric IDs and `@usernames`.
+
+Admin commands cover three kinds of operations:
+
+- inspection: list users, view one user's memory, search memory text and facts, list pending candidates;
+- regeneration: force a full memory refresh from history;
+- manual curation: replace summary text, accept/reject candidates, edit active facts, archive active facts.
+
+This gives the automatic memory system a review path, so generated memory can be corrected without editing the database by hand.
+
+### Image And Sticker Understanding
+
+[app/image2text.py](app/image2text.py) sends image payloads to Ark Responses API. File reads and base64 encoding are offloaded with `asyncio.to_thread()`. The response parser supports both `output_text` and nested Responses API output blocks.
+
+Stickers use the same image understanding path when a visual file or thumbnail is available. Animated or video stickers fall back to their thumbnail if possible. If vision fails, the bot stores a simple fallback description based on sticker metadata, such as emoji, set name, or sticker type.
+
+### Async And Reliability Choices
+
+The bot is built on async `python-telegram-bot`, but not every dependency is async. The implementation avoids blocking the reply flow by:
+
+- using `asyncio.to_thread()` for synchronous Twitter extraction and image file reads;
+- committing SQLite messages before embedding work starts;
+- tracking fallback background tasks when no Telegram `Application.create_task()` is available;
+- treating cleanup operations as best-effort;
+- keeping personal memory refresh out of the immediate reply path.
+
+### Test Coverage
+
+Tests live under [test](test). The non-live suite covers provider configuration, rendering logic, media extraction helpers, database migrations, RAG retrieval, group reply flow, image/sticker handling, memory refresh, memory candidates, and admin commands.
+
+Live tests are intentionally separate because they need network access, real credentials, or external services:
+
+```bash
+uv run pytest test --ignore=test/test_llm_live.py --ignore=test/test_video_download_live.py
+```
+
+## Configuration
+
+Runtime config is loaded from:
+
+1. Existing process environment variables.
+2. `config/runtime.env`.
+3. `config/runtime.local.env`.
+4. Built-in defaults from [app/runtime_config.py](app/runtime_config.py).
+
+Existing values win. For local secrets, prefer `config/runtime.local.env` and avoid duplicating the same key in multiple files.
+
+Start from [config/runtime.env.template](config/runtime.env.template):
+
+```dotenv
+# Telegram
+TELEGRAM_BOT_USERNAME=MioooooooooBot
+TELEGRAM_BOT_KEY=
+TELEGRAM_ADMIN_USER_IDS=
+
+# Provider selection: ark | azure | ollama
+LLM_PROVIDER=ark
+LLM_ENABLE_THINKING=0
+
+# Azure OpenAI
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_API_VERSION=2024-04-01-preview
+AZURE_OPENAI_DEPLOYMENT_NAME=gpt-5-mini
+
+# Ark text and vision
+ARK_API_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3/chat/completions
+ARK_API_KEY=
+ARK_MODEL=doubao-seed-1-8-251228
+ARK_VISION_MODEL=doubao-seed-1-6-251015
+
+# Ollama
+OLLAMA_ENDPOINT=http://100.69.97.8:11434
+OLLAMA_MODEL=gpt-oss:20b
+
+# Database and retrieval
+DB_FILE=data/message_history.db
+MESSAGE_REVIEW_BACK=80
+RAG_TOP_K=12
+EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+
+# Personal memory
+MEMORY_CANDIDATE_EXTRACTION_ENABLED=1
+MEMORY_CANDIDATE_AUTO_REFRESH_COUNT=3
+```
+
+Ark now uses a single endpoint variable:
+
+- Configure only `ARK_API_ENDPOINT`.
+- Text completions use the derived `/chat/completions` endpoint.
+- Vision and sticker understanding use the derived `/responses` endpoint.
+
+Optional Twitter/X cookie configuration:
+
+- `TWITTER_COOKIE`
+- `TWITTER_COOKIE_FILE`
+- Default cookie file: `config/x.com_cookies.txt`
+
+## Admin Commands
+
+Set `TELEGRAM_ADMIN_USER_IDS` to comma- or space-separated Telegram numeric user IDs or `@usernames`. Admin commands only work in private chat with the bot.
+
+| Command | Purpose |
+| --- | --- |
+| `/memory_help` | Show memory admin commands |
+| `/memories` | List users with message history, summaries, or facts |
+| `/memory <user>` | View one user's summary and structured facts |
+| `/memory_search <keyword>` | Search memory summaries and facts |
+| `/memory_refresh <user>` | Regenerate one user's memory from history |
+| `/memory_set <user> <text>` | Replace one user's summary memory |
+| `/memory_candidates [user]` | List pending memory candidates |
+| `/memory_accept <candidate_id>` | Accept a candidate into structured facts |
+| `/memory_reject <candidate_id>` | Reject a candidate |
+| `/memory_fact_set <fact_id> <text>` | Edit an active structured fact |
+| `/memory_fact_delete <fact_id>` | Archive an active structured fact |
+
+`<user>` accepts either a numeric Telegram user ID or `tg_user:<id>`.
+
+## Installation
+
+### Local Runtime
+
+1. Install Python 3.11 or newer.
+2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
+3. Install project dependencies:
+
+```bash
+uv sync
+```
+
+4. Install Playwright Chromium:
+
+```bash
+uv run playwright install chromium
+```
+
+5. Install common system dependencies:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg fonts-noto-cjk
+```
+
+Optional dependencies:
+
+```bash
+# Azure provider
+uv pip install openai
+
+# /med2jpg support
+sudo apt-get install -y texlive-xetex texlive-latex-extra texlive-lang-chinese
+uv pip install pypdfium2
+```
+
+## Running
+
+```bash
+uv run miobot
+```
+
+Equivalent:
+
+```bash
+uv run python main.py
+```
+
+On startup, MioBot initializes SQLite, validates the embedding backend, checks embedding metadata, and automatically reindexes when the stored embedding signature is stale.
+
+## RAG Maintenance
+
+```bash
+uv run miobot-rag health
+uv run miobot-rag reindex
+uv run miobot-rag reindex --chat-id 123456
+```
+
+Use these commands to inspect embedding health or rebuild embeddings globally or per chat.
+
+## Docker
+
+Build:
+
+```bash
+docker build -t miobot:latest .
+```
+
+Run:
+
+```bash
+docker run --rm -it \
+  --name miobot \
+  -v "$PWD/config/runtime.local.env:/app/config/runtime.local.env:ro" \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/output:/app/output" \
+  miobot:latest
+```
+
+The Dockerfile includes core Python dependencies, ffmpeg, Noto CJK fonts, and Playwright Chromium runtime dependencies. Azure and `/med2jpg` optional dependencies may require extending the image.
+
+## Testing
+
+Run non-live tests:
+
+```bash
+uv run pytest test --ignore=test/test_llm_live.py --ignore=test/test_video_download_live.py
+```
+
+Live tests require real credentials or network access and are intentionally excluded from the default command above.
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+| --- | --- | --- |
+| Bot exits during startup | FastEmbed model/dependency issue | Check dependencies and allow the first model download |
+| Ambient group messages rarely get replies | Activation probe decided not to reply | Reply to the bot or mention `mioo`, `小小宫`, or `@BotUsername` |
+| Photos or stickers do not affect replies | Ark vision config missing | Set `ARK_API_KEY`, `ARK_API_ENDPOINT`, and `ARK_VISION_MODEL` |
+| Twitter/X extraction fails | Protected content, login required, or rate limits | Provide `config/x.com_cookies.txt` or cookie env vars |
+| `/med2jpg` fails | TeX/PDF dependencies missing | Install TeX Live Chinese support and `pypdfium2` |
+| Azure provider fails | Missing `openai` package or Azure settings | Install `openai` and complete Azure env vars |
+
+## License
+
+This project is licensed under the GNU GPLv3. See [LICENSE](LICENSE) for details.
+
+---
+
+# 中文说明
+
+MioBot 是一个异步 Telegram 机器人，用于文本渲染、媒体下载，以及带有 RAG 上下文和用户长期记忆的群聊回复。
+
+## 功能概览
+
+- Markdown、纯文本、`.txt`、`.md` 转图片。
+- 自动处理 YouTube、Bilibili、Twitter/X 链接。
+- 基于最近聊天、混合 RAG、个人记忆的群聊回复。
+- 使用 Ark 视觉模型理解图片和贴纸。
+- 使用 SQLite 保存消息、embedding、贴纸缓存、记忆摘要、结构化 facts、记忆候选。
+- 管理员可在 Telegram 私聊里查看、刷新、编辑用户记忆。
+
+## 主要能力
+
+### 文本转图片
+
+- `/md2jpg` 直接渲染 Markdown。
+- `/text2jpg` 先调用当前 LLM 把纯文本整理成 Markdown，再渲染。
+- 上传 `.txt` 或 `.md` 文件也会走同一套渲染流程。
 
 示例：
 
@@ -26,235 +470,282 @@ Some *markdown* here,,,
 /text2jpg ,,,Some plain text here,,,
 ```
 
-对应模块：
+### 媒体下载
 
-- [`app.text2md.plain_text_to_markdown`](app/text2md.py)
-- [`app.md2jpg.md_to_image`](app/md2jpg.py)
+- 文本消息中出现 YouTube、Bilibili、Twitter/X 链接时自动触发。
+- YouTube / Bilibili 使用 [app/youtube_dl.py](app/youtube_dl.py)，优先下载不高于 720p 的 MP4，超过 Telegram 限制时尝试压缩。
+- Twitter/X 使用 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图片、视频、GIF 和纯文本兜底。
+- 媒体成功发送后会删除原始链接消息。
 
-### 2. Media Download
+### 群聊回复
 
-- 文本消息里出现 YouTube、Bilibili、Twitter/X 链接时会自动触发下载流程，不需要额外命令。
-- YouTube / Bilibili 走 [`app.youtube_dl`](app/youtube_dl.py)，优先下载不高于 720p 的 MP4，并在超过 Telegram 50MB 限制时尝试用 ffmpeg 压缩。
-- Twitter/X 走 [`app.twitter_downloader`](app/twitter_downloader.py)，支持图片、视频、GIF，以及只回文字内容的兜底路径。
-- 媒体成功发送后，机器人会删除原始链接消息。
+群聊文字、图片、贴纸最终都会进入 [main.py](main.py) 的统一回复流水线：
 
-### 3. Contextual Group Replies
+1. 写入消息和回复链元数据。
+2. 读取缓存的个人记忆，并后台维护记忆。
+3. 检测直接触发：回复机器人、提到 `@BotUsername`、`mioo` 或 `小小宫`。
+4. 普通环境消息先经过 activation probe 判断要不要回复。
+5. 组合最近消息、RAG 检索、个人记忆和运行时状态。
+6. 生成回复并把机器人回复写回数据库。
 
-群聊回复的当前实现已经不是旧版 README 里的“随机 1/5 触发”。现在的流程是：
+### 多模态上下文
 
-- 每条进入回复流水线的群消息先写入 SQLite。
-- 直接触发条件包括：回复机器人、提到 `@BotUsername`、提到 `mioo`、提到 `小小宫`。
-- 直接触发时跳过激活探测，直接进入 RAG 检索和回复生成。
-- 普通环境消息会先经过 [`app.reply2message.should_activate_reply`](app/reply2message.py) 做一次“要不要回复”的判断。
-- 真正生成回复时使用：
-  - 最近聊天窗口，默认 `MESSAGE_REVIEW_BACK=80`
-  - 同 chat 全量 embedding 索引上的相似消息检索，默认 `RAG_TOP_K=12`
-  - 用户长期记忆摘要
-  - 回复链元数据，例如“当前消息回复了谁、回复了什么”
+- 图片先由 [app/image2text.py](app/image2text.py) 生成文字/视觉摘要。
+- 贴纸首次出现时生成一句描述并写入 `sticker_descriptions`，之后复用缓存。
+- Ark 现在只需要一个 `ARK_API_ENDPOINT`；图片/贴纸所需的 `/responses` endpoint 会自动推导。
 
-相关模块：
+### 个人记忆
 
-- [`main.py`](main.py)
-- [`app.reply2message`](app/reply2message.py)
-- [`app.database`](app/database.py)
-- [`app.user_memory`](app/user_memory.py)
-- [`app.rag_embeddings`](app/rag_embeddings.py)
+个人记忆分为三层：
 
-### 4. Multimodal Group Context
+- `user_memories`：用于 prompt 注入的压缩摘要。
+- `user_memory_facts`：结构化长期 facts，带类型、置信度、证据消息和 active/archive 状态。
+- `user_memory_candidates`：从高信号消息里后台抽取的 pending 候选。
 
-- 群聊图片会先走 [`app.image2text.image_to_text`](app/image2text.py)，提取文字和视觉摘要后再进入同一条群聊回复流水线。
-- 群聊贴纸会先尝试生成一句自然语言描述；首次见到的贴纸会写入 `sticker_descriptions` 缓存，后续直接复用。
-- 图片和贴纸理解当前使用 Ark Responses API，不走 `LLM_PROVIDER` 抽象层。
+明确“记住/以后/remember/from now on”的内容会进入 fast candidate；普通偏好、身份、项目、目标等会进入 slow candidate。fast candidate 或累计足够多的 slow candidate 会触发合并进 facts。模型也可以返回 `archive_fact_ids` 来归档冲突或过期事实。
 
-这意味着：
+## 实现细节
 
-- 文字生成可以选 `ark` / `azure` / `ollama`
-- 但如果你想让“群聊图片/贴纸理解”生效，仍然需要配置 `ARK_API_KEY`
+### 启动和运行时配置
 
-### 5. `/med2jpg`
+启动入口在 [main.py](main.py)。程序会先调用 [app/runtime_config.py](app/runtime_config.py) 加载运行时配置，再导入依赖环境变量的模块。配置采用 first-value-wins：已有进程环境变量优先，然后加载 `config/runtime.env`、`config/runtime.local.env`，最后补内置默认值。
 
-- `/med2jpg` 会先把自然语言需求转换成结构化处方 JSON，再生成 PDF，最后转成 JPG。
-- 这一功能依赖 LaTeX 和 `pypdfium2`，不属于最小运行时的一部分。
+[app/ai_model.py](app/ai_model.py) 负责统一配置文本模型 provider。`LLM_PROVIDER` 可选 `ark`、`azure`、`ollama`。Ark 只暴露一个外部配置 `ARK_API_ENDPOINT`；运行时会自动推导 `/chat/completions` 和 `/responses`，避免文本和视觉 endpoint 分开维护。
 
-相关模块：
+开始 polling 前，启动流程会完成这些工作：
 
-- [`app.med.generate_med`](app/med.py)
-- [`app.med.generate_jpg_from_med_json`](app/med.py)
+1. 检查 FastEmbed 和 embedding 模型是否可用。
+2. 初始化或迁移 SQLite 表结构。
+3. 检查数据库里已有 embedding 的模型签名。
+4. 如果 embedding 签名漂移，自动 reindex。
+5. 注册 Telegram handlers 和全局错误处理器。
 
-### 6. `/crypto`
+### Telegram Handler 结构
 
-- `/crypto` 会拉取 Coinbase 价格信息，以及 Allez SOL / Allez USDC APR 信息并直接回复。
-- 相关实现位于 [`app.cryto`](app/cryto.py)。
+[main.py](main.py) 是 Telegram 编排层。它注册命令、文件、文本、图片、贴纸和管理员私聊 handler：
 
-## Architecture Overview
+- `/start` 返回简短能力说明。
+- `/md2jpg` 和 `/text2jpg` 共用命令解析和渲染路径。
+- `/med2jpg` 调用处方 JSON 生成和图片渲染。
+- `/crypto` 调用 [app/cryto.py](app/cryto.py) 返回价格和 APR 信息。
+- 上传 `.txt` / `.md` 文件会进入文档渲染流程。
+- 文本消息先检测媒体链接；没有媒体链接的群聊文本进入群聊回复流程。
+- 群聊图片和贴纸会先变成文字上下文，再进入同一条回复流程。
+- 记忆管理命令只允许配置过的管理员在私聊中使用。
 
-| Concern | Main Files | Notes |
-| --- | --- | --- |
-| Entrypoint / handler wiring | [main.py](main.py) | 启动、注册 Telegram handlers、启动前健康检查 |
-| Runtime config | [app/runtime_config.py](app/runtime_config.py) | 读取 `config/runtime.env`、`config/runtime.local.env` 和默认值 |
-| LLM provider abstraction | [app/ai_model.py](app/ai_model.py) | 统一封装 Ark / Azure / Ollama |
-| Markdown rendering | [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py) | 文本整理、HTML 渲染、Playwright 截图 |
-| Media download | [app/youtube_dl.py](app/youtube_dl.py), [app/twitter_downloader.py](app/twitter_downloader.py) | 下载、压缩、标题和 caption 处理 |
-| Group reply logic | [app/reply2message.py](app/reply2message.py), [main.py](main.py) | 激活探测、回复生成、direct trigger |
-| SQLite + RAG | [app/database.py](app/database.py), [app/rag_embeddings.py](app/rag_embeddings.py) | 消息存储、embedding、向量检索、健康检查与重建 |
-| Personal memory | [app/user_memory.py](app/user_memory.py) | 每个 Telegram 用户按 UTC 天刷新长期记忆 |
-| Vision / sticker understanding | [app/image2text.py](app/image2text.py) | 图片 OCR/摘要、贴纸一句话描述 |
-| Shared helpers | [app/main_helpers.py](app/main_helpers.py) | URL regex、触发判断、reply relation 构造 |
-| Prescription rendering | [app/med.py](app/med.py) | 处方 JSON -> PDF -> JPG |
+全局错误处理器会单独识别 Telegram polling conflict，方便排查重复运行 bot 的情况。
 
-## Runtime Flow
+### 文本和 Markdown 渲染
 
-### Startup
+文本渲染拆成两层：
 
-`main.py` 的启动顺序大致如下：
+- [app/text2md.py](app/text2md.py)：通过当前 LLM 把纯文本整理成 Markdown。
+- [app/md2jpg.py](app/md2jpg.py)：把 Markdown 转 HTML，再用 Playwright 截图成图片。
 
-1. 通过 [`app.runtime_config.bootstrap_runtime_environment`](app/runtime_config.py) 加载运行时配置。
-2. 通过 [`app.ai_model.configure_llm`](app/ai_model.py) 选择文本 LLM provider。
-3. 调用 [`app.rag_embeddings.ensure_fastembed_ready`](app/rag_embeddings.py) 做 embedding fail-fast 检查。
-4. 初始化 SQLite 表结构。
-5. 执行 embedding 健康检查；如果检测到旧 embedding 或签名漂移，会自动 reindex。
-6. 注册 Telegram command / message handlers 并开始 polling。
+命令正文用 `,,,content,,,` 包起来，避免命令参数和正文混在一起。上传 `.md` 文件会直接渲染；上传 `.txt` 文件会先转 Markdown。临时文件写入 `output/`，发送完成或出错后都会清理。
 
-### Group Reply Pipeline
+### 媒体下载流程
 
-群聊文字、图片、贴纸最终都会尽量汇合到同一个 `_handle_group_ai_reply_pipeline`：
+[app/main_helpers.py](app/main_helpers.py) 负责识别文本里的媒体链接。YouTube 和 Bilibili 走 [app/youtube_dl.py](app/youtube_dl.py)，使用 `yt-dlp` 下载 Telegram 友好的 MP4，并在文件过大时尝试 ffmpeg 压缩。
 
-1. 把消息和回复链元数据写入 `messages`
-2. 刷新或读取该用户的长期记忆
-3. 判断是否是 direct trigger；不是的话先做 activation probe
-4. 组装 prompt context：最近聊天窗口 + RAG 检索结果 + 用户记忆 + 运行时状态
-5. 生成回复并把机器人的回复再次写回 `messages`
+Twitter/X 走 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图片、视频、GIF 和纯文本兜底。因为这部分有同步网络和解析逻辑，[main.py](main.py) 使用 `asyncio.to_thread()` 执行，避免阻塞 async Telegram event loop。
 
-### Storage Model
+媒体发送成功后，状态消息和原始链接消息会 best-effort 删除；删除失败只记录日志，不影响主流程。
 
-当前数据库包含至少以下几类数据：
+### 群聊回复流水线
 
-- `messages`: 原始群聊消息与 reply-chain 元数据
-- `message_embeddings`: 每条消息的 embedding、模型签名、后端信息
-- `sticker_descriptions`: 贴纸描述缓存
-- `user_memories`: 用户长期记忆摘要
+核心逻辑是 [main.py](main.py) 里的 `_handle_group_ai_reply_pipeline()`。群聊文本、图片摘要、贴纸描述都会进入这里。
 
-注意：当前实现不会把历史消息裁剪到“最近 100 条”。数据库会持续积累消息；真正送给模型的“最近窗口”大小由 `MESSAGE_REVIEW_BACK` 控制，默认值是 80。
+流水线步骤：
 
-## Configuration
+1. 根据 Telegram numeric user ID 构造稳定用户 key。
+2. 提取回复链元数据，包括父消息 Telegram ID 和父消息发送者。
+3. 读取缓存个人记忆，不在主回复路径里等待刷新。
+4. 后台调度个人记忆刷新和候选记忆抽取。
+5. 把用户消息写入 SQLite，并拿到 DB message ID 作为 evidence。
+6. 判断 direct trigger：回复 bot、提到 `@BotUsername`、`mioo`、`小小宫`。
+7. 普通环境消息先调用 [app/reply2message.py](app/reply2message.py) 判断是否值得回复。
+8. 用当前消息、发送者、回复关系、图片摘要、贴纸描述构造更丰富的 RAG query。
+9. 从 [app/database.py](app/database.py) 读取最近上下文和相关历史消息。
+10. 调用 `generate_group_reply()` 生成回复，并把 bot 回复写回 `messages`。
 
-### Persona / Background Knowledge
+这条设计的重点是保持回复低延迟：记忆刷新、候选抽取、同步媒体解析都尽量放到主回复路径之外。
 
-编辑 [`config/info.txt`](config/info.txt)，每行写一个稳定事实或设定，群聊回复时会被注入系统提示里。
+Prompt 顺序也专门照顾 provider 侧 KV cache / prompt cache。稳定规则放在 system prompt；user prompt 按“更稳定到更动态”的顺序排列：早期聊天历史、长期个人记忆、RAG 结果、当前消息专属上下文、direct-address flags、runtime state，最后才是最新消息。这样相邻请求能复用尽可能长的前缀，同时让模型最后看到当前要回复的消息。
 
-### Runtime Environment Files
+### SQLite 存储模型
 
-运行时配置由 [`app/runtime_config.py`](app/runtime_config.py) 加载：
+[app/database.py](app/database.py) 初始化和迁移 SQLite。主要表包括：
 
-- `config/runtime.env`
-- `config/runtime.local.env`
-- 内置默认值
+| 表 | 用途 |
+| --- | --- |
+| `messages` | 群聊消息、Telegram message ID、回复链元数据、稳定用户 key |
+| `message_embeddings` | 每条消息的 embedding，以及模型、backend、signature |
+| `sticker_descriptions` | 贴纸自然语言描述缓存 |
+| `user_memories` | 用户压缩记忆摘要 |
+| `user_memory_facts` | 结构化长期 facts，带置信度、证据和 active/archive 状态 |
+| `user_memory_candidates` | 从消息中抽取的 pending/accepted/rejected 记忆候选 |
 
-当前实现使用“first value wins”语义：
+`add_message()` 会先提交消息行，再生成 embedding。这样慢 embedding 不会持有 SQLite 写锁。embedding 写入是 best-effort；即使失败，消息仍然能用于最近上下文和未来记忆刷新。
 
-- 进程环境变量如果已经存在，不会被文件覆盖
-- 在文件里，较早加载到的 key 不会被较晚的文件覆盖
+### RAG 检索
 
-因此更安全的实践是：
+RAG 是 hybrid retrieval：
 
-- 把一个 key 只放在一个地方
-- 如果使用 `runtime.local.env`，尽量不要在 `runtime.env` 里重复同名 key
+- 最近上下文从同一 chat 的 `messages` 按时间读取。
+- 向量检索使用 FastEmbed 和 `message_embeddings`。
+- keyword 检索扫描历史消息做词面重合。
+- 两路结果合并、去重，再按上下文预算裁剪。
 
-### Key Environment Variables
+RAG query 不只是当前文本。[app/main_helpers.py](app/main_helpers.py) 会加入回复目标、图片文字、贴纸描述、发送者显示名等上下文，让检索更容易命中当前对话真正指向的历史内容。
 
-最常用的变量如下，完整模板见 [`config/runtime.env.template`](config/runtime.env.template)：
+`miobot-rag` CLI 提供 `health` 和 `reindex`。`health` 用于检查 embedding 签名，`reindex` 用于全库或单 chat 重建 embedding。
+
+### 个人记忆系统
+
+[app/user_memory.py](app/user_memory.py) 维护长期用户记忆，分三层：
+
+1. `user_memory_candidates`：从高信号消息中后台抽取的候选事实。
+2. `user_memory_facts`：结构化、可归档的长期事实，是主要真实来源。
+3. `user_memories.memory_text`：注入 prompt 的压缩摘要。
+
+候选抽取是轻量规则式的。包含 `remember`、`from now on`、`我喜欢`、`以后`、`项目`、`目标` 等信号的消息可能生成 candidate。明确未来偏好会进入 `fast`，较弱但可能长期有用的信息进入 `slow`。
+
+记忆刷新会把 pending candidates、已有 facts 和历史消息交给 LLM 合并。期望 JSON 结构是：
+
+```json
+{
+  "memory_text": "short durable summary lines",
+  "facts": [
+    {
+      "type": "preference",
+      "text": "Prefers concise implementation plans",
+      "confidence": 0.84,
+      "evidence_message_ids": [123]
+    }
+  ],
+  "archive_fact_ids": [12]
+}
+```
+
+`archive_fact_ids` 用于停用冲突或过期 facts。空记忆会从该用户全部历史消息 bootstrap；管理员 `/memory_refresh` 会强制从历史重新生成。
+
+### 记忆管理员工具
+
+管理员工具在 [main.py](main.py) 中实现。权限检查同时校验私聊和 `TELEGRAM_ADMIN_USER_IDS`，支持 Telegram 数字 ID 和 `@username`。
+
+管理员能力分三类：
+
+- 查看：列出用户、查看单人记忆、搜索 summary/facts、查看 pending candidates。
+- 重新生成：从历史消息强制刷新某个用户记忆。
+- 人工修正：替换 summary、接受/拒绝 candidate、编辑 active fact、归档 active fact。
+
+这样自动记忆不是黑箱；管理员可以在 Telegram 内直接校正，不需要手动改数据库。
+
+### 图片和贴纸理解
+
+[app/image2text.py](app/image2text.py) 把图片发给 Ark Responses API。文件读取和 base64 编码通过 `asyncio.to_thread()` offload。响应解析支持 `output_text`，也支持 Responses API 的嵌套 output block。
+
+贴纸复用同一套视觉理解。animated/video sticker 会优先使用缩略图；如果视觉理解失败，会根据 emoji、set name、sticker 类型生成 fallback 描述并缓存。
+
+### Async 和可靠性设计
+
+虽然项目基于 async `python-telegram-bot`，但部分依赖不是 async。当前实现通过这些方式避免阻塞：
+
+- Twitter/X 同步提取放进 `asyncio.to_thread()`。
+- 图片文件读取和 base64 编码放进 `asyncio.to_thread()`。
+- SQLite 消息先提交，再跑 embedding。
+- 没有 Telegram `Application.create_task()` 时，会跟踪 fallback background task。
+- 清理失败只记录日志，不中断主流程。
+- 个人记忆刷新不放在主回复路径里等待。
+
+### 测试覆盖
+
+测试位于 [test](test)。非 live 测试覆盖 provider 配置、渲染逻辑、媒体提取 helper、数据库迁移、RAG 检索、群聊回复、图片/贴纸理解、记忆刷新、记忆候选和管理员命令。
+
+live 测试需要真实凭据、网络或外部服务，因此默认命令会排除：
+
+```bash
+uv run pytest test --ignore=test/test_llm_live.py --ignore=test/test_video_download_live.py
+```
+
+## 配置
+
+运行时配置来源顺序：
+
+1. 进程环境变量。
+2. `config/runtime.env`。
+3. `config/runtime.local.env`。
+4. [app/runtime_config.py](app/runtime_config.py) 中的默认值。
+
+已有值优先。建议把本地密钥放在 `config/runtime.local.env`，并避免同一个 key 在多个文件里重复配置。
+
+常用配置如下，完整模板见 [config/runtime.env.template](config/runtime.env.template)：
 
 ```dotenv
 # Telegram
 TELEGRAM_BOT_USERNAME=MioooooooooBot
 TELEGRAM_BOT_KEY=
+TELEGRAM_ADMIN_USER_IDS=
 
-# Provider selection: ark | azure | ollama
+# Provider: ark | azure | ollama
 LLM_PROVIDER=ark
 LLM_ENABLE_THINKING=0
 
-# Azure text model
-AZURE_OPENAI_ENDPOINT=
-AZURE_OPENAI_API_KEY=
-AZURE_OPENAI_API_VERSION=2024-04-01-preview
-AZURE_OPENAI_DEPLOYMENT_NAME=gpt-5-mini
-
-# Ark text + vision
+# Ark text and vision
 ARK_API_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3/chat/completions
 ARK_API_KEY=
 ARK_MODEL=doubao-seed-1-8-251228
-ARK_RESPONSES_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3/responses
 ARK_VISION_MODEL=doubao-seed-1-6-251015
 
-# Ollama
-OLLAMA_ENDPOINT=http://100.69.97.8:11434
-OLLAMA_MODEL=gpt-oss:20b
-
-# Database / retrieval
+# Database and retrieval
 DB_FILE=data/message_history.db
 MESSAGE_REVIEW_BACK=80
 RAG_TOP_K=12
 EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```
 
-额外可选项：
+Ark endpoint 已统一：只配置 `ARK_API_ENDPOINT`。文本模型使用自动推导出的 `/chat/completions`，图片和贴纸使用自动推导出的 `/responses`。
 
-- `TWITTER_COOKIE` 或 `TWITTER_COOKIE_FILE`
-- 默认 cookie 文件位置是 `config/x.com_cookies.txt`
+## 管理员命令
 
-## Installation
+`TELEGRAM_ADMIN_USER_IDS` 支持 Telegram 数字用户 ID 或 `@username`，逗号或空格分隔。管理员命令只在私聊 bot 时生效。
 
-### Core Runtime
+| 命令 | 作用 |
+| --- | --- |
+| `/memory_help` | 查看记忆管理命令 |
+| `/memories` | 列出有消息历史、summary 或 facts 的用户 |
+| `/memory <user>` | 查看某个用户的 summary 和 facts |
+| `/memory_search <keyword>` | 搜索 summary 和 facts |
+| `/memory_refresh <user>` | 从历史消息重新生成某个用户的记忆 |
+| `/memory_set <user> <text>` | 替换某个用户的 summary 记忆 |
+| `/memory_candidates [user]` | 查看 pending 记忆候选 |
+| `/memory_accept <candidate_id>` | 接受候选并写入 facts |
+| `/memory_reject <candidate_id>` | 拒绝候选 |
+| `/memory_fact_set <fact_id> <text>` | 编辑 active fact |
+| `/memory_fact_delete <fact_id>` | 归档 active fact |
+
+`<user>` 可以是 Telegram 数字用户 ID，也可以是 `tg_user:<id>`。
+
+## 安装与运行
 
 1. 安装 Python 3.11+。
 2. 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
-3. 安装项目依赖：
+3. 安装依赖：
 
 ```bash
 uv sync
-```
-
-4. 安装 Playwright Chromium：
-
-```bash
 uv run playwright install chromium
 ```
 
-5. 安装系统依赖。
-
-Debian / Ubuntu 常见最小组合：
+常见系统依赖：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y ffmpeg fonts-noto-cjk
 ```
 
-### Optional Dependencies
-
-如果你需要以下功能，还要额外装依赖：
-
-- 使用 Azure provider:
-
-```bash
-uv pip install openai
-```
-
-- 使用 `/med2jpg`:
-
-```bash
-sudo apt-get install -y texlive-xetex texlive-latex-extra texlive-lang-chinese
-uv pip install pypdfium2
-```
-
-- 需要 Twitter/X 受保护内容、登录态内容或更稳定提取时：
-  - 导出浏览器 cookies 到 `config/x.com_cookies.txt`
-  - 或设置 `TWITTER_COOKIE` / `TWITTER_COOKIE_FILE`
-
-仓库里的 [`init.sh`](init.sh) 提供了一个偏 Debian/Ubuntu 的本地启动脚本，可作为参考。
-
-## Running
-
-推荐方式：
+启动：
 
 ```bash
 uv run miobot
@@ -266,15 +757,7 @@ uv run miobot
 uv run python main.py
 ```
 
-首次运行时会：
-
-- 初始化 `DB_FILE` 指向的 SQLite 文件，默认是 `data/message_history.db`
-- 检查 FastEmbed 是否可用
-- 检查 embedding 健康状态，并在需要时自动执行 reindex
-
-## RAG Maintenance CLI
-
-项目还暴露了一个维护脚本入口：
+## RAG 维护
 
 ```bash
 uv run miobot-rag health
@@ -282,22 +765,12 @@ uv run miobot-rag reindex
 uv run miobot-rag reindex --chat-id 123456
 ```
 
-用途：
-
-- 查看当前 embedding 签名、数据库里已有的 embedding profile，以及是否需要重建
-- 手动对整个库或单个 chat 重新生成 embedding
+用于查看 embedding 健康状态，或全量/按 chat 重建 embedding。
 
 ## Docker
 
-构建：
-
 ```bash
 docker build -t miobot:latest .
-```
-
-运行：
-
-```bash
 docker run --rm -it \
   --name miobot \
   -v "$PWD/config/runtime.local.env:/app/config/runtime.local.env:ro" \
@@ -306,51 +779,26 @@ docker run --rm -it \
   miobot:latest
 ```
 
-当前 Dockerfile 已包含：
+Dockerfile 已包含核心 Python 依赖、ffmpeg、Noto CJK 字体和 Playwright Chromium 运行依赖。Azure 和 `/med2jpg` 的额外依赖可能需要自行扩展镜像。
 
-- 项目核心 Python 依赖
-- ffmpeg
-- Noto CJK 字体
-- Playwright Chromium 运行时
+## 测试
 
-当前 Dockerfile 未包含：
+```bash
+uv run pytest test --ignore=test/test_llm_live.py --ignore=test/test_video_download_live.py
+```
 
-- `openai` Python 包，所以如果要在容器里使用 Azure provider，需要扩展镜像
-- `pypdfium2` 和 TeX Live，所以 `/med2jpg` 默认不可用，需要扩展镜像
+live 测试需要真实凭据或网络访问，默认不包含在上面的命令里。
 
-如果使用 `LLM_PROVIDER=ollama`，还需要确保容器能访问 `OLLAMA_ENDPOINT`。
+## 常见问题
 
-## Command Summary
-
-| Action | Trigger |
-| --- | --- |
-| Start | `/start` |
-| Markdown -> image | `/md2jpg ,,,...markdown...,,,` |
-| Plain text -> image | `/text2jpg ,,,...plain text...,,,` |
-| Prescription -> image | `/med2jpg ...` |
-| Crypto snapshot | `/crypto` |
-| File -> image | 上传 `.txt` 或 `.md` |
-| Media download | 直接发送 YouTube / Bilibili / Twitter/X 链接 |
-| Group reply on text | 群聊文本，满足 direct trigger 或 activation probe |
-| Group reply on photo | 群聊图片 |
-| Group reply on sticker | 群聊贴纸 |
-
-补充说明：
-
-- `/md2jpg` 和 `/text2jpg` 仍然要求正文用前后 `,,,` 包起来。
-- 纯文本私聊不会自动触发聊天回复；没有命令时，文本 handler 主要做“媒体链接检测”或“群聊回复”。
-
-## Troubleshooting
-
-| Symptom | Likely Cause | Fix |
+| 现象 | 可能原因 | 处理方式 |
 | --- | --- | --- |
-| Bot exits at startup with fastembed error | `fastembed` 模型或依赖不可用 | 确认当前环境已安装依赖，并允许首次模型下载 |
-| Ambient group messages rarely get a reply | 这是当前设计，不再是随机 1/5；需要 activation probe 判定为值得回复 | 直接回复机器人或提到 `mioo` / `小小宫` / `@BotUsername` |
-| Photos or stickers do not influence replies | 没有配置 Ark vision 相关变量 | 配置 `ARK_API_KEY`、`ARK_RESPONSES_ENDPOINT`、`ARK_VISION_MODEL` |
-| Twitter/X extraction fails on some posts | 受保护内容、需要登录态、或被站点限流 | 提供 `config/x.com_cookies.txt` 或设置 cookie 变量 |
-| `/med2jpg` fails with LaTeX or PDF errors | 缺少 `xelatex`、中文 LaTeX 支持或 `pypdfium2` | 安装 TeX Live 中文支持和 `pypdfium2` |
-| Azure provider fails | 当前环境缺少 `openai` 包或 Azure 配置不完整 | 安装 `openai`，并补齐 Azure 相关环境变量 |
+| 启动时 FastEmbed 报错 | 模型或依赖不可用 | 检查依赖，并允许首次模型下载 |
+| 群聊普通消息很少回复 | activation probe 判断不需要回复 | 直接回复 bot 或提到 `mioo` / `小小宫` / `@BotUsername` |
+| 图片或贴纸不影响回复 | Ark vision 配置不完整 | 配置 `ARK_API_KEY`、`ARK_API_ENDPOINT`、`ARK_VISION_MODEL` |
+| Twitter/X 提取失败 | 受保护内容、需要登录态或限流 | 提供 `config/x.com_cookies.txt` 或 cookie 环境变量 |
+| `/med2jpg` 失败 | 缺少 TeX/PDF 依赖 | 安装 TeX Live 中文支持和 `pypdfium2` |
 
 ## License
 
-This project is licensed under the GNU GPLv3. See [LICENSE](LICENSE) for details.
+本项目使用 GNU GPLv3。详见 [LICENSE](LICENSE)。

@@ -33,7 +33,7 @@ from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
-from app.runtime_config import get_runtime_bool, get_runtime_value
+from app.runtime_config import get_ark_chat_completions_endpoint, get_runtime_bool, get_runtime_value
 
 try:  # Optional dependency for Azure support
   from openai import AsyncAzureOpenAI
@@ -165,7 +165,7 @@ def _load_settings_from_env() -> LLMSettings:
   settings.azure_api_version = get_runtime_value("AZURE_OPENAI_API_VERSION")
   settings.azure_deployment = get_runtime_value("AZURE_OPENAI_DEPLOYMENT") or get_runtime_value("AZURE_OPENAI_DEPLOYMENT_NAME")
 
-  settings.ark_endpoint = get_runtime_value("ARK_API_ENDPOINT") or settings.ark_endpoint
+  settings.ark_endpoint = get_ark_chat_completions_endpoint() or settings.ark_endpoint
   settings.ark_api_key = get_runtime_value("ARK_API_KEY") or None
   settings.ark_model = get_runtime_value("ARK_MODEL") or None
 

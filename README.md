@@ -316,6 +316,31 @@ Optional Twitter/X cookie configuration:
 
 Set `TELEGRAM_ADMIN_USER_IDS` to comma- or space-separated Telegram numeric user IDs or `@usernames`. Admin commands only work in private chat with the bot.
 
+### Managing Personal Memory In Private Chat
+
+1. Add yourself to `TELEGRAM_ADMIN_USER_IDS`, for example `TELEGRAM_ADMIN_USER_IDS=@Natsume_Mio` or `TELEGRAM_ADMIN_USER_IDS=123456789`.
+2. Restart the bot so the runtime config is reloaded.
+3. Open a private Telegram chat with the bot. These commands are rejected in groups.
+4. Send `/memory_help` to see the available memory commands.
+5. Send `/memories` to list users that have message history, summary memory, or structured facts.
+6. Copy a user key such as `tg_user:123456789`, then inspect it with `/memory tg_user:123456789`.
+7. Use `/memory_refresh tg_user:123456789` to rebuild that user's memory from history when the summary looks stale or empty.
+8. Use `/memory_set tg_user:123456789 <new summary>` to manually replace the compact summary.
+9. Use `/memory_candidates tg_user:123456789` to review pending extracted facts, then `/memory_accept <candidate_id>` or `/memory_reject <candidate_id>`.
+10. Use `/memory_fact_set <fact_id> <new text>` or `/memory_fact_delete <fact_id>` to edit or archive structured facts.
+
+Typical private-chat flow:
+
+```text
+/memories
+/memory tg_user:123456789
+/memory_candidates tg_user:123456789
+/memory_accept 7
+/memory_refresh tg_user:123456789
+```
+
+The summary in `user_memories` is what gets injected into normal group-reply prompts. Structured facts in `user_memory_facts` are also shown in that personal memory context. Candidate commands only affect pending candidates; they do not edit the compact summary unless you accept candidates and then refresh or set the summary manually.
+
 | Command | Purpose |
 | --- | --- |
 | `/memory_help` | Show memory admin commands |
@@ -710,6 +735,31 @@ Ark endpoint 已统一：只配置 `ARK_API_ENDPOINT`。文本模型使用自动
 ## 管理员命令
 
 `TELEGRAM_ADMIN_USER_IDS` 支持 Telegram 数字用户 ID 或 `@username`，逗号或空格分隔。管理员命令只在私聊 bot 时生效。
+
+### 在私聊里管理个人记忆
+
+1. 先把自己加入 `TELEGRAM_ADMIN_USER_IDS`，例如 `TELEGRAM_ADMIN_USER_IDS=@Natsume_Mio` 或 `TELEGRAM_ADMIN_USER_IDS=123456789`。
+2. 重启 bot，让运行时配置重新加载。
+3. 在 Telegram 里打开和 bot 的私聊。下面这些命令在群聊里会被拒绝。
+4. 发送 `/memory_help` 查看所有记忆管理命令。
+5. 发送 `/memories` 列出目前有消息历史、summary 记忆或结构化 facts 的用户。
+6. 复制用户 key，例如 `tg_user:123456789`，然后用 `/memory tg_user:123456789` 查看这个人的当前记忆。
+7. 如果记忆为空、过期或明显不对，用 `/memory_refresh tg_user:123456789` 从历史消息重新生成。
+8. 如果要直接覆盖 summary，用 `/memory_set tg_user:123456789 <新的摘要>`。
+9. 用 `/memory_candidates tg_user:123456789` 查看待审核候选事实，再用 `/memory_accept <candidate_id>` 或 `/memory_reject <candidate_id>` 接受/拒绝。
+10. 用 `/memory_fact_set <fact_id> <新内容>` 或 `/memory_fact_delete <fact_id>` 编辑/归档结构化 fact。
+
+一个常见的私聊操作流程：
+
+```text
+/memories
+/memory tg_user:123456789
+/memory_candidates tg_user:123456789
+/memory_accept 7
+/memory_refresh tg_user:123456789
+```
+
+`user_memories` 里的 summary 会进入普通群聊回复的 personal memory prompt；`user_memory_facts` 里的结构化 facts 也会展示在 personal memory context 里。candidate 命令只处理 pending 候选；接受 candidate 会写入 facts，但如果想马上改 summary，可以再执行 `/memory_refresh` 或直接 `/memory_set`。
 
 | 命令 | 作用 |
 | --- | --- |

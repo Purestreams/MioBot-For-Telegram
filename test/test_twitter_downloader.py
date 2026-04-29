@@ -394,6 +394,87 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         assert data is not None
         self.assertEqual(data["textList"].get("123"), "plain body")
 
+    def test_fetch_fxtwitter_fallback_parses_photo_media(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "code": 200,
+            "status": {
+                "text": "clean tweet text",
+                "raw_text": {"text": "clean tweet text https://t.co/media"},
+                "media": {
+                    "all": [
+                        {
+                            "type": "photo",
+                            "url": "https://pbs.twimg.com/media/photo123.jpg?name=orig",
+                        }
+                    ]
+                },
+            },
+        }
+
+        with mock.patch.object(self.downloader.session, "get", return_value=response):
+            data = self.downloader._fetch_fxtwitter_fallback("123")
+
+        self.assertIsNotNone(data)
+        assert data is not None
+        self.assertIn("photo123.jpg", data["picList"])
+        self.assertEqual(data["textList"].get("123"), "clean tweet text")
+
+    def test_get_single_tweet_data_tries_vxtwitter_when_fxtwitter_is_text_only(self):
+        with (
+            mock.patch("app.twitter_downloader.yt_dlp.YoutubeDL") as ydl_cls,
+            mock.patch.object(self.downloader, "_fetch_syndication_fallback", return_value={
+                "picList": {},
+                "gifList": {},
+                "vidList": {},
+                "textList": {},
+            }) as syndication,
+            mock.patch.object(
+                self.downloader,
+                "_fetch_oembed_text_fallback",
+                return_value={
+                    "picList": {},
+                    "gifList": {},
+                    "vidList": {},
+                    "textList": {"123": "oembed text"},
+                },
+            ) as oembed,
+            mock.patch.object(
+                self.downloader,
+                "_fetch_fxtwitter_fallback",
+                return_value={
+                    "picList": {},
+                    "gifList": {},
+                    "vidList": {},
+                    "textList": {"123": "fx text"},
+                },
+            ) as fxt,
+            mock.patch.object(
+                self.downloader,
+                "_fetch_vxtwitter_fallback",
+                return_value={
+                    "picList": {"img.jpg": {"url": "https://pbs.twimg.com/media/img.jpg", "twtId": "123"}},
+                    "gifList": {},
+                    "vidList": {},
+                    "textList": {"123": "vx text"},
+                },
+            ) as vxt,
+        ):
+            ydl = ydl_cls.return_value.__enter__.return_value
+            ydl.extract_info.side_effect = DownloadError("ERROR: [twitter] 123: No video could be found in this tweet")
+
+            data = self.downloader.get_single_tweet_data("123")
+
+        self.assertIsNotNone(data)
+        assert data is not None
+        self.assertIn("img.jpg", data["picList"])
+        self.assertEqual(data["textList"].get("123"), "vx text")
+        syndication.assert_called_once_with("123")
+        oembed.assert_called_once()
+        fxt.assert_called_once_with("123")
+        vxt.assert_called_once_with("123")
+
     def test_extract_twitter_media_returns_empty_when_unhandled_url(self):
         with mock.patch.object(self.downloader, "_activate_guest_token") as activate:
             media, text = self.downloader.extract_twitter_media("https://example.com/not-twitter")

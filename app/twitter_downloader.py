@@ -374,7 +374,7 @@ class TwitterDownloader:
             if not isinstance(status, dict):
                 return None
 
-            text_value = _extract_text_from_rich_payload(status.get('raw_text') or status.get('text') or '')
+            text_value = _extract_text_from_rich_payload(status.get('text') or status.get('raw_text') or '')
             media_payload = status.get('media')
             if not isinstance(media_payload, dict):
                 media_payload = {}
@@ -412,7 +412,7 @@ class TwitterDownloader:
                     continue
 
                 file_name = self._extract_filename(media_url, f'{twt_id}_fx_{index}.bin')
-                if media_type == 'image':
+                if media_type in {'image', 'photo'}:
                     pic_list[file_name] = {'url': media_url, 'twtId': twt_id}
                 elif media_type == 'gif':
                     gif_list[file_name] = {'url': media_url, 'twtId': twt_id}
@@ -563,6 +563,12 @@ class TwitterDownloader:
             return False
         return bool(data.get("picList") or data.get("gifList") or data.get("vidList") or data.get("textList"))
 
+    @staticmethod
+    def _has_payload_media(data: Optional[Dict[str, Any]]) -> bool:
+        if not data:
+            return False
+        return bool(data.get("picList") or data.get("gifList") or data.get("vidList"))
+
     def get_single_tweet_data(self, twt_id: str, tweet_url: Optional[str] = None) -> Optional[Dict[str, Any]]:
         extraction_url = f'https://x.com/i/status/{twt_id}'
         fallback_url = tweet_url or extraction_url
@@ -591,15 +597,19 @@ class TwitterDownloader:
 
             logger.info("oEmbed fallback has no media for tweet %s, trying fxtwitter fallback", twt_id)
             fx_data = self._fetch_fxtwitter_fallback(twt_id)
-            if self._has_payload_content(fx_data):
+            if self._has_payload_media(fx_data):
                 logger.info("Using fxtwitter fallback for tweet %s after yt-dlp error", twt_id)
                 return fx_data
 
-            logger.info("fxtwitter fallback empty for tweet %s, trying vxtwitter fallback", twt_id)
+            logger.info("fxtwitter fallback has no media for tweet %s, trying vxtwitter fallback", twt_id)
             vx_data = self._fetch_vxtwitter_fallback(twt_id)
             if self._has_payload_content(vx_data):
                 logger.info("Using vxtwitter fallback for tweet %s after yt-dlp error", twt_id)
                 return vx_data
+
+            if self._has_payload_content(fx_data):
+                logger.info("Using fxtwitter text-only fallback for tweet %s after yt-dlp error", twt_id)
+                return fx_data
 
             if self._has_payload_content(oembed_data):
                 logger.info("Using oEmbed text-only fallback for tweet %s after yt-dlp error", twt_id)

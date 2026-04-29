@@ -10,6 +10,7 @@ If output.pdf is not specified, it defaults to 'prescription.pdf'
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import shutil
@@ -50,6 +51,36 @@ async def _latex_resource_exists(resource: str) -> bool:
 
 logger = logging.getLogger(__name__)
 
+
+class MedRenderError(RuntimeError):
+    """Raised when prescription data cannot be rendered into an image."""
+
+
+_LATEX_TEXT_REPLACEMENTS = {
+    "\\": r"\textbackslash{}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+    "{": r"\{",
+    "}": r"\}",
+    "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+
+
+def _latex_text(value) -> str:
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return "".join(_LATEX_TEXT_REPLACEMENTS.get(char, char) for char in text)
+
+
+def _barcode_text(value) -> str:
+    text = "" if value is None else str(value)
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", text)
+    return cleaned or "0000000000"
+
 def generate_macro_tex(data):
     """Generate macro.tex content from JSON data"""
     patient = data.get('patient', {})
@@ -61,27 +92,28 @@ def generate_macro_tex(data):
     year = date_info.get('year') or str(now.year)
     month = date_info.get('month') or str(now.month)
     day = date_info.get('day') or str(now.day)
+    patient_id = _barcode_text(patient.get('id', ''))
     
     macro_content = f"""% User Defined Values
 
-\\newcommand{{\\textHospitalName}}{{{data.get('hospital_name', '深圳市罗湖区人民医院')}}}
-\\newcommand{{\\textPatientName}}{{{patient.get('name', '')}}}
-\\newcommand{{\\textPatientGender}}{{{patient.get('gender', '女')}}}
-\\newcommand{{\\textPatientAge}}{{{patient.get('age', '')}}}
-\\newcommand{{\\textPatientDep}}{{{patient.get('department', '')}}}
-\\newcommand{{\\textPatientID}}{{{patient.get('id', '')}}}
-\\newcommand{{\\textPatientFeeType}}{{{patient.get('fee_type', '自费')}}}
-\\newcommand{{\\textPatientDateYear}}{{{year}}}
-\\newcommand{{\\textPatientDateMonth}}{{{month}}}
-\\newcommand{{\\textPatientDateDay}}{{{day}}}
-\\newcommand{{\\textPatientDiag}}{{{patient.get('diagnosis', '')}}}
-\\newcommand{{\\textDoctorName}}{{{doctor.get('name', '')}}}
-\\newcommand{{\\textFee}}{{{doctor.get('fee', '')}}}
-\\newcommand{{\\catagory}}{{{patient.get('catagory', '普通')}}}
+\\newcommand{{\\textHospitalName}}{{{_latex_text(data.get('hospital_name', '深圳市罗湖区人民医院'))}}}
+\\newcommand{{\\textPatientName}}{{{_latex_text(patient.get('name', ''))}}}
+\\newcommand{{\\textPatientGender}}{{{_latex_text(patient.get('gender', '女'))}}}
+\\newcommand{{\\textPatientAge}}{{{_latex_text(patient.get('age', ''))}}}
+\\newcommand{{\\textPatientDep}}{{{_latex_text(patient.get('department', ''))}}}
+\\newcommand{{\\textPatientID}}{{{patient_id}}}
+\\newcommand{{\\textPatientFeeType}}{{{_latex_text(patient.get('fee_type', '自费'))}}}
+\\newcommand{{\\textPatientDateYear}}{{{_latex_text(year)}}}
+\\newcommand{{\\textPatientDateMonth}}{{{_latex_text(month)}}}
+\\newcommand{{\\textPatientDateDay}}{{{_latex_text(day)}}}
+\\newcommand{{\\textPatientDiag}}{{{_latex_text(patient.get('diagnosis', ''))}}}
+\\newcommand{{\\textDoctorName}}{{{_latex_text(doctor.get('name', ''))}}}
+\\newcommand{{\\textFee}}{{{_latex_text(doctor.get('fee', ''))}}}
+\\newcommand{{\\catagory}}{{{_latex_text(patient.get('catagory', '普通'))}}}
 
 
 % Warning: Set this value to blank may be criminal in some countries and regions.
-\\newcommand{{\\textWatermark}}{{{data.get('watermark', 'test')}}}
+\\newcommand{{\\textWatermark}}{{{_latex_text(data.get('watermark', 'test'))}}}
 
 % End
 
@@ -117,10 +149,10 @@ def generate_medicine_tex(data):
     
     medicine_blocks = []
     for med in medicines:
-        name = med.get('name', '')
-        quantity = med.get('quantity', '')
-        usage = med.get('usage', '')
-        price = med.get('price', '')
+        name = _latex_text(med.get('name', ''))
+        quantity = _latex_text(med.get('quantity', ''))
+        usage = _latex_text(med.get('usage', ''))
+        price = _latex_text(med.get('price', ''))
         
         block = f"""\\blockMedicine{{
     {name} % 药品名称
@@ -142,14 +174,19 @@ def generate_medicine_tex(data):
 
 def generate_main_tex():
     """Generate main.tex content - static structure"""
-    main_content = r"""\documentclass[UTF8]{ctexart}
-\usepackage[T1]{fontenc}
+    main_content = r"""\documentclass{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
 \usepackage{setspace}
 \usepackage{pst-barcode}
 \usepackage{tikz}
 \usepackage{dashrule}
 \usepackage[normalem]{ulem}
 \usepackage[paperwidth=14.5cm,paperheight=21cm]{geometry}
+\setCJKmainfont{FandolSong-Regular.otf}
+\setCJKsansfont{FandolHei-Regular.otf}
+\newCJKfontfamily\songti{FandolSong-Regular.otf}
+\newCJKfontfamily\heiti{FandolHei-Regular.otf}
 \newgeometry{top=1cm,bottom=0.5cm,left=1.5cm,right=1.5cm}
 \setlength\parindent{0pt}
 \begin{document}
@@ -307,9 +344,22 @@ async def generate_pdf(json_input, output_pdf=None):
         logger.warning("images directory not found at %s", images_dir)
         logger.warning("The PDF generation may fail if images are required.")
 
-    has_ctex = await _latex_resource_exists('ctexart.cls')
-    if not has_ctex:
-        logger.error("Required LaTeX class 'ctexart.cls' not found. Install a TeX Live distribution with Chinese support (e.g., texlive-full or texlive-lang-chinese).")
+    required_latex_resources = (
+        'fontspec.sty',
+        'xeCJK.sty',
+        'pst-barcode.sty',
+        'FandolSong-Regular.otf',
+        'FandolHei-Regular.otf',
+    )
+    missing_latex_resources = [
+        resource for resource in required_latex_resources
+        if not await _latex_resource_exists(resource)
+    ]
+    if missing_latex_resources:
+        logger.error(
+            "Required LaTeX resources not found: %s. Install a TeX Live distribution with Chinese and barcode support.",
+            ", ".join(missing_latex_resources),
+        )
         return False
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -621,12 +671,20 @@ generate_jpg_med = generate_jpg
 async def generate_jpg_from_med_json(
         json_input,
         output_jpg,
+        *,
+        raise_on_failure: bool = False,
     ):
     generate_pdf_path = await generate_pdf(json_input, None)
     logger.info("Generated PDF path: %s", generate_pdf_path)
     if not generate_pdf_path:
+        if raise_on_failure:
+            raise MedRenderError(
+                "PDF generation failed. Check that xelatex, xeCJK, pst-barcode, Fandol fonts, and the MED fields are valid."
+            )
         return False
     jpg_path = await generate_jpg(generate_pdf_path, output_jpg)
+    if not jpg_path and raise_on_failure:
+        raise MedRenderError("JPG conversion failed. Check that pypdfium2 is installed and the output path is writable.")
     return jpg_path
 
     

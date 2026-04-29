@@ -91,6 +91,62 @@ def test_format_tweet_text_for_reply_keeps_tweet_body_only():
     assert formatted == "Manus CEO没有政治敏感度，说让你开会你真的去开会…… 这下好了，这辈子出不去了"
 
 
+def test_build_help_text_lists_current_features():
+    help_text = main._build_help_text()
+
+    for expected in (
+        "/start",
+        "/help",
+        "/md2jpg",
+        "/text2jpg",
+        ".txt or .md",
+        "YouTube, Bilibili, or Twitter/X",
+        "text/photo/sticker",
+        "/med2jpg",
+        "/crypto",
+        "/memory_help",
+        "/memory_refresh",
+        "TELEGRAM_ADMIN_USER_IDS",
+    ):
+        assert expected in help_text
+
+
+def test_handle_help_replies_with_feature_list():
+    class _FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    message = _FakeMessage()
+    update = SimpleNamespace(message=message)
+
+    asyncio.run(main.handle_help(update, SimpleNamespace()))
+
+    assert len(message.replies) == 1
+    assert "MioBot help" in message.replies[0]
+    assert "/crypto" in message.replies[0]
+
+
+def test_start_points_to_help_command():
+    class _FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    message = _FakeMessage()
+    update = SimpleNamespace(message=message)
+
+    asyncio.run(main.start(update, SimpleNamespace()))
+
+    assert message.replies == [
+        "Hi! I can render text to images, download media links, and join group chats with contextual replies. Send /help to see all features."
+    ]
+
+
 def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
     class _FakeMessage:
         def __init__(self):
@@ -176,6 +232,40 @@ def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
     assert bot.videos == []
     assert status.deleted is True
     assert message.deleted is True
+
+
+def test_handle_medjpg_reports_render_failure_details(monkeypatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.message_id = 777
+            self.text = "/med2jpg patient A_B"
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+            return SimpleNamespace(delete=lambda: None)
+
+    class _FakeBot:
+        async def send_document(self, **kwargs):
+            raise AssertionError("send_document should not run after render failure")
+
+    async def fake_generate_med(prompt):
+        return {"hospital_name": "H", "patient": {}, "medicines": [{}], "doctor": {}, "watermark": ""}
+
+    async def fake_generate_jpg_from_med_json(json_input, output_jpg, *, raise_on_failure=False):
+        raise main.MedRenderError("PDF generation failed. Check xelatex.")
+
+    monkeypatch.setattr(main, "generate_med", fake_generate_med)
+    monkeypatch.setattr(main, "generate_jpg_from_med_json", fake_generate_jpg_from_med_json)
+
+    message = _FakeMessage()
+    update = SimpleNamespace(message=message, effective_chat=SimpleNamespace(id=1))
+    context = SimpleNamespace(bot=_FakeBot())
+
+    asyncio.run(main.handle_medjpg(update, context))
+
+    assert any("MED image rendering failed." in reply for reply in message.replies)
+    assert any("PDF generation failed" in reply for reply in message.replies)
 
 
 def test_handle_twitter_media_message_offloads_sync_extraction(monkeypatch):

@@ -85,6 +85,16 @@ def test_generate_jpg_from_med_json_short_circuits_when_pdf_generation_fails(mon
     assert out is False
 
 
+def test_generate_jpg_from_med_json_can_raise_render_error(monkeypatch):
+    async def fake_generate_pdf(json_input, output_pdf=None):
+        return False
+
+    monkeypatch.setattr(med, "generate_pdf", fake_generate_pdf)
+
+    with pytest.raises(med.MedRenderError):
+        asyncio.run(med.generate_jpg_from_med_json({"k": "v"}, "out.jpg", raise_on_failure=True))
+
+
 def test_generate_jpg_from_med_json_returns_jpg_path(monkeypatch):
     async def fake_generate_pdf(json_input, output_pdf=None):
         return "x.pdf"

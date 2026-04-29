@@ -66,7 +66,7 @@ from app.image2text import image_to_text, sticker_to_text
 
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
-from app.med import generate_jpg_from_med_json, generate_med
+from app.med import MedRenderError, generate_jpg_from_med_json, generate_med
 from app.ai_model import configure_llm
 from app.main_helpers import (
     OUTPUT_DIR,
@@ -546,6 +546,21 @@ def _build_detailed_media_error_message(exc: Exception, *, max_chars: int = TELE
     return message[: max_chars - 3].rstrip() + "..."
 
 
+def _build_med_error_message(exc: Exception, *, max_chars: int = TELEGRAM_TEXT_LIMIT) -> str:
+    if isinstance(exc, ValueError):
+        prefix = "Failed to generate valid MED JSON from the provided text."
+    elif isinstance(exc, MedRenderError):
+        prefix = "MED image rendering failed."
+    else:
+        prefix = "Sorry, I encountered an error while creating your MED image."
+
+    detail = f"{type(exc).__name__}: {exc}".strip()
+    message = f"{prefix}\n{detail}"
+    if len(message) <= max_chars:
+        return message
+    return message[: max_chars - 3].rstrip() + "..."
+
+
 def _build_group_reply_runtime_state(
     *,
     sender_display: str,
@@ -814,6 +829,38 @@ async def _handle_text2jpg_request(
 
 # -------- Telegram Bot Handlers --------
 
+
+def _build_help_text() -> str:
+    return (
+        "MioBot help\n\n"
+        "General commands:\n"
+        "/start - Show a short intro\n"
+        "/help - Show this feature list\n\n"
+        "Text to image:\n"
+        "/md2jpg ,,,...,,, - Render Markdown as an image\n"
+        "/text2jpg ,,,...,,, - Convert plain text to Markdown, then render it\n"
+        "Upload a .txt or .md file - Render it as an image\n\n"
+        "Media handling:\n"
+        "Send a YouTube, Bilibili, or Twitter/X link - Download and return supported media\n\n"
+        "Group AI replies:\n"
+        "In group chats, text/photo/sticker messages can trigger contextual replies. Direct triggers include replying to the bot, mentioning @BotUsername, or saying mioo / 小小宫.\n\n"
+        "Extra commands:\n"
+        "/med2jpg <request> - Generate a prescription-style MED image\n"
+        "/crypto - Show crypto prices and Allez APR snapshots\n\n"
+        "Private admin memory tools:\n"
+        "/memory_help - Show memory admin commands\n"
+        "/memories - List users with memory/history\n"
+        "/memory <user> - View one user's memory\n"
+        "/memory_search <keyword> - Search summaries and facts\n"
+        "/memory_refresh <user> - Regenerate memory from history\n"
+        "/memory_set <user> <text> - Replace summary memory\n"
+        "/memory_candidates [user] - Review pending memory candidates\n"
+        "/memory_accept <id> / /memory_reject <id> - Accept or reject a candidate\n"
+        "/memory_fact_set <id> <text> / /memory_fact_delete <id> - Edit or archive facts\n\n"
+        "Admin memory commands only work in private chat for users listed in TELEGRAM_ADMIN_USER_IDS."
+    )
+
+
 # Start command handler
 # This handler sends a welcome message when the /start command is issued.
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -822,8 +869,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        """Hi! I can convert Markdown to an image. Send me a message like:\n\n /md2jpg ,,,Your markdown here,,, \n\n'or\n\n /text2jpg ,,,Your plain text here,,, \n\nI can also download YouTube videos if you send me a link, and I might reply to messages in this group if I find them interesting, nya~"""
+        "Hi! I can render text to images, download media links, and join group chats with contextual replies. Send /help to see all features."
     )
+
+
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all currently supported bot features."""
+    if not update.message:
+        return
+
+    await update.message.reply_text(_build_help_text())
 
 
 async def handle_md2jpg_and_text2jpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1286,18 +1341,18 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     logger.info(f"Received text for MED rendering: {update.message.text if update.message else 'No message text'}")
     message_text = update.message.text
-    await update.message.reply_text("Processing your MED image request...")
-    json_prompt = await generate_med(message_text)
-    if not json_prompt:
-        await update.message.reply_text("Failed to generate MED JSON from the provided text.")
-        return
     output_file_path = _build_output_path("med", update.message.message_id)
     status_message = None
     try:
+        await update.message.reply_text("Processing your MED image request...")
+        json_prompt = await generate_med(message_text)
+        if not json_prompt:
+            raise ValueError("The model returned an empty MED JSON payload.")
+
         status_message = await update.message.reply_text("Generating your MED image, please wait a moment...")
 
         # Convert the generated prescription data straight to JPG
-        jpg_path = await generate_jpg_from_med_json(json_prompt, output_file_path)
+        jpg_path = await generate_jpg_from_med_json(json_prompt, output_file_path, raise_on_failure=True)
         if not jpg_path or not os.path.exists(jpg_path):
             raise FileNotFoundError(f"MED JPG not created at {jpg_path}")
 
@@ -1312,8 +1367,8 @@ async def handle_medjpg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         await _delete_message_if_exists(status_message)
     except Exception as e:
-        logger.error(f"Error during MED image generation or sending: {e}")
-        await update.message.reply_text("Sorry, I encountered an error while creating your MED image.")
+        logger.exception("Error during MED image generation or sending: %s", e)
+        await update.message.reply_text(_build_med_error_message(e))
         await _delete_message_if_exists(status_message)
     finally:
         _remove_file_if_exists(output_file_path)
@@ -1336,6 +1391,7 @@ def register_handlers(application: Application) -> None:
     """Register all command and message handlers in one place."""
     # on different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", handle_help))
 
     # Private memory administration commands
     application.add_handler(CommandHandler("memory_help", handle_memory_admin_help, filters=filters.ChatType.PRIVATE))

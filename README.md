@@ -107,6 +107,7 @@ Before polling starts, the bot:
 [main.py](main.py) owns the Telegram orchestration layer. It registers command handlers first, then document/text/photo/sticker handlers:
 
 - `/start` returns a short capability hint.
+- `/help` returns the current feature and command list.
 - `/md2jpg` and `/text2jpg` share the same command parser and rendering path.
 - `/med2jpg` calls the prescription generator and renderer.
 - `/crypto` replies with price and APR data from [app/cryto.py](app/cryto.py).
@@ -550,6 +551,7 @@ Some *markdown* here,,,
 [main.py](main.py) 是 Telegram 编排层。它注册命令、文件、文本、图片、贴纸和管理员私聊 handler：
 
 - `/start` 返回简短能力说明。
+- `/help` 返回当前所有功能和命令列表。
 - `/md2jpg` 和 `/text2jpg` 共用命令解析和渲染路径。
 - `/med2jpg` 调用处方 JSON 生成和图片渲染。
 - `/crypto` 调用 [app/cryto.py](app/cryto.py) 返回价格和 APR 信息。

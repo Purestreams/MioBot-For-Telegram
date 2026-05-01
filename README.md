@@ -390,8 +390,8 @@ Optional dependencies:
 uv pip install openai
 
 # /med2jpg support
-sudo apt-get install -y texlive-xetex texlive-latex-extra texlive-lang-chinese
-uv pip install pypdfium2
+sudo apt-get install -y texlive-xetex texlive-latex-extra texlive-pstricks texlive-lang-chinese
+uv sync --extra med
 ```
 
 ## Running
@@ -437,7 +437,7 @@ docker run --rm -it \
   miobot:latest
 ```
 
-The Dockerfile includes core Python dependencies, ffmpeg, Noto CJK fonts, and Playwright Chromium runtime dependencies. Azure and `/med2jpg` optional dependencies may require extending the image.
+The Dockerfile includes core Python dependencies, ffmpeg, Noto CJK fonts, Playwright Chromium runtime dependencies, and `/med2jpg` runtime dependencies (XeLaTeX, Chinese TeX packages, barcode support, and the `med` Python extra). Azure support may still require extending the image.
 
 ## Testing
 
@@ -457,7 +457,7 @@ Live tests require real credentials or network access and are intentionally excl
 | Ambient group messages rarely get replies | Activation probe decided not to reply | Reply to the bot or mention `mioo`, `小小宫`, or `@BotUsername` |
 | Photos or stickers do not affect replies | Ark vision config missing | Set `ARK_API_KEY`, `ARK_API_ENDPOINT`, and `ARK_VISION_MODEL` |
 | Twitter/X extraction fails | Protected content, login required, or rate limits | Provide `config/x.com_cookies.txt` or cookie env vars |
-| `/med2jpg` fails | TeX/PDF dependencies missing | Install TeX Live Chinese support and `pypdfium2` |
+| `/med2jpg` fails | TeX/PDF dependencies missing | Install `texlive-xetex`, `texlive-latex-extra`, `texlive-pstricks`, `texlive-lang-chinese`, then run `uv sync --extra med` |
 | Azure provider fails | Missing `openai` package or Azure settings | Install `openai` and complete Azure env vars |
 
 ## License
@@ -831,7 +831,7 @@ docker run --rm -it \
   miobot:latest
 ```
 
-Dockerfile 已包含核心 Python 依赖、ffmpeg、Noto CJK 字体和 Playwright Chromium 运行依赖。Azure 和 `/med2jpg` 的额外依赖可能需要自行扩展镜像。
+Dockerfile 已包含核心 Python 依赖、ffmpeg、Noto CJK 字体、Playwright Chromium 运行依赖，以及 `/med2jpg` 运行所需的 XeLaTeX、中文 TeX 包、barcode 支持和 `med` Python extra。Azure 支持仍然可能需要自行扩展镜像。
 
 ## 测试
 
@@ -849,7 +849,7 @@ live 测试需要真实凭据或网络访问，默认不包含在上面的命令
 | 群聊普通消息很少回复 | activation probe 判断不需要回复 | 直接回复 bot 或提到 `mioo` / `小小宫` / `@BotUsername` |
 | 图片或贴纸不影响回复 | Ark vision 配置不完整 | 配置 `ARK_API_KEY`、`ARK_API_ENDPOINT`、`ARK_VISION_MODEL` |
 | Twitter/X 提取失败 | 受保护内容、需要登录态或限流 | 提供 `config/x.com_cookies.txt` 或 cookie 环境变量 |
-| `/med2jpg` 失败 | 缺少 TeX/PDF 依赖 | 安装 TeX Live 中文支持和 `pypdfium2` |
+| `/med2jpg` 失败 | 缺少 TeX/PDF 依赖 | 安装 `texlive-xetex`、`texlive-latex-extra`、`texlive-pstricks`、`texlive-lang-chinese`，然后执行 `uv sync --extra med` |
 
 ## License
 

@@ -18,6 +18,11 @@ dependencies = [
     "yt-dlp>=2024.8.6",
 ]
 
+[project.optional-dependencies]
+med = [
+    "pypdfium2>=4.30.0",
+]
+
 [project.scripts]
 miobot = "main:main"
 miobot-rag = "app.database:cli_main"

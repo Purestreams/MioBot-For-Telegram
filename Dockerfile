@@ -7,11 +7,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Runtime packages: ffmpeg for yt-dlp post-processing, fonts for CJK rendering.
+# Runtime packages: ffmpeg for yt-dlp post-processing, fonts for CJK rendering,
+# and XeLaTeX dependencies for /med2jpg.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
     fonts-noto-cjk \
+    texlive-xetex \
+    texlive-latex-extra \
+    texlive-pstricks \
+    texlive-lang-chinese \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy minimal files first for better layer caching.
@@ -22,7 +27,7 @@ COPY main.py ./
 
 # Install project and Playwright browser runtime.
 RUN python -m pip install --upgrade pip \
-    && python -m pip install . \
+    && python -m pip install ".[med]" \
     && python -m playwright install --with-deps chromium
 
 # Prepare runtime directories.

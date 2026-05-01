@@ -194,6 +194,9 @@ def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
         def extract_twitter_media(self, url):
             return [("pic", b"img1"), ("pic", b"img2")], {"1": "tweet body"}
 
+    async def fake_add_message(**kwargs):
+        return 1
+
     message = _FakeMessage()
     bot = _FakeBot()
     status = _FakeStatus()
@@ -201,6 +204,7 @@ def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
     context = SimpleNamespace(bot=bot)
 
     monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
+    monkeypatch.setattr(main, "add_message", fake_add_message)
 
     handled = asyncio.run(
         main._handle_twitter_media_message(
@@ -230,6 +234,100 @@ def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
     assert len(bot.documents) == 0
     assert bot.messages == []
     assert bot.videos == []
+    assert status.deleted is True
+    assert message.deleted is True
+
+
+def test_handle_twitter_media_message_persists_semantic_tweet_content(monkeypatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.text = "check this out https://x.com/u/status/1"
+            self.message_id = 123
+            self.replies = []
+            self.deleted = False
+            self.reply_to_message = None
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append({"text": text, "kwargs": kwargs})
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeBot:
+        def __init__(self):
+            self.photos = []
+            self.media_groups = []
+            self.videos = []
+            self.documents = []
+            self.messages = []
+
+        async def send_photo(self, **kwargs):
+            self.photos.append(kwargs)
+
+        async def send_media_group(self, **kwargs):
+            self.media_groups.append(kwargs)
+
+        async def send_video(self, **kwargs):
+            self.videos.append(kwargs)
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+
+    class _FakeStatus:
+        def __init__(self):
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeTwitterDownloader:
+        def extract_twitter_media(self, url):
+            return [("pic", b"img1"), ("gif", b"gif1")], {"1": "tweet body with sqlite lock context"}
+
+    captured = {}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        captured["chat_id"] = chat_id
+        captured["username"] = username
+        captured["content"] = content
+        captured["kwargs"] = kwargs
+        return 1
+
+    message = _FakeMessage()
+    bot = _FakeBot()
+    status = _FakeStatus()
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=42),
+    )
+    context = SimpleNamespace(bot=bot)
+
+    monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+
+    handled = asyncio.run(
+        main._handle_twitter_media_message(
+            update=update,
+            context=context,
+            video_url="https://x.com/u/status/1",
+            sender_display="Tester @tester",
+            status_message=status,
+        )
+    )
+
+    assert handled is True
+    assert captured["chat_id"] == 1
+    assert captured["username"] == "Tester @tester"
+    assert "shared_twitter_link: https://x.com/u/status/1" in captured["content"]
+    assert "shared_twitter_media: 1 image(s), 1 gif(s)" in captured["content"]
+    assert "user_comment: check this out" in captured["content"]
+    assert "tweet_text: tweet body with sqlite lock context" in captured["content"]
+    assert captured["kwargs"]["telegram_user_key"] == "tg_user:42"
+    assert captured["kwargs"]["telegram_message_id"] == 123
     assert status.deleted is True
     assert message.deleted is True
 
@@ -311,6 +409,9 @@ def test_handle_twitter_media_message_offloads_sync_extraction(monkeypatch):
         def extract_twitter_media(self, url):
             return [], {"1": "text only tweet"}
 
+    async def fake_add_message(**kwargs):
+        return 1
+
     captured = {"to_thread": False, "callable_name": None}
 
     async def fake_to_thread(func, *args, **kwargs):
@@ -320,6 +421,7 @@ def test_handle_twitter_media_message_offloads_sync_extraction(monkeypatch):
 
     monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
     monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(main, "add_message", fake_add_message)
 
     message = _FakeMessage()
     bot = _FakeBot()
@@ -399,6 +501,9 @@ def test_handle_twitter_media_message_handles_text_only_tweet(monkeypatch):
         def extract_twitter_media(self, url):
             return [], {"1": "text only tweet"}
 
+    async def fake_add_message(**kwargs):
+        return 1
+
     message = _FakeMessage()
     bot = _FakeBot()
     status = _FakeStatus()
@@ -406,6 +511,7 @@ def test_handle_twitter_media_message_handles_text_only_tweet(monkeypatch):
     context = SimpleNamespace(bot=bot)
 
     monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
+    monkeypatch.setattr(main, "add_message", fake_add_message)
 
     handled = asyncio.run(
         main._handle_twitter_media_message(
@@ -486,6 +592,9 @@ def test_handle_twitter_media_message_sends_video_with_caption(monkeypatch):
         def extract_twitter_media(self, url):
             return [("vid", b"video-data")], {"1": "video tweet body"}
 
+    async def fake_add_message(**kwargs):
+        return 1
+
     message = _FakeMessage()
     bot = _FakeBot()
     status = _FakeStatus()
@@ -493,6 +602,7 @@ def test_handle_twitter_media_message_sends_video_with_caption(monkeypatch):
     context = SimpleNamespace(bot=bot)
 
     monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
+    monkeypatch.setattr(main, "add_message", fake_add_message)
 
     handled = asyncio.run(
         main._handle_twitter_media_message(
@@ -568,6 +678,9 @@ def test_handle_twitter_media_message_sends_video_when_text_empty(monkeypatch):
         def extract_twitter_media(self, url):
             return [("vid", b"video-data")], {"1": ""}
 
+    async def fake_add_message(**kwargs):
+        return 1
+
     message = _FakeMessage()
     bot = _FakeBot()
     status = _FakeStatus()
@@ -575,6 +688,7 @@ def test_handle_twitter_media_message_sends_video_when_text_empty(monkeypatch):
     context = SimpleNamespace(bot=bot)
 
     monkeypatch.setattr(main, "TwitterDownloader", lambda: _FakeTwitterDownloader())
+    monkeypatch.setattr(main, "add_message", fake_add_message)
 
     handled = asyncio.run(
         main._handle_twitter_media_message(

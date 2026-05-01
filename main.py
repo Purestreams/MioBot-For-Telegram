@@ -670,6 +670,7 @@ async def _handle_twitter_media_message(
     media_list, text_dict = await asyncio.to_thread(twitter_downloader.extract_twitter_media, video_url)
 
     tweet_text = summarize_tweet_text(text_dict)
+    raw_message_text = (getattr(update.message, "text", None) or getattr(update.message, "caption", None) or video_url).strip()
 
     image_medias = [media for media_type, media in media_list if media_type == 'pic']
     video_medias = [media for media_type, media in media_list if media_type == 'vid']
@@ -682,6 +683,28 @@ async def _handle_twitter_media_message(
             "Could not extract video, images, or text from this tweet. "
             "It may be deleted, protected, region-restricted, or blocked by auth/cookie settings."
         )
+
+    sender_user = getattr(update, "effective_user", None)
+    reply_to_message = getattr(update.message, "reply_to_message", None)
+    try:
+        await add_message(
+            chat_id=update.effective_chat.id,
+            username=sender_display,
+            content=_build_twitter_history_message(
+                raw_message_text=raw_message_text,
+                twitter_url=video_url,
+                tweet_text=tweet_text,
+                image_count=len(image_medias),
+                video_count=len(video_medias),
+                gif_count=len(gif_medias),
+            ),
+            telegram_user_key=_telegram_user_key_from_user(sender_user),
+            telegram_message_id=getattr(update.message, "message_id", None),
+            reply_to_telegram_message_id=getattr(reply_to_message, "message_id", None) if reply_to_message else None,
+            reply_to_username=_display_name_from_user(getattr(reply_to_message, "from_user", None)) if reply_to_message else None,
+        )
+    except Exception:
+        logger.exception("Failed to persist parsed Twitter/X content for %s", video_url)
 
     if len(image_medias) > 1:
         album_caption = build_twitter_caption(text_caption, sender_display, video_url)
@@ -859,6 +882,42 @@ def _build_help_text() -> str:
         "/memory_fact_set <id> <text> / /memory_fact_delete <id> - Edit or archive facts\n\n"
         "Admin memory commands only work in private chat for users listed in TELEGRAM_ADMIN_USER_IDS."
     )
+
+
+def _build_twitter_history_message(
+    *,
+    raw_message_text: str,
+    twitter_url: str,
+    tweet_text: str,
+    image_count: int,
+    video_count: int,
+    gif_count: int,
+    max_tweet_chars: int = 1500,
+) -> str:
+    user_comment = " ".join((raw_message_text or "").replace(twitter_url, " ").split()).strip()
+    normalized_tweet_text = " ".join((tweet_text or "").split()).strip()
+    if len(normalized_tweet_text) > max_tweet_chars:
+        normalized_tweet_text = normalized_tweet_text[: max_tweet_chars - 1].rstrip() + "…"
+
+    media_parts: list[str] = []
+    if image_count:
+        media_parts.append(f"{image_count} image(s)")
+    if video_count:
+        media_parts.append(f"{video_count} video(s)")
+    if gif_count:
+        media_parts.append(f"{gif_count} gif(s)")
+    if not media_parts:
+        media_parts.append("text-only")
+
+    lines = [
+        f"shared_twitter_link: {twitter_url}",
+        f"shared_twitter_media: {', '.join(media_parts)}",
+    ]
+    if user_comment:
+        lines.append(f"user_comment: {user_comment}")
+    if normalized_tweet_text:
+        lines.append(f"tweet_text: {normalized_tweet_text}")
+    return "\n".join(lines)
 
 
 # Start command handler

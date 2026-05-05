@@ -7,7 +7,7 @@ The default README language is English. A Chinese version is available below: [�
 ## Highlights
 
 - Markdown, plain text, `.txt`, and `.md` rendering to image.
-- Automatic YouTube, Bilibili, and Twitter/X media handling.
+- Automatic YouTube, Bilibili, Twitter/X, and Zhihu link handling.
 - Context-aware group replies powered by recent chat history, hybrid RAG, and personal memory.
 - Photo and sticker understanding through Ark vision models.
 - SQLite-backed message history, embeddings, sticker cache, memory summaries, structured facts, and memory candidates.
@@ -34,9 +34,10 @@ Related modules: [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py
 
 ### Media Download
 
-- Plain text messages containing YouTube, Bilibili, or Twitter/X links trigger the media flow automatically.
+- Plain text messages containing YouTube, Bilibili, Twitter/X, or Zhihu links trigger the media flow automatically.
 - YouTube and Bilibili use [app/youtube_dl.py](app/youtube_dl.py), prefer MP4 up to 720p, and try ffmpeg compression when Telegram size limits are exceeded.
 - Twitter/X uses [app/twitter_downloader.py](app/twitter_downloader.py) and supports photos, videos, GIFs, and text-only fallback replies.
+- Zhihu uses [app/zhihu_dl.py](app/zhihu_dl.py) and returns parsed question, author, and answer text from answer links.
 - After successful media delivery, the original link message is deleted.
 
 ### Group Replies
@@ -79,7 +80,7 @@ High-signal messages create pending candidates in the background. Fast candidate
 | Runtime config | [app/runtime_config.py](app/runtime_config.py) | Loads env files and derives Ark chat/Responses endpoints |
 | LLM abstraction | [app/ai_model.py](app/ai_model.py) | Ark, Azure OpenAI, and Ollama chat completion wrapper |
 | Rendering | [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py) | Text shaping, HTML rendering, Playwright screenshot |
-| Media | [app/youtube_dl.py](app/youtube_dl.py), [app/twitter_downloader.py](app/twitter_downloader.py) | Download, compression, captions, fallback parsing |
+| Media | [app/youtube_dl.py](app/youtube_dl.py), [app/twitter_downloader.py](app/twitter_downloader.py), [app/zhihu_dl.py](app/zhihu_dl.py) | Download, compression, captions, fallback parsing, Zhihu answer extraction |
 | Group replies | [app/reply2message.py](app/reply2message.py), [main.py](main.py) | Activation probe and reply generation |
 | Storage and RAG | [app/database.py](app/database.py), [app/rag_embeddings.py](app/rag_embeddings.py) | SQLite, embeddings, vector search, keyword search, reindexing |
 | Personal memory | [app/user_memory.py](app/user_memory.py) | Candidate extraction, summary refresh, structured facts |
@@ -132,6 +133,8 @@ Commands use the `,,,content,,,` wrapper so the bot can distinguish command synt
 Text messages are inspected for supported media URLs by helpers in [app/main_helpers.py](app/main_helpers.py). YouTube and Bilibili links are handled by [app/youtube_dl.py](app/youtube_dl.py), which uses `yt-dlp`, picks a Telegram-friendly MP4 format, and calls ffmpeg compression when the file is too large.
 
 Twitter/X links are handled by [app/twitter_downloader.py](app/twitter_downloader.py). The extractor supports direct tweet parsing plus fallback services. It can return photos, videos, GIFs, or text-only content. Because the extraction stack uses synchronous network and parsing work, [main.py](main.py) runs it through `asyncio.to_thread()` so the async Telegram event loop is not blocked.
+
+Zhihu answer links are handled by [app/zhihu_dl.py](app/zhihu_dl.py). The parser reuses a logged-in requests session and cookie file to fetch the answer JSON, then [main.py](main.py) sends the parsed question, author, and answer text back as a Telegram message. This synchronous parser also runs through `asyncio.to_thread()`.
 
 After media is sent, status messages and original link messages are deleted best-effort. Cleanup failures are logged but do not break the reply flow.
 
@@ -473,7 +476,7 @@ MioBot 是一个异步 Telegram 机器人，用于文本渲染、媒体下载，
 ## 功能概览
 
 - Markdown、纯文本、`.txt`、`.md` 转图片。
-- 自动处理 YouTube、Bilibili、Twitter/X 链接。
+- 自动处理 YouTube、Bilibili、Twitter/X、知乎链接。
 - 基于最近聊天、混合 RAG、个人记忆的群聊回复。
 - 使用 Ark 视觉模型理解图片和贴纸。
 - 使用 SQLite 保存消息、embedding、贴纸缓存、记忆摘要、结构化 facts、记忆候选。
@@ -498,9 +501,10 @@ Some *markdown* here,,,
 
 ### 媒体下载
 
-- 文本消息中出现 YouTube、Bilibili、Twitter/X 链接时自动触发。
+- 文本消息中出现 YouTube、Bilibili、Twitter/X、知乎链接时自动触发。
 - YouTube / Bilibili 使用 [app/youtube_dl.py](app/youtube_dl.py)，优先下载不高于 720p 的 MP4，超过 Telegram 限制时尝试压缩。
 - Twitter/X 使用 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图片、视频、GIF 和纯文本兜底。
+- 知乎回答链接使用 [app/zhihu_dl.py](app/zhihu_dl.py)，返回问题、回答者和回答正文。
 - 媒体成功发送后会删除原始链接消息。
 
 ### 群聊回复
@@ -576,6 +580,8 @@ Some *markdown* here,,,
 [app/main_helpers.py](app/main_helpers.py) 负责识别文本里的媒体链接。YouTube 和 Bilibili 走 [app/youtube_dl.py](app/youtube_dl.py)，使用 `yt-dlp` 下载 Telegram 友好的 MP4，并在文件过大时尝试 ffmpeg 压缩。
 
 Twitter/X 走 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图片、视频、GIF 和纯文本兜底。因为这部分有同步网络和解析逻辑，[main.py](main.py) 使用 `asyncio.to_thread()` 执行，避免阻塞 async Telegram event loop。
+
+知乎回答链接走 [app/zhihu_dl.py](app/zhihu_dl.py)，使用保存的 cookie 会话请求知乎回答 JSON，然后把问题、作者和正文整理成文本消息返回。因为这部分也是同步网络请求，[main.py](main.py) 同样通过 `asyncio.to_thread()` 执行，避免阻塞 Telegram 的 async 事件循环。
 
 媒体发送成功后，状态消息和原始链接消息会 best-effort 删除；删除失败只记录日志，不影响主流程。
 

@@ -12,6 +12,12 @@ def test_extract_video_url_prefers_youtube_when_present():
     assert "youtube.com" in extracted
 
 
+def test_extract_video_url_supports_zhihu_answer_links():
+    message = "看看这个 https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097"
+    extracted = main._extract_video_url(message)
+    assert extracted == "https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097"
+
+
 def test_extract_search_keywords_deduplicates_and_filters_stopwords():
     text = "This is this a test test for bot bot context retrieval"
     keywords = main._extract_search_keywords(text)
@@ -100,7 +106,7 @@ def test_build_help_text_lists_current_features():
         "/md2jpg",
         "/text2jpg",
         ".txt or .md",
-        "YouTube, Bilibili, or Twitter/X",
+        "Zhihu",
         "text/photo/sticker",
         "/med2jpg",
         "/crypto",
@@ -234,6 +240,107 @@ def test_handle_twitter_media_message_sends_images_and_text(monkeypatch):
     assert len(bot.documents) == 0
     assert bot.messages == []
     assert bot.videos == []
+    assert status.deleted is True
+    assert message.deleted is True
+
+
+def test_handle_zhihu_link_message_sends_text_and_persists_content(monkeypatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.text = "帮我总结 https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097"
+            self.message_id = 808
+            self.replies = []
+            self.deleted = False
+            self.reply_to_message = None
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append({"text": text, "kwargs": kwargs})
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeBot:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+
+    class _FakeStatus:
+        def __init__(self):
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    captured = {}
+
+    def fake_parse_zhihu_link(url):
+        assert url == "https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097"
+        return {
+            "question": "00后是否会更加认可自由主义？",
+            "author": "Allen",
+            "author_url": "chen-shi-xuan-44",
+            "content": "目前的趋势是00后要用一生的代价来认可自由主义。",
+            "time": "2026-04-28 05:07",
+        }
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        captured["chat_id"] = chat_id
+        captured["username"] = username
+        captured["content"] = content
+        captured["kwargs"] = kwargs
+        return 1
+
+    message = _FakeMessage()
+    bot = _FakeBot()
+    status = _FakeStatus()
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=42),
+    )
+    context = SimpleNamespace(bot=bot)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(main, "parse_zhihu_link", fake_parse_zhihu_link)
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+
+    handled = asyncio.run(
+        main._handle_zhihu_link_message(
+            update=update,
+            context=context,
+            video_url="https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097",
+            sender_display="Tester @tester",
+            status_message=status,
+        )
+    )
+
+    assert handled is True
+    assert captured["chat_id"] == 1
+    assert captured["username"] == "Tester @tester"
+    assert "shared_zhihu_link: https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097" in captured["content"]
+    assert "user_comment: 帮我总结" in captured["content"]
+    assert "zhihu_question: 00后是否会更加认可自由主义？" in captured["content"]
+    assert "zhihu_answer: 目前的趋势是00后要用一生的代价来认可自由主义。" in captured["content"]
+    assert captured["kwargs"]["telegram_user_key"] == "tg_user:42"
+    assert bot.messages == [
+        {
+            "chat_id": 1,
+            "text": (
+                "知乎问题：00后是否会更加认可自由主义？\n"
+                "回答者：Allen (@chen-shi-xuan-44)\n"
+                "时间：2026-04-28 05:07\n\n"
+                "目前的趋势是00后要用一生的代价来认可自由主义。\n\n"
+                "原链接：https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097\n"
+                "Requested by: Tester @tester"
+            ),
+            "disable_web_page_preview": True,
+        }
+    ]
     assert status.deleted is True
     assert message.deleted is True
 
@@ -825,6 +932,56 @@ def test_handle_text_for_youtube_or_group_schedules_video_processing_in_backgrou
 
     assert len(message.reply_calls) == 1
     assert message.reply_calls[0]["text"] == "Downloading your video, please wait a moment..."
+    assert scheduled["context"] is context
+    assert scheduled["coro"] is not None
+
+
+def test_handle_text_for_youtube_or_group_uses_zhihu_status_text(monkeypatch):
+    class _FakeStatusMessage:
+        def __init__(self, text):
+            self.text = text
+
+        async def edit_text(self, text):
+            return None
+
+        async def delete(self):
+            return None
+
+    class _FakeMessage:
+        def __init__(self, text):
+            self.text = text
+            self.message_id = 655
+            self.reply_calls = []
+
+        async def reply_text(self, text, **kwargs):
+            self.reply_calls.append({"text": text, "kwargs": kwargs})
+            return _FakeStatusMessage(text)
+
+    scheduled = {}
+    message = _FakeMessage("https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097")
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1, type="group"),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=1),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace())
+
+    def fake_schedule_background_task(context_arg, coro):
+        scheduled["context"] = context_arg
+        scheduled["coro"] = coro
+        coro.close()
+
+    monkeypatch.setattr(
+        main,
+        "_extract_video_url",
+        lambda text: "https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097",
+    )
+    monkeypatch.setattr(main, "_schedule_background_task", fake_schedule_background_task)
+
+    asyncio.run(main.handle_text_for_youtube_or_group(update, context))
+
+    assert len(message.reply_calls) == 1
+    assert message.reply_calls[0]["text"] == "Parsing your Zhihu link, please wait a moment..."
     assert scheduled["context"] is context
     assert scheduled["coro"] is not None
 

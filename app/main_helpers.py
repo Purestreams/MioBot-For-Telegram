@@ -29,6 +29,12 @@ TWITTER_URL_REGEX = (
     r'[A-Za-z0-9_]+/status/\d+'
     r'(?:[/?#][^\s]*)?'
 )
+ZHIHU_URL_REGEX = (
+    r'(https?://)?(?:www\.)?'
+    r'zhihu\.com/'
+    r'(?:question/\d+(?:/answer/\d+)?|answer/\d+)'
+    r'(?:[/?#][^\s]*)?'
+)
 
 MD2JPG_REGEX = r'/md2jpg(?:@\w+)?\s*,,,(.*),,,'
 TEXT2JPG_REGEX = r'/text2jpg(?:@\w+)?\s*,,,(.*),,,'
@@ -75,6 +81,7 @@ def _extract_video_url(message_text: str) -> Optional[str]:
     youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
     bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
     twitter_match = re.search(TWITTER_URL_REGEX, message_text)
+    zhihu_match = re.search(ZHIHU_URL_REGEX, message_text)
 
     if youtube_match:
         return youtube_match.group(0)
@@ -82,7 +89,13 @@ def _extract_video_url(message_text: str) -> Optional[str]:
         return bilibili_match.group(0)
     if twitter_match:
         return twitter_match.group(0)
+    if zhihu_match:
+        return zhihu_match.group(0)
     return None
+
+
+def is_zhihu_answer_url(url: str) -> bool:
+    return bool(url and re.search(ZHIHU_URL_REGEX, url))
 
 
 def _is_reply_to_this_bot(update, bot_username: Optional[str]) -> bool:

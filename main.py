@@ -30,6 +30,7 @@ from app.twitter_downloader import (
     is_twitter_status_url,
     summarize_tweet_text,
 )
+from app.zhihu_dl import parse_link as parse_zhihu_link
 from app.youtube_dl import (
     download_video_to_file,
     compress_video_if_needed,
@@ -79,6 +80,7 @@ from app.main_helpers import (
     _is_reply_to_this_bot,
     _classify_group_reply_trigger,
     _display_name_from_user,
+    is_zhihu_answer_url,
     _telegram_user_key_from_user,
     _build_reply_relation_payload,
     _match_command_payload,
@@ -527,6 +529,12 @@ def _truncate_caption_text(text: str, max_chars: int = TELEGRAM_CAPTION_LIMIT) -
     return text[: max_chars - 3].rstrip() + "..."
 
 
+def _truncate_message_text(text: str, max_chars: int = TELEGRAM_TEXT_LIMIT) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
 def _build_detailed_media_error_message(exc: Exception, *, max_chars: int = TELEGRAM_TEXT_LIMIT) -> str:
     parts: list[str] = []
     seen: set[int] = set()
@@ -778,6 +786,67 @@ async def _handle_twitter_media_message(
     return True
 
 
+async def _handle_zhihu_link_message(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    video_url: str,
+    sender_display: str,
+    status_message,
+) -> bool:
+    """Handle Zhihu answer links. Returns True when request is fully handled."""
+    if not update.message or not update.effective_chat:
+        return False
+
+    zhihu_result = await asyncio.to_thread(parse_zhihu_link, video_url)
+    raw_message_text = (getattr(update.message, "text", None) or getattr(update.message, "caption", None) or video_url).strip()
+
+    question = str(zhihu_result.get("question") or "(无标题)")
+    author = str(zhihu_result.get("author") or "(匿名)")
+    author_url = str(zhihu_result.get("author_url") or "")
+    content = str(zhihu_result.get("content") or "（无内容）")
+    time_text = str(zhihu_result.get("time") or "未知")
+
+    sender_user = getattr(update, "effective_user", None)
+    reply_to_message = getattr(update.message, "reply_to_message", None)
+    try:
+        await add_message(
+            chat_id=update.effective_chat.id,
+            username=sender_display,
+            content=_build_zhihu_history_message(
+                raw_message_text=raw_message_text,
+                zhihu_url=video_url,
+                question=question,
+                author=author,
+                content=content,
+            ),
+            telegram_user_key=_telegram_user_key_from_user(sender_user),
+            telegram_message_id=getattr(update.message, "message_id", None),
+            reply_to_telegram_message_id=getattr(reply_to_message, "message_id", None) if reply_to_message else None,
+            reply_to_username=_display_name_from_user(getattr(reply_to_message, "from_user", None)) if reply_to_message else None,
+        )
+    except Exception:
+        logger.exception("Failed to persist parsed Zhihu content for %s", video_url)
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=_build_zhihu_reply_text(
+            zhihu_url=video_url,
+            question=question,
+            author=author,
+            author_url=author_url,
+            content=content,
+            sender_display=sender_display,
+            time_text=time_text,
+        ),
+        disable_web_page_preview=True,
+    )
+
+    await _delete_message_if_exists(status_message)
+    await _delete_message_if_exists(update.message)
+    return True
+
+
 async def _render_and_send_image_from_markdown(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -864,7 +933,7 @@ def _build_help_text() -> str:
         "/text2jpg ,,,...,,, - Convert plain text to Markdown, then render it\n"
         "Upload a .txt or .md file - Render it as an image\n\n"
         "Media handling:\n"
-        "Send a YouTube, Bilibili, or Twitter/X link - Download and return supported media\n\n"
+        "Send a YouTube, Bilibili, Twitter/X, or Zhihu link - Download media or parse supported text\n\n"
         "Group AI replies:\n"
         "In group chats, text/photo/sticker messages can trigger contextual replies. Direct triggers include replying to the bot, mentioning @BotUsername, or saying mioo / 小小宫.\n\n"
         "Extra commands:\n"
@@ -918,6 +987,66 @@ def _build_twitter_history_message(
     if normalized_tweet_text:
         lines.append(f"tweet_text: {normalized_tweet_text}")
     return "\n".join(lines)
+
+
+def _build_zhihu_history_message(
+    *,
+    raw_message_text: str,
+    zhihu_url: str,
+    question: str,
+    author: str,
+    content: str,
+    max_content_chars: int = 1500,
+) -> str:
+    user_comment = " ".join((raw_message_text or "").replace(zhihu_url, " ").split()).strip()
+    normalized_content = " ".join((content or "").split()).strip()
+    if len(normalized_content) > max_content_chars:
+        normalized_content = normalized_content[: max_content_chars - 1].rstrip() + "…"
+
+    lines = [
+        f"shared_zhihu_link: {zhihu_url}",
+        f"zhihu_question: {' '.join((question or '').split()).strip()}",
+        f"zhihu_author: {' '.join((author or '').split()).strip()}",
+    ]
+    if user_comment:
+        lines.append(f"user_comment: {user_comment}")
+    if normalized_content:
+        lines.append(f"zhihu_answer: {normalized_content}")
+    return "\n".join(lines)
+
+
+def _build_zhihu_reply_text(
+    *,
+    zhihu_url: str,
+    question: str,
+    author: str,
+    author_url: str,
+    content: str,
+    sender_display: str,
+    time_text: str,
+    max_content_chars: int = 3200,
+) -> str:
+    author_line = author or "(匿名)"
+    if author_url:
+        author_line = f"{author_line} (@{author_url})"
+
+    trimmed_content = (content or "（无内容）").strip() or "（无内容）"
+    if len(trimmed_content) > max_content_chars:
+        trimmed_content = trimmed_content[: max_content_chars - 1].rstrip() + "…"
+
+    message = "\n".join(
+        [
+            f"知乎问题：{question or '(无标题)'}",
+            f"回答者：{author_line}",
+            f"时间：{time_text or '未知'}",
+            "",
+            trimmed_content,
+            "",
+            f"原链接：{zhihu_url}",
+            f"Requested by: {sender_display}",
+        ]
+    )
+    return _truncate_message_text(message)
 
 
 # Start command handler
@@ -1210,6 +1339,16 @@ async def _process_video_link_request(
 ) -> None:
     cleanup_paths: set[str] = set()
     try:
+        if is_zhihu_answer_url(video_url):
+            await _handle_zhihu_link_message(
+                update=update,
+                context=context,
+                video_url=video_url,
+                sender_display=sender_display,
+                status_message=status_message,
+            )
+            return
+
         if is_twitter_status_url(video_url):
             await _handle_twitter_media_message(
                 update=update,
@@ -1260,9 +1399,9 @@ async def _process_video_link_request(
         for path in cleanup_paths:
             _remove_file_if_exists(path)
 
-# Handle text messages: download video links (YouTube/Bilibili/Twitter), else pass to group AI handler
+# Handle text messages: download media links or parse Zhihu links, else pass to group AI handler
 async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages: download supported video links, else pass to group AI handler."""
+    """Handle text messages: download supported media links or parse Zhihu links, else pass to group AI handler."""
     if not update.message or not update.message.text:
         return
 
@@ -1274,7 +1413,12 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
     video_url = _extract_video_url(message_text)
 
     if video_url:
-        status_message = await update.message.reply_text("Downloading your video, please wait a moment...")
+        status_text = (
+            "Parsing your Zhihu link, please wait a moment..."
+            if is_zhihu_answer_url(video_url)
+            else "Downloading your video, please wait a moment..."
+        )
+        status_message = await update.message.reply_text(status_text)
         _schedule_background_task(
             context,
             _process_video_link_request(

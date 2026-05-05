@@ -224,3 +224,5 @@ output/prescription*
 
 *.mp4.part
 output/*
+
+.DS_Store

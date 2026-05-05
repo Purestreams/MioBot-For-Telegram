@@ -226,6 +226,37 @@ def test_refresh_user_memory_parses_structured_facts(monkeypatch, tmp_path):
     assert facts[0].confidence == 0.84
 
 
+def test_parse_memory_refresh_payload_coerces_list_memory_text():
+    payload = user_memory._parse_memory_refresh_payload(
+        json.dumps(
+            {
+                "memory_text": [
+                    "prefers concise answers",
+                    "tracks iOS beta releases",
+                ],
+                "facts": [],
+                "archive_fact_ids": [],
+            }
+        ),
+        [],
+    )
+
+    assert payload.memory_text == "prefers concise answers\ntracks iOS beta releases"
+
+
+def test_parse_memory_refresh_payload_salvages_truncated_json_memory_text():
+    payload = user_memory._parse_memory_refresh_payload(
+        '{"memory_text": ["prefers concise answers", "tracks iOS beta releases"], "facts": [{"type": "preference"',
+        [],
+    )
+
+    assert payload.memory_text == "prefers concise answers\ntracks iOS beta releases"
+    assert [fact["fact_text"] for fact in payload.facts] == [
+        "prefers concise answers",
+        "tracks iOS beta releases",
+    ]
+
+
 def test_memory_refresh_prompt_keeps_metadata_after_source_context():
     messages = user_memory._build_memory_messages(
         display_name="Alice @alice",

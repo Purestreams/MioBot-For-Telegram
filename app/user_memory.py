@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import json
 import logging
@@ -193,6 +194,107 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     return None
 
 
+def _extract_first_json_array(text: str) -> Optional[str]:
+    in_string = False
+    escape = False
+    depth = 0
+    start = -1
+
+    for index, char in enumerate(text):
+        if start == -1:
+            if char == "[":
+                start = index
+                depth = 1
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _coerce_memory_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, dict):
+        return _coerce_memory_text(value.get("memory_text") or value.get("summary") or "")
+
+    if isinstance(value, (list, tuple)):
+        lines: list[str] = []
+        for item in value:
+            normalized = _coerce_memory_text(item)
+            if normalized:
+                lines.extend(normalized.splitlines())
+        return _normalize_memory_text("\n".join(lines))
+
+    text = _strip_markdown_code_fence(str(value or ""))
+    if not text:
+        return ""
+
+    if text[0] in "[{":
+        try:
+            return _coerce_memory_text(json.loads(text))
+        except json.JSONDecodeError:
+            pass
+
+        try:
+            literal = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            literal = None
+        if literal is not None:
+            normalized = _coerce_memory_text(literal)
+            if normalized:
+                return normalized
+
+        decoder = json.JSONDecoder()
+        for key in ('"memory_text"', '"summary"'):
+            start = text.find(key)
+            if start == -1:
+                continue
+
+            candidate = text[start + len(key):]
+            _sep, colon, candidate = candidate.partition(":")
+            if not colon:
+                continue
+            candidate = candidate.lstrip()
+
+            try:
+                parsed, _ = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                parsed = None
+            if parsed is not None:
+                normalized = _coerce_memory_text(parsed)
+                if normalized:
+                    return normalized
+
+            if candidate.startswith("["):
+                array_text = _extract_first_json_array(candidate)
+                if array_text:
+                    try:
+                        normalized = _coerce_memory_text(json.loads(array_text))
+                    except json.JSONDecodeError:
+                        normalized = ""
+                    if normalized:
+                        return normalized
+
+    return _normalize_memory_text(text)
+
+
 def _message_ids_from_rows(rows: list[MessageRow]) -> list[int]:
     return [row.id for row in rows]
 
@@ -253,14 +355,14 @@ def _parse_memory_refresh_payload(result_text: str, source_rows: list[MessageRow
     try:
         payload = json.loads(json_candidate)
     except json.JSONDecodeError:
-        memory_text = _normalize_memory_text(raw)
+        memory_text = _coerce_memory_text(raw)
         return MemoryRefreshPayload(memory_text, _fact_candidates_from_lines(memory_text, source_rows), [])
 
     if not isinstance(payload, dict):
-        memory_text = _normalize_memory_text(raw)
+        memory_text = _coerce_memory_text(raw)
         return MemoryRefreshPayload(memory_text, _fact_candidates_from_lines(memory_text, source_rows), [])
 
-    memory_text = _normalize_memory_text(str(payload.get("memory_text") or payload.get("summary") or ""))
+    memory_text = _coerce_memory_text(payload.get("memory_text") or payload.get("summary") or "")
     facts: list[dict[str, Any]] = []
     raw_facts = payload.get("facts")
     if isinstance(raw_facts, list):
@@ -394,14 +496,15 @@ async def get_personal_memory_context(
 
     current = await get_user_memory(telegram_user_key)
     facts = await get_user_memory_facts(telegram_user_key, limit=max_facts, min_confidence=0.2)
+    normalized_memory_text = _coerce_memory_text(current.memory_text) if current else ""
 
     sections: list[str] = []
     if facts:
         sections.append("structured_facts:")
         sections.extend(f"- [{fact.fact_type}] {fact.fact_text}" for fact in facts)
-    if current and current.memory_text.strip():
+    if normalized_memory_text:
         sections.append("summary:")
-        sections.extend(current.memory_text.strip().splitlines())
+        sections.extend(normalized_memory_text.splitlines())
 
     if not sections:
         return None

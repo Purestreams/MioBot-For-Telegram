@@ -331,11 +331,10 @@ def test_handle_zhihu_link_message_sends_text_and_persists_content(monkeypatch):
         {
             "chat_id": 1,
             "text": (
-                "知乎问题：00后是否会更加认可自由主义？\n"
-                "回答者：Allen (@chen-shi-xuan-44)\n"
-                "时间：2026-04-28 05:07\n\n"
-                "目前的趋势是00后要用一生的代价来认可自由主义。\n\n"
-                "原链接：https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097\n"
+                "00后是否会更加认可自由主义？\n\n"
+                "目前的趋势是00后要用一生的代价来认可自由主义。\n"
+                "-- Allen (@chen-shi-xuan-44) · 2026-04-28 05:07\n\n"
+                "https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097\n"
                 "Requested by: Tester @tester"
             ),
             "disable_web_page_preview": True,

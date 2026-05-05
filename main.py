@@ -1030,19 +1030,19 @@ def _build_zhihu_reply_text(
     if author_url:
         author_line = f"{author_line} (@{author_url})"
 
+    question_line = (question or "(无标题)").strip() or "(无标题)"
     trimmed_content = (content or "（无内容）").strip() or "（无内容）"
     if len(trimmed_content) > max_content_chars:
         trimmed_content = trimmed_content[: max_content_chars - 1].rstrip() + "…"
 
     message = "\n".join(
         [
-            f"知乎问题：{question or '(无标题)'}",
-            f"回答者：{author_line}",
-            f"时间：{time_text or '未知'}",
+            question_line,
             "",
             trimmed_content,
+            f"-- {author_line} · {time_text or '未知'}",
             "",
-            f"原链接：{zhihu_url}",
+            zhihu_url,
             f"Requested by: {sender_display}",
         ]
     )

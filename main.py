@@ -40,6 +40,7 @@ from app.reply2message import generate_group_reply, should_activate_reply
 from app.rag_embeddings import ensure_fastembed_ready
 from app.user_memory import (
     accept_user_memory_candidate,
+    audit_user_memory_texts,
     extract_user_memory_candidate_from_message,
     get_personal_memory_context,
     refresh_user_memory_if_due,
@@ -249,6 +250,7 @@ async def handle_memory_admin_help(update: Update, context: ContextTypes.DEFAULT
         "Memory admin commands:\n"
         "/memory_help - show this help\n"
         "/memories - list users with message history or memory\n"
+        "/memory_audit [limit] - inspect malformed summaries (0 = full scan)\n"
         "/memory <telegram_user_id|tg_user:key> - view one user's memory\n"
         "/memory_search <keyword> - search summaries and facts\n"
         "/memory_refresh <telegram_user_id|tg_user:key> - regenerate one user's memory from history\n"
@@ -286,6 +288,36 @@ async def handle_memory_admin_list(update: Update, context: ContextTypes.DEFAULT
     await message.reply_text(_truncate_admin_reply("\n".join(lines)))
 
 
+async def handle_memory_admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    limit = _parse_non_negative_int(args[0]) if args else 200
+    if args and limit is None:
+        await message.reply_text("Usage: /memory_audit [non_negative_limit], use 0 for full scan")
+        return
+
+    audit_limit = None if limit == 0 else limit
+    scope_text = "all rows" if audit_limit is None else f"the latest {audit_limit} rows"
+    rows = await audit_user_memory_texts(limit=audit_limit)
+    if not rows:
+        await message.reply_text(f"Memory audit found no malformed summaries in {scope_text}.")
+        return
+
+    lines = [f"Memory audit found {len(rows)} malformed summaries in {scope_text}:"]
+    for row in rows:
+        display_name = row.latest_display_name or row.telegram_user_key
+        lines.append(
+            f"- {display_name} | {row.telegram_user_key} | issues={','.join(row.issue_types)} | "
+            f"len={row.stored_length}->{row.normalized_length} | {_compact_admin_text(row.preview, max_chars=180)}"
+        )
+    await message.reply_text(_truncate_admin_reply("\n".join(lines)))
+
+
 async def handle_memory_admin_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _ensure_admin_private_chat(update):
         return
@@ -319,11 +351,7 @@ async def handle_memory_admin_view(update: Update, context: ContextTypes.DEFAULT
     ]
     if facts:
         for fact in facts:
-            evidence = ",".join(str(message_id) for message_id in fact.evidence_message_ids) or "none"
-            lines.append(
-                f"- #{fact.id} [{fact.fact_type}] {fact.fact_text} "
-                f"(confidence={fact.confidence:.2f}, evidence={evidence})"
-            )
+            lines.append(f"- #{fact.id} [{fact.fact_type}] {fact.fact_text} (confidence={fact.confidence:.2f})")
     else:
         lines.append("(empty)")
     await message.reply_text(_truncate_admin_reply("\n".join(lines)))
@@ -423,6 +451,14 @@ def _parse_positive_int(value: str) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _parse_non_negative_int(value: str) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 async def handle_memory_admin_candidates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -942,6 +978,7 @@ def _build_help_text() -> str:
         "Private admin memory tools:\n"
         "/memory_help - Show memory admin commands\n"
         "/memories - List users with memory/history\n"
+        "/memory_audit [limit] - Inspect malformed memory summaries (0 = full scan)\n"
         "/memory <user> - View one user's memory\n"
         "/memory_search <keyword> - Search summaries and facts\n"
         "/memory_refresh <user> - Regenerate memory from history\n"
@@ -1599,6 +1636,7 @@ def register_handlers(application: Application) -> None:
     # Private memory administration commands
     application.add_handler(CommandHandler("memory_help", handle_memory_admin_help, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memories", handle_memory_admin_list, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("memory_audit", handle_memory_admin_audit, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memory", handle_memory_admin_view, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memory_search", handle_memory_admin_search, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memory_refresh", handle_memory_admin_refresh, filters=filters.ChatType.PRIVATE))

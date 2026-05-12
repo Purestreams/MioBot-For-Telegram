@@ -75,6 +75,63 @@ def test_memory_admin_list_formats_overviews(monkeypatch):
     assert "facts=2" in update.message.replies[0]
 
 
+def test_memory_admin_audit_reports_malformed_summaries(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update()
+
+    async def fake_audit_user_memory_texts(*, limit=200):
+        assert limit == 50
+        return [
+            SimpleNamespace(
+                telegram_user_key="tg_user:1",
+                latest_display_name="Alice @alice",
+                stored_length=220,
+                normalized_length=88,
+                issue_types=["json-blob", "normalizes-differently"],
+                preview='{"memory_text": ["Prefers concise answers"]',
+            )
+        ]
+
+    monkeypatch.setattr(main, "audit_user_memory_texts", fake_audit_user_memory_texts)
+
+    asyncio.run(main.handle_memory_admin_audit(update, _context(["50"])))
+
+    reply = update.message.replies[0]
+    assert "Alice @alice" in reply
+    assert "issues=json-blob,normalizes-differently" in reply
+    assert "len=220->88" in reply
+
+
+def test_memory_admin_audit_reports_clean_state(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update()
+
+    async def fake_audit_user_memory_texts(*, limit=200):
+        assert limit == 200
+        return []
+
+    monkeypatch.setattr(main, "audit_user_memory_texts", fake_audit_user_memory_texts)
+
+    asyncio.run(main.handle_memory_admin_audit(update, _context()))
+
+    assert update.message.replies == ["Memory audit found no malformed summaries in the latest 200 rows."]
+
+
+def test_memory_admin_audit_zero_runs_full_scan(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update()
+
+    async def fake_audit_user_memory_texts(*, limit=200):
+        assert limit is None
+        return []
+
+    monkeypatch.setattr(main, "audit_user_memory_texts", fake_audit_user_memory_texts)
+
+    asyncio.run(main.handle_memory_admin_audit(update, _context(["0"])))
+
+    assert update.message.replies == ["Memory audit found no malformed summaries in all rows."]
+
+
 def test_memory_admin_view_shows_summary_and_facts(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
     update = _update()
@@ -111,7 +168,8 @@ def test_memory_admin_view_shows_summary_and_facts(monkeypatch):
     assert "Memory for Alice @alice" in reply
     assert "key: tg_user:1" in reply
     assert "[preference] Prefers concise answers" in reply
-    assert "evidence=11,12" in reply
+    assert "confidence=0.90" in reply
+    assert "evidence=" not in reply
 
 
 def test_memory_admin_search_formats_matches(monkeypatch):

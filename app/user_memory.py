@@ -20,6 +20,7 @@ from app.database import (
     get_user_memory_candidate,
     get_user_memory_facts,
     get_user_messages_for_memory,
+    list_user_memory_overviews,
     list_user_memory_candidates,
     mark_user_memory_candidates_status,
     update_user_memory_candidate_status,
@@ -40,6 +41,16 @@ class MemoryRefreshPayload:
     memory_text: str
     facts: list[dict[str, Any]]
     archive_fact_ids: list[int]
+
+
+@dataclass(frozen=True)
+class MemoryTextAuditRow:
+    telegram_user_key: str
+    latest_display_name: str
+    stored_length: int
+    normalized_length: int
+    issue_types: list[str]
+    preview: str
 
 
 def _personal_memory_context_max_chars() -> int:
@@ -295,6 +306,24 @@ def _coerce_memory_text(value: Any) -> str:
     return _normalize_memory_text(text)
 
 
+def _memory_text_issue_types(raw_text: str) -> list[str]:
+    stripped = (raw_text or "").lstrip()
+    issues: list[str] = []
+    if not stripped:
+        return issues
+    if stripped.startswith("["):
+        issues.append("list-literal")
+    if stripped.startswith("{"):
+        issues.append("json-blob")
+    if stripped.startswith("```"):
+        issues.append("code-fence")
+
+    normalized = _coerce_memory_text(raw_text)
+    if normalized != (raw_text or "").strip():
+        issues.append("normalizes-differently")
+    return issues
+
+
 def _message_ids_from_rows(rows: list[MessageRow]) -> list[int]:
     return [row.id for row in rows]
 
@@ -510,6 +539,30 @@ async def get_personal_memory_context(
         return None
 
     return _trim_text("\n".join(sections), max_chars=max_chars or _personal_memory_context_max_chars()) or None
+
+
+async def audit_user_memory_texts(*, limit: Optional[int] = 200) -> list[MemoryTextAuditRow]:
+    rows = await list_user_memory_overviews(limit=limit)
+    findings: list[MemoryTextAuditRow] = []
+    for row in rows:
+        raw_text = row.memory_text or ""
+        if not raw_text.strip():
+            continue
+        issues = _memory_text_issue_types(raw_text)
+        if not issues:
+            continue
+        normalized = _coerce_memory_text(raw_text)
+        findings.append(
+            MemoryTextAuditRow(
+                telegram_user_key=row.telegram_user_key,
+                latest_display_name=row.latest_display_name,
+                stored_length=len(raw_text),
+                normalized_length=len(normalized),
+                issue_types=issues,
+                preview=raw_text.strip().replace("\n", " | "),
+            )
+        )
+    return findings
 
 
 async def refresh_user_memory_if_due(

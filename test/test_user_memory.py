@@ -257,6 +257,29 @@ def test_parse_memory_refresh_payload_salvages_truncated_json_memory_text():
     ]
 
 
+def test_audit_user_memory_texts_flags_malformed_summaries(monkeypatch, tmp_path):
+    db_path = tmp_path / "user_memory_audit.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def _run():
+        await database.upsert_user_memory(
+            "tg_user:111",
+            latest_display_name="Alice @alice",
+            memory_text='{"memory_text": ["prefers concise answers"]',
+            last_refreshed_date="2026-04-29",
+        )
+        return await user_memory.audit_user_memory_texts(limit=10)
+
+    findings = asyncio.run(_run())
+
+    assert len(findings) == 1
+    assert findings[0].telegram_user_key == "tg_user:111"
+    assert findings[0].issue_types == ["json-blob", "normalizes-differently"]
+    assert findings[0].normalized_length < findings[0].stored_length
+
+
 def test_memory_refresh_prompt_keeps_metadata_after_source_context():
     messages = user_memory._build_memory_messages(
         display_name="Alice @alice",

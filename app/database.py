@@ -1200,13 +1200,19 @@ async def mark_user_memory_candidates_status(
         return cursor.rowcount
 
 
-async def list_user_memory_overviews(*, limit: int = 50) -> list[UserMemoryOverviewRow]:
+async def list_user_memory_overviews(*, limit: Optional[int] = 50) -> list[UserMemoryOverviewRow]:
     db_file = _db_file_path()
     _ensure_db_parent_dir(db_file)
 
+    limit_clause = ""
+    params: tuple[Any, ...] = ()
+    if limit is not None and limit > 0:
+        limit_clause = "\n            LIMIT ?"
+        params = (limit,)
+
     async with aiosqlite.connect(db_file) as db:
         cursor = await db.execute(
-            '''
+            f'''
             WITH memory_keys AS (
                 SELECT telegram_user_key FROM user_memories
                 UNION
@@ -1247,10 +1253,9 @@ async def list_user_memory_overviews(*, limit: int = 50) -> list[UserMemoryOverv
             LEFT JOIN user_memories um ON um.telegram_user_key = k.telegram_user_key
             LEFT JOIN fact_counts fc ON fc.telegram_user_key = k.telegram_user_key
             LEFT JOIN latest_messages lm ON lm.telegram_user_key = k.telegram_user_key
-            ORDER BY COALESCE(um.updated_at, lm.latest_message_at, '') DESC, k.telegram_user_key ASC
-            LIMIT ?
+            ORDER BY COALESCE(um.updated_at, lm.latest_message_at, '') DESC, k.telegram_user_key ASC{limit_clause}
             ''',
-            (limit,),
+            params,
         )
         rows = await cursor.fetchall()
 

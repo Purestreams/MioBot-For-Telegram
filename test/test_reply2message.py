@@ -123,6 +123,20 @@ def test_should_activate_reply_parses_json_with_prefixed_text(monkeypatch, tmp_p
     assert result is True
 
 
+def test_should_activate_reply_rejects_string_boolean_values(monkeypatch, tmp_path):
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("x\n", encoding="utf-8")
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        return _Completion('{"should_reply": "true", "reason": "question"}')
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
+
+    result = asyncio.run(reply2message.should_activate_reply(["u: hi"]))
+    assert result is False
+
+
 def test_should_reply_and_generate_stops_when_probe_says_no(monkeypatch):
     calls = {"probe": 0, "generate": 0}
 

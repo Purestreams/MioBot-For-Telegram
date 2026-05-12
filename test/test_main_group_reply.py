@@ -283,6 +283,82 @@ def test_group_reply_pipeline_uses_cached_memory_and_schedules_refresh(monkeypat
     assert update.message.replies == ["来了"]
 
 
+def test_group_reply_pipeline_skips_bot_senders(monkeypatch):
+    update = _FakeUpdate()
+    bot_user = _FakeUser(name="RelayBot", is_bot=True, username="relay_bot", user_id=4242)
+    update.message.from_user = bot_user
+    update.effective_user = bot_user
+
+    async def fail_add_message(*args, **kwargs):
+        raise AssertionError("bot sender should be ignored before writing history")
+
+    async def fail_get_personal_memory_context(*args, **kwargs):
+        raise AssertionError("bot sender should not load personal memory")
+
+    async def fail_should_activate_reply(*args, **kwargs):
+        raise AssertionError("bot sender should not trigger the reply probe")
+
+    async def fail_generate_group_reply(*args, **kwargs):
+        raise AssertionError("bot sender should never generate a reply")
+
+    monkeypatch.setattr(main, "add_message", fail_add_message)
+    monkeypatch.setattr(main, "get_personal_memory_context", fail_get_personal_memory_context)
+    monkeypatch.setattr(main, "should_activate_reply", fail_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fail_generate_group_reply)
+
+    update_any: Any = update
+    asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "status update"))
+
+    assert update.message.replies == []
+
+
+def test_group_reply_pipeline_reply_to_bot_is_case_insensitive(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="what do you think", message_id=91)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
+    update.message.reply_to_message = _FakeMessage(text="prior bot reply", message_id=90)
+    update.message.reply_to_message.from_user = _FakeUser(name="Mioo", is_bot=True, username="MioBot", user_id=777)
+
+    calls = {"probe": 0, "generate": 0}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        return None
+
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+        return ["[t] user: hello"], ["[t] mio: prior bot reply"]
+
+    async def fail_should_activate_reply(**kwargs):
+        calls["probe"] += 1
+        raise AssertionError("reply-to-bot should bypass the reply probe")
+
+    async def fake_generate_group_reply(**kwargs):
+        calls["generate"] += 1
+        assert kwargs["is_reply_to_bot"] is True
+        assert any("trigger_type: reply_to_bot" in line for line in (kwargs.get("runtime_state") or []))
+        return "在"
+
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
+        return None
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "TELEGRAM_BOT_USERNAME", "miobot")
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
+    monkeypatch.setattr(main, "should_activate_reply", fail_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
+
+    update_any: Any = update
+    asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "what do you think"))
+
+    assert calls == {"probe": 0, "generate": 1}
+    assert update.message.replies == ["在"]
+
+
 def test_handle_sticker_for_group_ai_reply_uses_cached_description(monkeypatch):
     update = _FakeUpdate()
     update.message.sticker = SimpleNamespace(

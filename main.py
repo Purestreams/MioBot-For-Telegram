@@ -1177,6 +1177,11 @@ async def handle_group_ai_reply(update: Update, context: ContextTypes.DEFAULT_TY
     await _handle_group_ai_reply_pipeline(update, update.message.text, context=context)
 
 
+def _resolve_group_ai_sender(update: Update):
+    message = getattr(update, "message", None)
+    return getattr(message, "from_user", None) or getattr(update, "effective_user", None)
+
+
 async def _handle_group_ai_reply_pipeline(
     update: Update,
     message_text: str,
@@ -1191,9 +1196,14 @@ async def _handle_group_ai_reply_pipeline(
     if not update.effective_chat or not update.effective_user:
         return
 
+    sender_user = _resolve_group_ai_sender(update)
+    if sender_user and getattr(sender_user, "is_bot", False):
+        logger.info("Skipping group AI reply pipeline for bot sender: %s", getattr(sender_user, "username", None) or getattr(sender_user, "id", None))
+        return
+
     chat_id = update.effective_chat.id
-    sender_display = _display_name_from_user(update.effective_user)
-    telegram_user_key = _telegram_user_key_from_user(update.effective_user)
+    sender_display = _display_name_from_user(sender_user)
+    telegram_user_key = _telegram_user_key_from_user(sender_user)
     stored_message_text, relation_context = _build_reply_relation_payload(update, message_text)
     merged_additional_context = list(additional_context or []) + relation_context
     replied_message = update.message.reply_to_message
@@ -1229,7 +1239,8 @@ async def _handle_group_ai_reply_pipeline(
         latest_display_name=sender_display,
     )
 
-    is_reply_to_bot = _is_reply_to_this_bot(update, TELEGRAM_BOT_USERNAME)
+    bot_user_id = getattr(getattr(context, "bot", None), "id", None)
+    is_reply_to_bot = _is_reply_to_this_bot(update, TELEGRAM_BOT_USERNAME, bot_user_id=bot_user_id)
     trigger_type = "reply_to_bot" if is_reply_to_bot else _classify_group_reply_trigger(raw_user_text, TELEGRAM_BOT_USERNAME)
     is_mentioned = trigger_type in {"username_mention", "alias_mention"}
     is_directly_addressed = is_reply_to_bot or is_mentioned
@@ -1480,6 +1491,8 @@ async def handle_photo_for_group_ai_reply(update: Update, context: ContextTypes.
         return
     if not _is_group_chat(update):
         return
+    if getattr(_resolve_group_ai_sender(update), "is_bot", False):
+        return
 
     photo = update.message.photo[-1]
     photo_path = _build_output_path("photo", update.message.message_id, extension="jpg")
@@ -1520,6 +1533,8 @@ async def handle_sticker_for_group_ai_reply(update: Update, context: ContextType
     if not update.message or not update.message.sticker:
         return
     if not _is_group_chat(update):
+        return
+    if getattr(_resolve_group_ai_sender(update), "is_bot", False):
         return
 
     sticker = update.message.sticker

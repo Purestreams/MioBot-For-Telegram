@@ -235,6 +235,12 @@ def _normalize_reply_content(result_text: str) -> Optional[str]:
     return raw or None
 
 
+def _parse_json_boolean(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
 async def should_activate_reply(
     message_history: list[str],
     *,
@@ -276,8 +282,13 @@ async def should_activate_reply(
             logger.warning("Model returned invalid activation payload. Raw prefix: %r", (completion.content or "")[:200])
             return False
 
+        should_reply = _parse_json_boolean(result_json.get("should_reply"))
+        if should_reply is None:
+            logger.warning("Model returned non-boolean should_reply field: %r", result_json.get("should_reply"))
+            return False
+
         logger.info("Reply activation probe: %s", result_json)
-        return bool(result_json.get("should_reply"))
+        return should_reply
     except Exception as exc:
         logger.exception("An error occurred in should_activate_reply: %s", exc)
         return False

@@ -98,17 +98,25 @@ def is_zhihu_answer_url(url: str) -> bool:
     return bool(url and re.search(ZHIHU_URL_REGEX, url))
 
 
-def _is_reply_to_this_bot(update, bot_username: Optional[str]) -> bool:
+def _normalize_telegram_username(value: Optional[str]) -> str:
+    return str(value or "").strip().lstrip("@").lower()
+
+
+def _is_reply_to_this_bot(update, bot_username: Optional[str], bot_user_id: Optional[int] = None) -> bool:
     message = getattr(update, "message", None)
     if not message or not message.reply_to_message:
         return False
 
     from_user = message.reply_to_message.from_user
-    return bool(
-        from_user
-        and from_user.is_bot
-        and from_user.username == bot_username
-    )
+    if not (from_user and from_user.is_bot):
+        return False
+
+    if bot_user_id is not None and getattr(from_user, "id", None) == bot_user_id:
+        return True
+
+    normalized_from_username = _normalize_telegram_username(getattr(from_user, "username", None))
+    normalized_bot_username = _normalize_telegram_username(bot_username)
+    return bool(normalized_bot_username and normalized_from_username == normalized_bot_username)
 
 
 def _classify_group_reply_trigger(message_text: Optional[str], bot_username: Optional[str]) -> str:

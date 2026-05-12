@@ -69,6 +69,30 @@ def test_classify_group_reply_trigger_ignores_embedded_alias_text():
     assert trigger == "ambient"
 
 
+def test_is_reply_to_this_bot_matches_username_case_insensitively():
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            reply_to_message=SimpleNamespace(
+                from_user=SimpleNamespace(is_bot=True, username="MioBot", id=777)
+            )
+        )
+    )
+
+    assert main._is_reply_to_this_bot(update, "miobot") is True
+
+
+def test_is_reply_to_this_bot_requires_known_bot_identity():
+    update = SimpleNamespace(
+        message=SimpleNamespace(
+            reply_to_message=SimpleNamespace(
+                from_user=SimpleNamespace(is_bot=True, username=None, id=777)
+            )
+        )
+    )
+
+    assert main._is_reply_to_this_bot(update, None) is False
+
+
 def test_telegram_user_key_from_user_uses_stable_telegram_user_id():
     user = SimpleNamespace(id=123456789, username="alice")
     assert main._telegram_user_key_from_user(user) == "tg_user:123456789"

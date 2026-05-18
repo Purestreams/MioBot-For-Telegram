@@ -43,10 +43,12 @@ def _is_bilibili_url(url: str) -> bool:
 
 
 def _extract_bilibili_canonical_url(url: str) -> Optional[str]:
-    match = re.search(r'https?://www\.bilibili\.com/video/[^/?]+', url or '')
+    # Always normalize to a tracking-free canonical format.
+    match = re.search(r'https?://(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})', url or '')
     if not match:
         return None
-    return match.group(0)
+    bvid = match.group(1)
+    return f'https://www.bilibili.com/video/{bvid}/'
 
 
 def _build_ydl_base_opts(url: str) -> dict:
@@ -393,22 +395,39 @@ async def get_bilibili_permanent_url(url: str) -> Optional[str]:
             headers=BILIBILI_HTTP_HEADERS,
         ) as client:
             response = await client.head(url)
-            response.raise_for_status()
+            status_code = int(getattr(response, 'status_code', 200) or 0)
+            if status_code >= 400:
+                logger.warning(
+                    "Failed to resolve Bilibili URL %s: HTTP %s",
+                    url,
+                    status_code,
+                )
+                return None
+
+            response_headers = getattr(response, 'headers', {}) or {}
+            location = response_headers.get('location', '')
+            resolved_url = str(response.url)
+            if location:
+                resolved_url = urljoin(str(response.url), location)
+
+            canonical_url = _extract_bilibili_canonical_url(resolved_url)
+            if canonical_url:
+                return canonical_url
+
+            # Some b23.tv links do not expose a canonical location in HEAD.
+            # Fallback to a normal GET with redirects enabled to read final URL.
+            if _is_bilibili_url(url):
+                follow_response = await client.get(url, follow_redirects=True)
+                follow_status = int(getattr(follow_response, 'status_code', 200) or 0)
+                if follow_status < 400:
+                    canonical_url = _extract_bilibili_canonical_url(str(follow_response.url))
+                    if canonical_url:
+                        return canonical_url
     except Exception as e:
         logger.warning("Failed to resolve Bilibili URL %s: %s", url, e)
         return None
 
-    response_headers = getattr(response, 'headers', {}) or {}
-    location = response_headers.get('location', '')
-    resolved_url = str(response.url)
-    if location:
-        resolved_url = urljoin(str(response.url), location)
-
-    canonical_url = _extract_bilibili_canonical_url(resolved_url)
-    if canonical_url:
-        return canonical_url
-
-    logger.warning("Could not extract Bilibili permanent URL from: %s", resolved_url)
+    logger.warning("Could not extract Bilibili permanent URL from: %s", url)
     return None
 
 

@@ -913,6 +913,87 @@ def test_handle_text_for_youtube_or_group_sends_detailed_error(monkeypatch):
     assert message.status_messages[0].deleted is True
 
 
+def test_process_video_link_request_sends_video_with_preview(monkeypatch, tmp_path):
+    class _FakeStatusMessage:
+        def __init__(self):
+            self.deleted = False
+            self.edits = []
+
+        async def edit_text(self, text):
+            self.edits.append(text)
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeMessage:
+        def __init__(self):
+            self.message_id = 999
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+        async def reply_text(self, text, **kwargs):
+            raise AssertionError(f"unexpected error reply: {text}")
+
+    class _FakeBot:
+        def __init__(self):
+            self.video_calls = []
+            self.document_calls = []
+
+        async def send_video(self, **kwargs):
+            self.video_calls.append(kwargs)
+
+        async def send_document(self, **kwargs):
+            self.document_calls.append(kwargs)
+
+    message = _FakeMessage()
+    status = _FakeStatusMessage()
+    bot = _FakeBot()
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1),
+    )
+    context = SimpleNamespace(bot=bot)
+
+    created_path = tmp_path / "video.mp4"
+    created_path.write_bytes(b"fake-video")
+
+    async def _fake_download_video_to_file(url, output_path):
+        return "video title"
+
+    async def _fake_compress_video_if_needed(_path):
+        return str(created_path)
+
+    async def _fake_resolve_caption_url(_url):
+        return "https://example.com/original"
+
+    monkeypatch.setattr(main, "is_zhihu_answer_url", lambda url: False)
+    monkeypatch.setattr(main, "is_twitter_status_url", lambda url: False)
+    monkeypatch.setattr(main, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "download_video_to_file", _fake_download_video_to_file)
+    monkeypatch.setattr(main, "compress_video_if_needed", _fake_compress_video_if_needed)
+    monkeypatch.setattr(main, "resolve_caption_url", _fake_resolve_caption_url)
+
+    asyncio.run(
+        main._process_video_link_request(
+            update=update,
+            context=context,
+            video_url="https://b23.tv/xyz",
+            sender_display="Tester @tester",
+            status_message=status,
+        )
+    )
+
+    assert len(bot.video_calls) == 1
+    assert bot.document_calls == []
+    assert bot.video_calls[0]["supports_streaming"] is True
+    assert bot.video_calls[0]["chat_id"] == 1
+    assert bot.video_calls[0]["reply_to_message_id"] == 999
+    assert status.deleted is True
+    assert message.deleted is True
+
+
 def test_handle_text_for_youtube_or_group_schedules_video_processing_in_background(monkeypatch):
     class _FakeStatusMessage:
         def __init__(self, text):

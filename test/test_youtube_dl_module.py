@@ -66,6 +66,50 @@ def test_download_video_to_file_returns_fallback_title(monkeypatch):
     assert called == {"url": "https://example.com/v", "output_path": "output/test.mp4"}
 
 
+def test_resolve_download_candidates_prefers_canonical_bilibili(monkeypatch):
+    async def _fake_get_bilibili_permanent_url(_url):
+        return "https://www.bilibili.com/video/BV1abc1234"
+
+    monkeypatch.setattr(youtube_dl, "get_bilibili_permanent_url", _fake_get_bilibili_permanent_url)
+
+    candidates = asyncio.run(youtube_dl._resolve_download_candidates("https://b23.tv/abc123"))
+
+    assert candidates == [
+        "https://www.bilibili.com/video/BV1abc1234",
+        "https://b23.tv/abc123",
+    ]
+
+
+def test_download_video_to_file_retries_next_candidate_when_first_fails(monkeypatch, tmp_path: Path):
+    attempted = []
+
+    async def _fake_get_video_title(_url):
+        return "Title"
+
+    async def _fake_resolve_download_candidates(_url):
+        return ["https://www.bilibili.com/video/BV1abc1234", "https://b23.tv/abc123"]
+
+    async def _fake_download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
+        attempted.append((url, output_path))
+        if len(attempted) == 1:
+            # Create a partial file to make sure cleanup runs before retry.
+            with open(output_path, "wb") as handle:
+                handle.write(b"partial")
+            raise RuntimeError("first candidate failed")
+
+    output_path = tmp_path / "video.mp4"
+
+    monkeypatch.setattr(youtube_dl, "get_video_title", _fake_get_video_title)
+    monkeypatch.setattr(youtube_dl, "_resolve_download_candidates", _fake_resolve_download_candidates)
+    monkeypatch.setattr(youtube_dl, "download_video_720p_h264", _fake_download_video_720p_h264)
+
+    title = asyncio.run(youtube_dl.download_video_to_file("https://b23.tv/abc123", str(output_path)))
+
+    assert title == "Title"
+    assert attempted[0][0] == "https://www.bilibili.com/video/BV1abc1234"
+    assert attempted[1][0] == "https://b23.tv/abc123"
+
+
 def test_normalize_output_path_truncates_overlong_filename(tmp_path: Path):
     long_name = "a" * 400 + ".mp4"
 

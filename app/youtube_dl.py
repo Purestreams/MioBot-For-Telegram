@@ -55,8 +55,14 @@ def _build_ydl_base_opts(url: str) -> dict:
         'no_warnings': True,
         'noprogress': True,
         'noplaylist': True,
-        'retries': 3,
-        'fragment_retries': 3,
+        # Network sources can be flaky; keep retries higher than defaults.
+        'retries': 8,
+        'fragment_retries': 8,
+        'extractor_retries': 3,
+        'file_access_retries': 3,
+        'continuedl': True,
+        'concurrent_fragment_downloads': 1,
+        'http_chunk_size': 10 * 1024 * 1024,
         'socket_timeout': 30,
         'http_headers': dict(DEFAULT_HTTP_HEADERS),
     }
@@ -147,9 +153,13 @@ async def download_video_720p_h264(url, output_path='output/%(title)s.%(ext)s'):
             'preferedformat': 'mp4',
         }],
         'postprocessor_args': [
-            '-c:v', 'copy',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
             '-b:a', '128k',
+            '-movflags', '+faststart',
         ],
     }
 
@@ -306,11 +316,58 @@ async def resolve_caption_url(video_url: str) -> str:
     return video_url
 
 
+async def _resolve_download_candidates(video_url: str) -> list[str]:
+    candidates: list[str] = []
+    if _is_bilibili_url(video_url):
+        canonical_url = await get_bilibili_permanent_url(video_url)
+        if canonical_url:
+            candidates.append(canonical_url)
+    if video_url not in candidates:
+        candidates.append(video_url)
+    return candidates
+
+
+def _remove_partial_download_artifacts(output_file_path: str) -> None:
+    if not output_file_path:
+        return
+    for suffix in ('', '.part', '.ytdl'):
+        path = f'{output_file_path}{suffix}'
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            logger.warning("Failed to remove partial download artifact: %s", path)
+
+
 async def download_video_to_file(video_url: str, output_file_path: str) -> str:
     """Download supported video media and return a display title."""
-    video_title = await get_video_title(video_url)
-    await download_video_720p_h264(video_url, output_path=_normalize_output_path(output_file_path))
-    return video_title or "Video"
+    normalized_output_path = _normalize_output_path(output_file_path)
+    candidate_urls = await _resolve_download_candidates(video_url)
+    video_title: Optional[str] = None
+    last_error: Optional[Exception] = None
+
+    for index, candidate_url in enumerate(candidate_urls, start=1):
+        if video_title is None:
+            video_title = await get_video_title(candidate_url)
+
+        try:
+            await download_video_720p_h264(candidate_url, output_path=normalized_output_path)
+            return video_title or "Video"
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Download attempt %d/%d failed for %s via %s: %s",
+                index,
+                len(candidate_urls),
+                video_url,
+                candidate_url,
+                exc,
+            )
+            _remove_partial_download_artifacts(normalized_output_path)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Download failed without an explicit error.")
     
 async def get_bilibili_permanent_url(url: str) -> Optional[str]:
     """

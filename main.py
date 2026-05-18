@@ -1427,12 +1427,13 @@ async def _process_video_link_request(
         )
 
         with open(file_to_send_path, 'rb') as video:
-            await context.bot.send_document(
+            await context.bot.send_video(
                 chat_id=update.effective_chat.id,
-                document=video,
+                video=video,
                 reply_to_message_id=update.message.message_id,
                 caption=video_caption,
                 parse_mode=ParseMode.HTML,
+                supports_streaming=True,
             )
 
         await _delete_message_if_exists(status_message)

@@ -16,7 +16,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 
 # private imports
-from app.runtime_config import bootstrap_runtime_environment, get_ark_chat_completions_endpoint, get_runtime_value
+from app.runtime_config import (
+    bootstrap_runtime_environment,
+    get_ark_chat_completions_endpoint,
+    get_runtime_bool,
+    get_runtime_int,
+    get_runtime_value,
+)
 
 # Load config/runtime env before importing modules that read env at import time.
 bootstrap_runtime_environment()
@@ -36,7 +42,7 @@ from app.youtube_dl import (
     compress_video_if_needed,
     resolve_caption_url,
 )
-from app.reply2message import generate_group_reply, should_activate_reply
+from app.reply2message import choose_reply_sticker, generate_group_reply, should_activate_reply
 from app.rag_embeddings import ensure_fastembed_ready
 from app.user_memory import (
     accept_user_memory_candidate,
@@ -49,6 +55,7 @@ from app.user_memory import (
 from app.database import (
     add_message,
     archive_user_memory_fact,
+    find_sticker_reply_candidates,
     get_latest_display_name_for_user,
     get_prompt_context_parts,
     get_sticker_text,
@@ -59,12 +66,13 @@ from app.database import (
     list_user_memory_overviews,
     log_embedding_health_report,
     reindex_message_embeddings,
+    record_sticker_reply_usage,
     search_user_memories,
     update_user_memory_fact,
     upsert_user_memory,
     upsert_sticker_text,
 )
-from app.image2text import image_to_text, sticker_to_text
+from app.image2text import StickerUnderstanding, image_to_text, sticker_to_understanding
 
 from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
@@ -621,6 +629,138 @@ def _build_group_reply_runtime_state(
     ]
 
 
+def _sticker_reply_enabled() -> bool:
+    return get_runtime_bool("STICKER_REPLY_ENABLED", True)
+
+
+def _sticker_reply_candidate_limit() -> int:
+    return max(0, get_runtime_int("STICKER_REPLY_CANDIDATE_LIMIT", 12))
+
+
+def _build_sticker_reply_query(
+    *,
+    message_text: str,
+    ai_reply: str,
+    additional_context: Optional[list[str]] = None,
+) -> str:
+    parts = [message_text, ai_reply]
+    for line in additional_context or []:
+        if line.startswith(("input_type:", "sticker_", "replied_to_content:", "message_relation:")):
+            parts.append(line)
+    return "\n".join(part.strip() for part in parts if part and part.strip())
+
+
+def _sticker_candidate_prompt_payload(candidate) -> dict:
+    return {
+        "file_unique_id": candidate.file_unique_id,
+        "emoji": candidate.emoji,
+        "set_name": candidate.set_name,
+        "description": candidate.description,
+        "tags": getattr(candidate, "tags", []),
+        "mood": getattr(candidate, "mood", None),
+        "safe_for_reply": getattr(candidate, "safe_for_reply", True),
+        "use_count": getattr(candidate, "use_count", 0),
+        "last_used_at": getattr(candidate, "last_used_at", None),
+        "is_animated": candidate.is_animated,
+        "is_video": candidate.is_video,
+    }
+
+
+async def _choose_sticker_reply_candidate(
+    *,
+    update: Update,
+    context: Optional[ContextTypes.DEFAULT_TYPE],
+    message_text: str,
+    ai_reply: str,
+    additional_context: Optional[list[str]],
+    runtime_state: Optional[list[str]],
+) -> Optional[tuple[object, bool]]:
+    if not _sticker_reply_enabled() or not update.message or context is None:
+        return None
+    if getattr(context, "bot", None) is None:
+        return None
+
+    limit = _sticker_reply_candidate_limit()
+    if limit <= 0:
+        return None
+
+    try:
+        query_text = _build_sticker_reply_query(
+            message_text=message_text,
+            ai_reply=ai_reply,
+            additional_context=additional_context,
+        )
+        candidates = await find_sticker_reply_candidates(query_text, limit=limit)
+        if not candidates:
+            return None
+
+        candidate_payloads = [_sticker_candidate_prompt_payload(candidate) for candidate in candidates]
+        choice = await choose_reply_sticker(
+            latest_message=message_text,
+            reply_text=ai_reply,
+            sticker_candidates=candidate_payloads,
+            additional_context=additional_context,
+            runtime_state=runtime_state,
+        )
+        if not choice:
+            return None
+
+        if isinstance(choice, str):
+            selected_unique_id = choice
+            send_text = True
+        else:
+            selected_unique_id = getattr(choice, "file_unique_id", None)
+            send_text = bool(getattr(choice, "send_text", True))
+        if not selected_unique_id:
+            return None
+
+        selected = next((candidate for candidate in candidates if candidate.file_unique_id == selected_unique_id), None)
+        if not selected or not selected.file_id:
+            return None
+
+        return selected, send_text
+    except Exception as exc:
+        logger.exception("Error choosing sticker reply: %s", exc)
+        return None
+
+
+async def _send_sticker_reply(
+    *,
+    update: Update,
+    chat_id: int,
+    sender_display: str,
+    selected,
+) -> bool:
+    if not update.message or not getattr(selected, "file_id", None):
+        return False
+
+    try:
+        sent_message = await update.message.reply_sticker(sticker=selected.file_id)
+    except Exception as exc:
+        logger.exception("Error sending sticker reply: %s", exc)
+        return False
+
+    try:
+        await record_sticker_reply_usage(selected.file_unique_id)
+    except Exception as exc:
+        logger.exception("Sticker reply sent but usage logging failed: %s", exc)
+
+    try:
+        await add_message(
+            chat_id=chat_id,
+            username="mioo_bot",
+            content=f"sticker reply: {selected.description}",
+            telegram_message_id=getattr(sent_message, "message_id", None),
+            reply_to_telegram_message_id=getattr(update.message, "message_id", None),
+            reply_to_username=sender_display,
+        )
+    except Exception as exc:
+        logger.exception("Sticker reply sent but history logging failed: %s", exc)
+
+    logger.info("Sent sticker reply %s from set %s", selected.file_unique_id, selected.set_name or "(none)")
+    return True
+
+
 def _fallback_sticker_description(sticker) -> str:
     parts: list[str] = []
     if getattr(sticker, "is_animated", False):
@@ -641,15 +781,15 @@ def _fallback_sticker_description(sticker) -> str:
     return ", ".join(parts)
 
 
-async def _describe_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
+async def _describe_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str, list[str], Optional[str], bool]:
     if not update.message or not update.message.sticker:
-        return "sticker", "fallback"
+        return "sticker", "fallback", [], None, True
 
     sticker = update.message.sticker
     file_unique_id = getattr(sticker, "file_unique_id", None) or ""
     cached_description = await get_sticker_text(file_unique_id)
     if cached_description:
-        return cached_description, "cache"
+        return cached_description, "cache", [], None, True
 
     visual_file_id = getattr(sticker, "file_id", None)
     extension = "webp"
@@ -664,14 +804,14 @@ async def _describe_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             visual_file_id = None
 
-    description = None
+    understanding: Optional[StickerUnderstanding] = None
     output_path = None
     try:
         if visual_file_id and context.bot:
             output_path = _build_output_path("sticker", update.message.message_id, extension=extension)
             tg_file = await context.bot.get_file(visual_file_id)
             await tg_file.download_to_drive(custom_path=output_path)
-            description = await sticker_to_text(
+            understanding = await sticker_to_understanding(
                 output_path,
                 emoji=getattr(sticker, "emoji", None),
                 set_name=getattr(sticker, "set_name", None),
@@ -681,8 +821,16 @@ async def _describe_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     finally:
         _remove_file_if_exists(output_path)
 
-    if not description:
+    if understanding:
+        description = understanding.description
+        tags = understanding.tags
+        mood = understanding.mood
+        safe_for_reply = understanding.safe_for_reply
+    else:
         description = _fallback_sticker_description(sticker)
+        tags = []
+        mood = None
+        safe_for_reply = True
         source = "fallback"
 
     await upsert_sticker_text(
@@ -692,10 +840,13 @@ async def _describe_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         set_name=getattr(sticker, "set_name", None),
         description=description,
         description_source=source,
+        tags=tags,
+        mood=mood,
+        safe_for_reply=safe_for_reply,
         is_animated=bool(getattr(sticker, "is_animated", False)),
         is_video=bool(getattr(sticker, "is_video", False)),
     )
-    return description, source
+    return description, source, tags, mood, safe_for_reply
 
 
 async def _handle_twitter_media_message(
@@ -1282,6 +1433,26 @@ async def _handle_group_ai_reply_pipeline(
 
     if ai_reply:
         try:
+            sticker_reply = await _choose_sticker_reply_candidate(
+                update=update,
+                context=context,
+                message_text=message_text,
+                ai_reply=ai_reply,
+                additional_context=merged_additional_context or None,
+                runtime_state=runtime_state,
+            )
+            if sticker_reply:
+                selected_sticker, send_text = sticker_reply
+                if not send_text:
+                    sent_sticker = await _send_sticker_reply(
+                        update=update,
+                        chat_id=chat_id,
+                        sender_display=sender_display,
+                        selected=selected_sticker,
+                    )
+                    if sent_sticker:
+                        return
+
             sent_message = await update.message.reply_text(ai_reply)
             await add_message(
                 chat_id=chat_id,
@@ -1291,6 +1462,14 @@ async def _handle_group_ai_reply_pipeline(
                 reply_to_telegram_message_id=getattr(update.message, "message_id", None),
                 reply_to_username=sender_display,
             )
+            if sticker_reply:
+                selected_sticker, _ = sticker_reply
+                await _send_sticker_reply(
+                    update=update,
+                    chat_id=chat_id,
+                    sender_display=sender_display,
+                    selected=selected_sticker,
+                )
         except Exception as e:
             logger.error(f"Error sending AI reply: {e}")
 
@@ -1539,7 +1718,7 @@ async def handle_sticker_for_group_ai_reply(update: Update, context: ContextType
         return
 
     sticker = update.message.sticker
-    description, description_source = await _describe_sticker(update, context)
+    description, description_source, tags, mood, safe_for_reply = await _describe_sticker(update, context)
     synthesized_text = f"sticker: {description}"
 
     await _handle_group_ai_reply_pipeline(
@@ -1552,6 +1731,9 @@ async def handle_sticker_for_group_ai_reply(update: Update, context: ContextType
             f"sticker_cached: {str(description_source == 'cache').lower()}",
             f"sticker_description_source: {description_source}",
             f"sticker_description: {description}",
+            f"sticker_tags: {', '.join(tags) if tags else '(none)'}",
+            f"sticker_mood: {mood or '(none)'}",
+            f"sticker_safe_for_reply: {str(safe_for_reply).lower()}",
         ],
         context=context,
     )

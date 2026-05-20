@@ -73,10 +73,108 @@ def test_sticker_text_round_trip(monkeypatch, tmp_path):
             set_name="mio_pack",
             description="smiling cat waving",
             description_source="sticker_file",
+            tags=["smile", "wave"],
+            mood="happy",
         )
         return await database.get_sticker_text("sticker-1")
 
     assert asyncio.run(_run()) == "smiling cat waving"
+
+
+def test_find_sticker_reply_candidates_prefers_matching_descriptions(monkeypatch, tmp_path):
+    db_path = tmp_path / "sticker_candidates.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def _run():
+        await database.upsert_sticker_text(
+            "sticker-laugh",
+            file_id="file-laugh",
+            emoji="😂",
+            set_name="mio_pack",
+            description="laughing reaction with big smile",
+            description_source="sticker_file",
+            tags=["laugh", "smile"],
+            mood="happy",
+        )
+        await database.upsert_sticker_text(
+            "sticker-sad",
+            file_id="file-sad",
+            emoji="😢",
+            set_name="mio_pack",
+            description="sad face crying",
+            description_source="sticker_file",
+            tags=["sad", "cry"],
+            mood="sad",
+        )
+        await database.upsert_sticker_text(
+            "sticker-without-file",
+            file_id=None,
+            emoji="🙂",
+            set_name="mio_pack",
+            description="happy smile but cannot be sent",
+            description_source="sticker_file",
+            tags=["happy"],
+            mood="happy",
+        )
+        return await database.find_sticker_reply_candidates("哈哈 that was funny", limit=2)
+
+    candidates = asyncio.run(_run())
+
+    assert [candidate.file_unique_id for candidate in candidates] == ["sticker-laugh"]
+    assert candidates[0].file_id == "file-laugh"
+    assert candidates[0].tags == ["laugh", "smile"]
+    assert candidates[0].mood == "happy"
+
+
+def test_sticker_reply_candidates_skip_unsafe_and_deprioritize_recently_used(monkeypatch, tmp_path):
+    db_path = tmp_path / "sticker_quality.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    monkeypatch.setenv("STICKER_REPLY_COOLDOWN_MINUTES", "60")
+    database.init_db()
+
+    async def _run():
+        await database.upsert_sticker_text(
+            "safe-used",
+            file_id="file-used",
+            emoji="🙂",
+            set_name="mio_pack",
+            description="happy smile reaction",
+            description_source="sticker_file",
+            tags=["happy", "smile"],
+            mood="happy",
+        )
+        await database.upsert_sticker_text(
+            "safe-fresh",
+            file_id="file-fresh",
+            emoji="🙂",
+            set_name="mio_pack",
+            description="happy smile reaction",
+            description_source="sticker_file",
+            tags=["happy", "smile"],
+            mood="happy",
+        )
+        await database.upsert_sticker_text(
+            "unsafe",
+            file_id="file-unsafe",
+            emoji="🙂",
+            set_name="mio_pack",
+            description="happy smile reaction",
+            description_source="sticker_file",
+            tags=["happy", "smile"],
+            mood="happy",
+            safe_for_reply=False,
+        )
+        await database.record_sticker_reply_usage("safe-used")
+        return await database.find_sticker_reply_candidates("happy smile", limit=3)
+
+    candidates = asyncio.run(_run())
+
+    assert [candidate.file_unique_id for candidate in candidates] == ["safe-fresh", "safe-used"]
+    assert candidates[1].use_count == 1
+    assert candidates[1].last_used_at is not None
 
 
 def test_add_message_releases_write_lock_before_embedding(monkeypatch, tmp_path):

@@ -1,13 +1,23 @@
 import base64
 import asyncio
+import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
 from app.runtime_config import get_ark_responses_endpoint, get_runtime_value
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StickerUnderstanding:
+    description: str
+    tags: list[str]
+    mood: Optional[str]
+    safe_for_reply: bool = True
 
 
 def _read_base64_file(file_path: str) -> str:
@@ -68,6 +78,131 @@ def _build_sticker_prompt(*, emoji: Optional[str] = None, set_name: Optional[str
     if hints:
         prompt += " " + " ".join(hints)
     return prompt
+
+
+def _build_sticker_understanding_prompt(*, emoji: Optional[str] = None, set_name: Optional[str] = None) -> str:
+    hints: list[str] = []
+    if emoji:
+        hints.append(f"Known sticker emoji: {emoji}.")
+    if set_name:
+        hints.append(f"Sticker set name: {set_name}.")
+
+    prompt = (
+        "Analyze this Telegram sticker for a chat bot sticker-reply cache. "
+        "Return only compact JSON with exactly these keys: "
+        "description, tags, mood, safe_for_reply. "
+        "description must be one short plain-text line about the visible subject, text, and reaction. "
+        "tags must be 3 to 8 short lowercase English keywords useful for search, such as laugh, angry, thanks, cute. "
+        "mood must be one short lowercase label. "
+        "safe_for_reply must be false for sexual, hateful, violent, graphic, self-harm, private-data, or otherwise risky content; otherwise true."
+    )
+    if hints:
+        prompt += " " + " ".join(hints)
+    return prompt
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    body_lines = lines[1:]
+    if body_lines and body_lines[-1].strip().startswith("```"):
+        body_lines = body_lines[:-1]
+    return "\n".join(body_lines).strip()
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    in_string = False
+    escape = False
+    depth = 0
+    start = -1
+
+    for index, char in enumerate(text or ""):
+        if start == -1:
+            if char == "{":
+                start = index
+                depth = 1
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _coerce_sticker_tags(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_tags = [part.strip() for part in value.replace(";", ",").split(",")]
+    elif isinstance(value, list):
+        raw_tags = [str(part).strip() for part in value]
+    else:
+        raw_tags = []
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in raw_tags:
+        tag = " ".join(raw_tag.lower().split())[:40]
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+        if len(tags) >= 8:
+            break
+    return tags
+
+
+def _parse_sticker_understanding(text: str) -> Optional[StickerUnderstanding]:
+    raw = _strip_markdown_code_fence(text or "")
+    if not raw:
+        return None
+
+    payload: dict[str, Any] | None = None
+    for candidate in (raw, _extract_first_json_object(raw) or ""):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payload = parsed
+            break
+
+    if payload is None:
+        return StickerUnderstanding(description=" ".join(raw.split()), tags=[], mood=None, safe_for_reply=True)
+
+    description = str(payload.get("description") or payload.get("summary") or "").strip()
+    if not description:
+        return None
+
+    mood = payload.get("mood")
+    normalized_mood = " ".join(str(mood).lower().split())[:40] if mood else None
+    safe_value = payload.get("safe_for_reply", True)
+    safe_for_reply = safe_value if isinstance(safe_value, bool) else str(safe_value).strip().lower() not in {"0", "false", "no", "unsafe"}
+
+    return StickerUnderstanding(
+        description=" ".join(description.split()),
+        tags=_coerce_sticker_tags(payload.get("tags")),
+        mood=normalized_mood or None,
+        safe_for_reply=bool(safe_for_reply),
+    )
 
 
 async def image_to_text(
@@ -144,3 +279,21 @@ async def sticker_to_text(
     if not description:
         return None
     return " ".join(description.split()) or None
+
+
+async def sticker_to_understanding(
+    image_path: str,
+    *,
+    emoji: Optional[str] = None,
+    set_name: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[StickerUnderstanding]:
+    """Describe and tag a Telegram sticker for outbound reply selection."""
+    raw_understanding = await image_to_text(
+        image_path,
+        prompt=_build_sticker_understanding_prompt(emoji=emoji, set_name=set_name),
+        model=model,
+    )
+    if not raw_understanding:
+        return None
+    return _parse_sticker_understanding(raw_understanding)

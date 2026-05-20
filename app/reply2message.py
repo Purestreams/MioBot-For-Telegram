@@ -1,14 +1,21 @@
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from app.ai_model import chat_completion
 
 
 logger = logging.getLogger(__name__)
 INFO_FILE_PATH = Path(__file__).resolve().parent.parent / "config" / "info.txt"
+
+
+@dataclass(frozen=True)
+class ReplyStickerChoice:
+    file_unique_id: str
+    send_text: bool = True
 
 
 def _strip_markdown_code_fence(text: str) -> str:
@@ -207,6 +214,91 @@ Rules:
 """.strip()
 
 
+def _build_sticker_selection_system_prompt() -> str:
+    return """
+You decide whether Mioo should use one Telegram sticker for its group chat reply.
+
+Rules:
+- Return valid JSON with exactly three keys: "file_unique_id", "send_text", and "reason".
+- "file_unique_id" must be either one of the provided candidate IDs or null.
+- "send_text" must be a boolean. Use true unless the sticker alone is a complete, natural reply.
+- If "file_unique_id" is null, "send_text" must be true.
+- Choose null unless a sticker clearly improves the reply.
+- Prefer a sticker for playful reactions, jokes, thanks, surprise, mock outrage, or when the user explicitly asks for a sticker/reaction.
+- Use "send_text": false for pure reactions, lightweight banter, acknowledgements, or explicit sticker requests where text would feel redundant.
+- Keep "send_text": true when the text contains useful information, an answer, a task result, or important nuance.
+- Choose null for serious, factual, technical, sensitive, or task-oriented replies where a sticker would distract.
+- Never invent IDs and never output Telegram file_id values.
+- Keep "reason" short.
+""".strip()
+
+
+def _candidate_value(candidate: Mapping[str, Any] | object, key: str) -> Any:
+    if isinstance(candidate, Mapping):
+        return candidate.get(key)
+    return getattr(candidate, key, None)
+
+
+def _compact_prompt_text(value: str, *, max_chars: int = 700) -> str:
+    text = " ".join((value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _sticker_candidates_payload(sticker_candidates: list[Mapping[str, Any] | object]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for candidate in sticker_candidates:
+        file_unique_id = _candidate_value(candidate, "file_unique_id")
+        if not file_unique_id:
+            continue
+        payload.append(
+            {
+                "file_unique_id": str(file_unique_id),
+                "emoji": _candidate_value(candidate, "emoji"),
+                "set_name": _candidate_value(candidate, "set_name"),
+                "description": _compact_prompt_text(str(_candidate_value(candidate, "description") or ""), max_chars=240),
+                "tags": _candidate_value(candidate, "tags") or [],
+                "mood": _candidate_value(candidate, "mood"),
+                "safe_for_reply": bool(_candidate_value(candidate, "safe_for_reply") if _candidate_value(candidate, "safe_for_reply") is not None else True),
+                "use_count": int(_candidate_value(candidate, "use_count") or 0),
+                "last_used_at": _candidate_value(candidate, "last_used_at"),
+                "is_animated": bool(_candidate_value(candidate, "is_animated")),
+                "is_video": bool(_candidate_value(candidate, "is_video")),
+            }
+        )
+    return payload
+
+
+def _build_sticker_selection_user_prompt(
+    *,
+    latest_message: str,
+    reply_text: str,
+    sticker_candidates: list[Mapping[str, Any] | object],
+    additional_context: Optional[list[str]] = None,
+    runtime_state: Optional[list[str]] = None,
+) -> str:
+    context_block = "\n".join(additional_context or []) if additional_context else "(none)"
+    runtime_block = "\n".join(runtime_state or []) if runtime_state else "(none)"
+    candidates_block = json.dumps(
+        _sticker_candidates_payload(sticker_candidates),
+        ensure_ascii=False,
+        indent=2,
+    )
+    return (
+        "Latest message:\n"
+        f"{_compact_prompt_text(latest_message, max_chars=900)}\n\n"
+        "Mioo text reply:\n"
+        f"{_compact_prompt_text(reply_text, max_chars=700)}\n\n"
+        "Additional context:\n"
+        f"{context_block}\n\n"
+        "Runtime state:\n"
+        f"{runtime_block}\n\n"
+        "Candidate stickers:\n"
+        f"{candidates_block}"
+    )
+
+
 def _normalize_reply_content(result_text: str) -> Optional[str]:
     raw = _strip_markdown_code_fence((result_text or "").strip())
     if not raw:
@@ -339,6 +431,75 @@ async def generate_group_reply(
         return reply_text
     except Exception as exc:
         logger.exception("An error occurred in generate_group_reply: %s", exc)
+        return None
+
+
+async def choose_reply_sticker(
+    *,
+    latest_message: str,
+    reply_text: str,
+    sticker_candidates: list[Mapping[str, Any] | object],
+    additional_context: Optional[list[str]] = None,
+    runtime_state: Optional[list[str]] = None,
+    model: Optional[str] = None,
+) -> Optional[ReplyStickerChoice]:
+    candidate_payload = _sticker_candidates_payload(sticker_candidates)
+    if not candidate_payload:
+        return None
+
+    allowed_ids = {candidate["file_unique_id"] for candidate in candidate_payload}
+    try:
+        completion = await chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": _build_sticker_selection_system_prompt(),
+                },
+                {
+                    "role": "user",
+                    "content": _build_sticker_selection_user_prompt(
+                        latest_message=latest_message,
+                        reply_text=reply_text,
+                        sticker_candidates=candidate_payload,
+                        additional_context=additional_context,
+                        runtime_state=runtime_state,
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            model=model,
+        )
+
+        payload = _parse_reply_payload(completion.content or "")
+        if payload is None:
+            logger.warning("Model returned invalid sticker selection payload. Raw prefix: %r", (completion.content or "")[:200])
+            return None
+
+        selected_id = payload.get("file_unique_id")
+        if selected_id is None:
+            return None
+
+        selected_id = str(selected_id)
+        if selected_id not in allowed_ids:
+            logger.warning("Model selected unknown sticker ID: %r", selected_id)
+            return None
+
+        raw_send_text = payload.get("send_text")
+        if raw_send_text is None:
+            send_text = True
+        else:
+            parsed_send_text = _parse_json_boolean(raw_send_text)
+            if parsed_send_text is None:
+                logger.warning("Model returned non-boolean send_text field: %r", raw_send_text)
+                send_text = True
+            else:
+                send_text = parsed_send_text
+
+        logger.info("Selected sticker reply %s (send_text=%s): %s", selected_id, send_text, payload.get("reason"))
+        return ReplyStickerChoice(file_unique_id=selected_id, send_text=send_text)
+    except Exception as exc:
+        logger.exception("An error occurred in choose_reply_sticker: %s", exc)
         return None
 
 

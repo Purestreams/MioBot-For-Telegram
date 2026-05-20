@@ -1,7 +1,13 @@
 import asyncio
 
 from app import image2text
-from app.image2text import _build_sticker_prompt, _extract_text_from_responses_payload, _guess_mime_type
+from app.image2text import (
+    _build_sticker_prompt,
+    _build_sticker_understanding_prompt,
+    _extract_text_from_responses_payload,
+    _guess_mime_type,
+    _parse_sticker_understanding,
+)
 
 
 def test_guess_mime_type_by_extension():
@@ -38,6 +44,33 @@ def test_build_sticker_prompt_includes_optional_hints():
     prompt = _build_sticker_prompt(emoji="🙂", set_name="mio_pack")
     assert "Known sticker emoji: 🙂." in prompt
     assert "Sticker set name: mio_pack." in prompt
+
+
+def test_build_sticker_understanding_prompt_requests_quality_json():
+    prompt = _build_sticker_understanding_prompt(emoji="🙂", set_name="mio_pack")
+    assert "description, tags, mood, safe_for_reply" in prompt
+    assert "Known sticker emoji: 🙂." in prompt
+
+
+def test_parse_sticker_understanding_from_json():
+    parsed = _parse_sticker_understanding(
+        '{"description":"Happy cat waving", "tags":["happy", "wave", "cat"], "mood":"happy", "safe_for_reply":true}'
+    )
+
+    assert parsed is not None
+    assert parsed.description == "Happy cat waving"
+    assert parsed.tags == ["happy", "wave", "cat"]
+    assert parsed.mood == "happy"
+    assert parsed.safe_for_reply is True
+
+
+def test_parse_sticker_understanding_falls_back_to_description_line():
+    parsed = _parse_sticker_understanding("smiling cat waving hello")
+
+    assert parsed is not None
+    assert parsed.description == "smiling cat waving hello"
+    assert parsed.tags == []
+    assert parsed.safe_for_reply is True
 
 
 def test_image_to_text_reads_file_in_worker_thread(monkeypatch, tmp_path):

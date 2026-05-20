@@ -126,3 +126,39 @@ def test_init_db_auto_migrates_old_message_embeddings_schema(monkeypatch, tmp_pa
     assert "signature" in embed_cols
     assert sticker_tables is not None
     assert memory_tables is not None
+
+
+def test_init_db_auto_migrates_old_sticker_schema(monkeypatch, tmp_path):
+    db_path = tmp_path / "legacy_stickers.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            '''
+            CREATE TABLE sticker_descriptions (
+                file_unique_id TEXT PRIMARY KEY,
+                file_id TEXT,
+                emoji TEXT,
+                set_name TEXT,
+                description TEXT NOT NULL,
+                description_source TEXT NOT NULL DEFAULT 'fallback',
+                is_animated INTEGER NOT NULL DEFAULT 0,
+                is_video INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            '''
+        )
+        db.commit()
+
+    database.init_db()
+
+    with sqlite3.connect(db_path) as db:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(sticker_descriptions)").fetchall()}
+
+    assert "sticker_tags" in cols
+    assert "mood" in cols
+    assert "safe_for_reply" in cols
+    assert "use_count" in cols
+    assert "last_used_at" in cols

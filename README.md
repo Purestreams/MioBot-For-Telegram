@@ -10,6 +10,7 @@ The default README language is English. A Chinese version is available below: [�
 - Automatic YouTube, Bilibili, Twitter/X, and Zhihu link handling.
 - Context-aware group replies powered by recent chat history, hybrid RAG, and personal memory.
 - Photo and sticker understanding through Ark vision models.
+- Optional sticker replies, including sticker-only reactions, selected from the cached sticker database with quality tags and usage cooldown.
 - SQLite-backed message history, embeddings, sticker cache, memory summaries, structured facts, and memory candidates.
 - Private Telegram admin tools for inspecting, regenerating, and editing user memory.
 
@@ -49,12 +50,13 @@ Group text, photo, and sticker messages converge into the same reply pipeline in
 3. Detect direct triggers: replying to the bot, mentioning `@BotUsername`, `mioo`, or `小小宫`.
 4. For ambient messages, run an activation probe before replying.
 5. Build prompt context from recent messages, hybrid RAG results, personal memory, and runtime state.
-6. Generate the reply and store the bot response back into the database.
+6. Generate the reply, optionally use a matching cached sticker with or without text, and store bot responses back into the database.
 
 ### Multimodal Context
 
 - Photos are summarized by [app/image2text.py](app/image2text.py) before entering the group reply pipeline.
-- Stickers are described once and cached in `sticker_descriptions`.
+- Stickers are described once and cached in `sticker_descriptions`; cached `file_id` values can also be reused for outbound sticker replies.
+- Sticker cache rows include searchable tags, mood, `safe_for_reply`, `use_count`, and `last_used_at` so outbound replies avoid risky or overused stickers.
 - Vision uses Ark Responses API derived from the single `ARK_API_ENDPOINT` setting. You do not need a separate responses endpoint variable.
 
 ### Personal Memory

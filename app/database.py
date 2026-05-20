@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import aiosqlite
+import datetime
 import json
 import sqlite3
 import logging
@@ -76,6 +77,23 @@ class MessageRow:
     content: str
     timestamp: str
     reply_to_username: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class StickerReplyCandidate:
+    file_unique_id: str
+    file_id: str
+    emoji: Optional[str]
+    set_name: Optional[str]
+    description: str
+    description_source: str
+    tags: list[str]
+    mood: Optional[str]
+    safe_for_reply: bool = True
+    is_animated: bool = False
+    is_video: bool = False
+    use_count: int = 0
+    last_used_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +182,163 @@ def _trim_context_lines(lines: list[str], *, max_chars: int, keep: str = "last")
     return selected
 
 
+_STICKER_SEARCH_STOPWORDS = {
+    "and",
+    "the",
+    "this",
+    "that",
+    "with",
+    "from",
+    "input_type",
+    "sticker",
+    "reply",
+    "message",
+    "user",
+    "true",
+    "false",
+    "none",
+    "current_date_utc",
+    "current_weekday_utc",
+    "sender_display",
+    "trigger_type",
+    "direct_addressed",
+}
+
+_STICKER_QUERY_EXPANSIONS = (
+    ("haha", ("laugh", "smile", "happy", "joy")),
+    ("lol", ("laugh", "smile", "happy", "joy")),
+    ("lmao", ("laugh", "smile", "happy", "joy")),
+    ("thanks", ("thanks", "thank", "heart", "happy")),
+    ("thank you", ("thanks", "thank", "heart", "happy")),
+    ("cute", ("cute", "happy", "smile")),
+    ("angry", ("angry", "mad", "annoyed")),
+    ("sad", ("sad", "cry", "tears")),
+    ("cry", ("cry", "sad", "tears")),
+    ("ok", ("ok", "yes", "thumb", "nod")),
+    ("哈哈", ("laugh", "smile", "happy", "joy")),
+    ("笑死", ("laugh", "smile", "happy", "joy")),
+    ("开心", ("happy", "smile", "joy")),
+    ("可爱", ("cute", "happy", "smile")),
+    ("谢谢", ("thanks", "thank", "heart", "happy")),
+    ("感谢", ("thanks", "thank", "heart", "happy")),
+    ("生气", ("angry", "mad", "annoyed")),
+    ("难过", ("sad", "cry", "tears")),
+    ("哭", ("cry", "sad", "tears")),
+)
+
+
+def _sticker_search_terms(query_text: str, *, max_terms: int = 16) -> list[str]:
+    lowered = (query_text or "").lower()
+    terms: list[str] = []
+
+    for trigger, expanded_terms in _STICKER_QUERY_EXPANSIONS:
+        if trigger in lowered:
+            terms.extend(expanded_terms)
+
+    for token in re.findall(r"[\w\u4e00-\u9fff]+", lowered):
+        normalized = token.strip("_")
+        if len(normalized) < 2 or normalized in _STICKER_SEARCH_STOPWORDS:
+            continue
+        terms.append(normalized[:64])
+
+    unique_terms: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        if term in seen:
+            continue
+        seen.add(term)
+        unique_terms.append(term)
+        if len(unique_terms) >= max_terms:
+            break
+    return unique_terms
+
+
+def _sticker_reply_cooldown_minutes() -> int:
+    return _get_env_int("STICKER_REPLY_COOLDOWN_MINUTES", 30)
+
+
+def _decode_sticker_tags(value: Any) -> list[str]:
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else value
+    except json.JSONDecodeError:
+        decoded = value
+
+    if isinstance(decoded, str):
+        raw_tags = [part.strip() for part in decoded.replace(";", ",").split(",")]
+    elif isinstance(decoded, list):
+        raw_tags = [str(part).strip() for part in decoded]
+    else:
+        raw_tags = []
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in raw_tags:
+        tag = " ".join(raw_tag.lower().split())[:40]
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+        if len(tags) >= 8:
+            break
+    return tags
+
+
+def _encode_sticker_tags(tags: Optional[list[str]]) -> str:
+    return json.dumps(_decode_sticker_tags(tags or []), ensure_ascii=False)
+
+
+def _is_recent_sticker_use(last_used_at: Optional[str], *, cooldown_minutes: int) -> bool:
+    if not last_used_at or cooldown_minutes <= 0:
+        return False
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(minutes=cooldown_minutes)
+    cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    return str(last_used_at) >= cutoff_text
+
+
+def _score_sticker_candidate(candidate: StickerReplyCandidate, terms: list[str]) -> int:
+    description = (candidate.description or "").lower()
+    emoji = (candidate.emoji or "").lower()
+    set_name = (candidate.set_name or "").lower()
+    tags = " ".join(candidate.tags or []).lower()
+    mood = (candidate.mood or "").lower()
+    score = 0
+    for term in terms:
+        if term in description:
+            score += 4
+        if tags and term in tags:
+            score += 5
+        if mood and term in mood:
+            score += 3
+        if emoji and term in emoji:
+            score += 2
+        if set_name and term in set_name:
+            score += 1
+    if not candidate.safe_for_reply:
+        score -= 1000
+    score -= min(max(candidate.use_count, 0), 20)
+    if _is_recent_sticker_use(candidate.last_used_at, cooldown_minutes=_sticker_reply_cooldown_minutes()):
+        score -= 100
+    return score
+
+
+def _sticker_candidate_from_row(row: tuple[Any, ...]) -> StickerReplyCandidate:
+    return StickerReplyCandidate(
+        file_unique_id=str(row[0]),
+        file_id=str(row[1]),
+        emoji=row[2] if isinstance(row[2], str) else None,
+        set_name=row[3] if isinstance(row[3], str) else None,
+        description=str(row[4] or ""),
+        description_source=str(row[5] or ""),
+        tags=_decode_sticker_tags(row[6]),
+        mood=row[7] if isinstance(row[7], str) and row[7].strip() else None,
+        safe_for_reply=bool(row[8]),
+        is_animated=bool(row[9]),
+        is_video=bool(row[10]),
+        use_count=int(row[11] or 0),
+        last_used_at=row[12] if isinstance(row[12], str) else None,
+    )
+
+
 async def _enable_foreign_keys(db: aiosqlite.Connection) -> None:
     try:
         await db.execute("PRAGMA foreign_keys = ON")
@@ -221,6 +396,25 @@ def _migrate_message_embeddings_table(db: sqlite3.Connection) -> None:
     db.execute("CREATE INDEX IF NOT EXISTS idx_embed_chat_signature ON message_embeddings (chat_id, signature)")
 
 
+def _get_sticker_columns(db: sqlite3.Connection) -> set[str]:
+    cursor = db.execute("PRAGMA table_info(sticker_descriptions)")
+    return {str(row[1]) for row in cursor.fetchall()}
+
+
+def _migrate_stickers_table(db: sqlite3.Connection) -> None:
+    columns = _get_sticker_columns(db)
+    if "sticker_tags" not in columns:
+        db.execute("ALTER TABLE sticker_descriptions ADD COLUMN sticker_tags TEXT NOT NULL DEFAULT '[]'")
+    if "mood" not in columns:
+        db.execute("ALTER TABLE sticker_descriptions ADD COLUMN mood TEXT")
+    if "safe_for_reply" not in columns:
+        db.execute("ALTER TABLE sticker_descriptions ADD COLUMN safe_for_reply INTEGER NOT NULL DEFAULT 1")
+    if "use_count" not in columns:
+        db.execute("ALTER TABLE sticker_descriptions ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0")
+    if "last_used_at" not in columns:
+        db.execute("ALTER TABLE sticker_descriptions ADD COLUMN last_used_at DATETIME")
+
+
 def _init_stickers_table(db: sqlite3.Connection) -> None:
     db.execute(
         '''
@@ -231,14 +425,23 @@ def _init_stickers_table(db: sqlite3.Connection) -> None:
             set_name TEXT,
             description TEXT NOT NULL,
             description_source TEXT NOT NULL DEFAULT 'fallback',
+            sticker_tags TEXT NOT NULL DEFAULT '[]',
+            mood TEXT,
+            safe_for_reply INTEGER NOT NULL DEFAULT 1,
             is_animated INTEGER NOT NULL DEFAULT 0,
             is_video INTEGER NOT NULL DEFAULT 0,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at DATETIME,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         '''
     )
+    _migrate_stickers_table(db)
     db.execute("CREATE INDEX IF NOT EXISTS idx_sticker_set_name ON sticker_descriptions (set_name)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sticker_file_id ON sticker_descriptions (file_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sticker_updated_at ON sticker_descriptions (updated_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sticker_safe_reply ON sticker_descriptions (safe_for_reply, last_used_at, use_count)")
 
 
 def _init_user_memories_table(db: sqlite3.Connection) -> None:
@@ -1515,6 +1718,9 @@ async def upsert_sticker_text(
     set_name: Optional[str],
     description: str,
     description_source: str,
+    tags: Optional[list[str]] = None,
+    mood: Optional[str] = None,
+    safe_for_reply: bool = True,
     is_animated: bool = False,
     is_video: bool = False,
 ) -> None:
@@ -1534,16 +1740,22 @@ async def upsert_sticker_text(
                 set_name,
                 description,
                 description_source,
+                sticker_tags,
+                mood,
+                safe_for_reply,
                 is_animated,
                 is_video,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(file_unique_id) DO UPDATE SET
                 file_id = excluded.file_id,
                 emoji = excluded.emoji,
                 set_name = excluded.set_name,
                 description = excluded.description,
                 description_source = excluded.description_source,
+                sticker_tags = excluded.sticker_tags,
+                mood = excluded.mood,
+                safe_for_reply = excluded.safe_for_reply,
                 is_animated = excluded.is_animated,
                 is_video = excluded.is_video,
                 updated_at = CURRENT_TIMESTAMP
@@ -1555,11 +1767,92 @@ async def upsert_sticker_text(
                 set_name,
                 description,
                 description_source,
+                _encode_sticker_tags(tags),
+                (mood or None),
+                int(safe_for_reply),
                 int(is_animated),
                 int(is_video),
             ),
         )
         await db.commit()
+
+
+async def record_sticker_reply_usage(file_unique_id: str) -> None:
+    if not file_unique_id:
+        return
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        await db.execute(
+            '''
+            UPDATE sticker_descriptions
+            SET use_count = COALESCE(use_count, 0) + 1,
+                last_used_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE file_unique_id = ?
+            ''',
+            (file_unique_id,),
+        )
+        await db.commit()
+
+
+async def find_sticker_reply_candidates(query_text: str, *, limit: int = 12) -> list[StickerReplyCandidate]:
+    if limit <= 0:
+        return []
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+    terms = _sticker_search_terms(query_text)
+    rows: list[tuple[Any, ...]] = []
+    select_sql = '''
+        SELECT
+            file_unique_id,
+            file_id,
+            emoji,
+            set_name,
+            description,
+            description_source,
+                        sticker_tags,
+                        mood,
+                        safe_for_reply,
+            is_animated,
+                        is_video,
+                        use_count,
+                        last_used_at
+        FROM sticker_descriptions
+        WHERE file_id IS NOT NULL
+          AND TRIM(file_id) <> ''
+                    AND COALESCE(safe_for_reply, 1) = 1
+    '''
+
+    async with aiosqlite.connect(db_file) as db:
+        if terms:
+            clauses = []
+            params: list[Any] = []
+            for term in terms:
+                like = f"%{term}%"
+                clauses.append(
+                    "(LOWER(description) LIKE ? OR LOWER(COALESCE(sticker_tags, '')) LIKE ? OR LOWER(COALESCE(mood, '')) LIKE ? OR LOWER(COALESCE(emoji, '')) LIKE ? OR LOWER(COALESCE(set_name, '')) LIKE ?)"
+                )
+                params.extend([like, like, like, like, like])
+            cursor = await db.execute(
+                f"{select_sql} AND ({' OR '.join(clauses)}) ORDER BY updated_at DESC LIMIT ?",
+                tuple(params + [max(limit * 6, limit, 30)]),
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            cursor = await db.execute(
+                f"{select_sql} ORDER BY updated_at DESC LIMIT ?",
+                (max(limit * 4, limit, 30),),
+            )
+            rows = await cursor.fetchall()
+
+    candidates = [_sticker_candidate_from_row(row) for row in rows]
+    candidates.sort(key=lambda candidate: _score_sticker_candidate(candidate, terms), reverse=True)
+    return candidates[:limit]
 
 
 async def get_embedding_health_report() -> dict[str, Any]:

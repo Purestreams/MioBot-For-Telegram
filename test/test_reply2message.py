@@ -181,3 +181,74 @@ def test_should_reply_and_generate_skips_probe_for_direct_trigger(monkeypatch):
     assert result == "nya~"
     assert called["kwargs"]["is_mentioned"] is True
     assert called["kwargs"]["runtime_state"] == ["trigger_type: alias_mention"]
+
+
+def test_choose_reply_sticker_returns_allowed_candidate(monkeypatch):
+    called = {}
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        called["messages"] = messages
+        called["kwargs"] = kwargs
+        return _Completion(json.dumps({"file_unique_id": "sticker-1", "send_text": True, "reason": "playful laugh"}))
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+
+    result = asyncio.run(
+        reply2message.choose_reply_sticker(
+            latest_message="mioo 哈哈",
+            reply_text="笑死",
+            sticker_candidates=[
+                {
+                    "file_unique_id": "sticker-1",
+                    "emoji": "😂",
+                    "set_name": "mio_pack",
+                    "description": "laughing reaction",
+                    "is_animated": False,
+                    "is_video": False,
+                }
+            ],
+            runtime_state=["trigger_type: alias_mention"],
+        )
+    )
+
+    assert result is not None
+    assert result.file_unique_id == "sticker-1"
+    assert result.send_text is True
+    assert called["kwargs"]["temperature"] == 0
+    assert "Candidate stickers" in called["messages"][1]["content"]
+
+
+def test_choose_reply_sticker_can_choose_sticker_only(monkeypatch):
+    async def fake_chat_completion(*, messages, **kwargs):
+        return _Completion(json.dumps({"file_unique_id": "sticker-1", "send_text": False, "reason": "pure reaction"}))
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+
+    result = asyncio.run(
+        reply2message.choose_reply_sticker(
+            latest_message="mioo 发个表情",
+            reply_text="给你一个",
+            sticker_candidates=[{"file_unique_id": "sticker-1", "description": "playful wave"}],
+        )
+    )
+
+    assert result is not None
+    assert result.file_unique_id == "sticker-1"
+    assert result.send_text is False
+
+
+def test_choose_reply_sticker_rejects_unknown_candidate(monkeypatch):
+    async def fake_chat_completion(*, messages, **kwargs):
+        return _Completion(json.dumps({"file_unique_id": "missing", "send_text": False, "reason": "bad id"}))
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+
+    result = asyncio.run(
+        reply2message.choose_reply_sticker(
+            latest_message="hello",
+            reply_text="hi",
+            sticker_candidates=[{"file_unique_id": "sticker-1", "description": "wave"}],
+        )
+    )
+
+    assert result is None

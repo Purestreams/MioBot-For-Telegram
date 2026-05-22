@@ -162,3 +162,74 @@ def test_init_db_auto_migrates_old_sticker_schema(monkeypatch, tmp_path):
     assert "safe_for_reply" in cols
     assert "use_count" in cols
     assert "last_used_at" in cols
+
+
+def test_init_db_versions_and_migrates_unscoped_global_memory(monkeypatch, tmp_path):
+    db_path = tmp_path / "legacy_global_memory.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            '''
+            CREATE TABLE global_memory_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact_type TEXT NOT NULL,
+                fact_text TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                evidence_message_ids TEXT NOT NULL DEFAULT '[]',
+                first_observed_at TEXT,
+                last_confirmed_at TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(fact_type, fact_text)
+            )
+            '''
+        )
+        db.execute(
+            "INSERT INTO global_memory_facts (fact_type, fact_text, confidence) VALUES (?, ?, ?)",
+            ("style", "Legacy unscoped memory", 0.8),
+        )
+        db.commit()
+
+    database.init_db()
+
+    with sqlite3.connect(db_path) as db:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(global_memory_facts)").fetchall()}
+        version = db.execute("SELECT value FROM db_metadata WHERE key = 'schema_version'").fetchone()
+        legacy_backup = db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'global_memory_facts_unscoped_backup'"
+        ).fetchone()
+        legacy_row = db.execute(
+            "SELECT chat_id, fact_type, fact_text FROM global_memory_facts WHERE fact_text = 'Legacy unscoped memory'"
+        ).fetchone()
+
+    assert "chat_id" in cols
+    assert version == (str(database.DB_SCHEMA_VERSION),)
+    assert legacy_backup is not None
+    assert legacy_row == (0, "style", "Legacy unscoped memory")
+
+    with sqlite3.connect(db_path) as db:
+        webadmin_table = db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'webadmin_login_tokens'"
+        ).fetchone()
+
+    assert webadmin_table is not None
+
+    async def _run():
+        await database.upsert_global_memory_facts(
+            -100,
+            [{"fact_type": "style", "fact_text": "Legacy unscoped memory", "confidence": 0.9}],
+        )
+        await database.upsert_global_memory_facts(
+            -200,
+            [{"fact_type": "style", "fact_text": "Legacy unscoped memory", "confidence": 0.7}],
+        )
+        return await database.get_global_memory_facts(-100), await database.get_global_memory_facts(-200)
+
+    chat_100_facts, chat_200_facts = asyncio.run(_run())
+
+    assert chat_100_facts[0].chat_id == -100
+    assert chat_100_facts[0].confidence == 0.9
+    assert chat_200_facts[0].chat_id == -200

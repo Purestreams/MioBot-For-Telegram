@@ -8,6 +8,7 @@ license = { text = "GPL-3.0-only" }
 dependencies = [
     "aiosqlite>=0.20.0",
     "fastembed>=0.3.6",
+    "fastapi>=0.115.0",
     "httpx>=0.27.0",
     "markdown2>=2.5.0",
     "numpy>=1.26.0",
@@ -15,6 +16,7 @@ dependencies = [
     "playwright>=1.45.0",
     "python-telegram-bot>=21.0",
     "requests>=2.31.0",
+    "uvicorn>=0.30.0",
     "yt-dlp>=2024.8.6",
 ]
 
@@ -26,6 +28,7 @@ med = [
 [project.scripts]
 miobot = "main:main"
 miobot-rag = "app.database:cli_main"
+miobot-webadmin = "webadmin.app:main"
 
 [dependency-groups]
 dev = [
@@ -40,12 +43,16 @@ build-backend = "hatchling.build"
 include = [
     "main.py",
     "app/**/*.py",
+    "webadmin/**/*.py",
+    "webadmin/static/**/*",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "main.py",
     "app/**/*.py",
+    "webadmin/**/*.py",
+    "webadmin/static/**/*",
     "README.md",
     "LICENSE",
     "pyproject.toml",

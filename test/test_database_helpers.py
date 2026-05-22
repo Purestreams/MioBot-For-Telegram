@@ -81,6 +81,56 @@ def test_sticker_text_round_trip(monkeypatch, tmp_path):
     assert asyncio.run(_run()) == "smiling cat waving"
 
 
+def test_webadmin_login_token_is_single_use(monkeypatch, tmp_path):
+    db_path = tmp_path / "webadmin_token.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def _run():
+        created = await database.create_webadmin_login_token(
+            "hash-1",
+            admin_user_id=42,
+            admin_username="admin",
+            ttl_seconds=600,
+        )
+        first = await database.consume_webadmin_login_token("hash-1")
+        second = await database.consume_webadmin_login_token("hash-1")
+        return created, first, second
+
+    created, first, second = asyncio.run(_run())
+
+    assert created.admin_user_id == 42
+    assert first is not None
+    assert first.admin_username == "admin"
+    assert second is None
+
+
+def test_webadmin_chat_messages_filter_by_search(monkeypatch, tmp_path):
+    db_path = tmp_path / "webadmin_messages.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+
+    async def fake_embed_message_content(*args, **kwargs):
+        raise RuntimeError("skip embeddings")
+
+    monkeypatch.setattr(database, "_embed_message_content", fake_embed_message_content)
+    database.init_db()
+
+    async def _run():
+        await database.add_message(100, "Alice @alice", "keep this message", telegram_user_key="tg_user:1")
+        await database.add_message(100, "Bob @bob", "something else", telegram_user_key="tg_user:2")
+        await database.add_message(200, "Carol @carol", "keep in other chat", telegram_user_key="tg_user:3")
+        return await database.list_webadmin_chat_messages(100, search="keep", limit=10)
+
+    rows = asyncio.run(_run())
+
+    assert len(rows) == 1
+    assert rows[0].chat_id == 100
+    assert rows[0].username == "Alice @alice"
+    assert rows[0].telegram_user_key == "tg_user:1"
+
+
 def test_find_sticker_reply_candidates_prefers_matching_descriptions(monkeypatch, tmp_path):
     db_path = tmp_path / "sticker_candidates.db"
     monkeypatch.setenv("DB_FILE", str(db_path))
@@ -256,6 +306,82 @@ def test_user_memory_facts_round_trip_and_merge(monkeypatch, tmp_path):
     assert facts[0].fact_text == "Prefers concise engineering answers"
     assert facts[0].confidence == 0.9
     assert facts[0].evidence_message_ids == [1, 2, 3]
+
+
+def test_global_memory_facts_round_trip_and_merge(monkeypatch, tmp_path):
+    db_path = tmp_path / "global_facts.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def _run():
+        await database.upsert_global_memory_facts(
+            -100,
+            [
+                {
+                    "fact_type": "style",
+                    "fact_text": "Keep group replies concise",
+                    "confidence": 0.7,
+                    "evidence_message_ids": [1],
+                }
+            ]
+        )
+        await database.upsert_global_memory_facts(
+            -100,
+            [
+                {
+                    "type": "style",
+                    "text": "Keep group replies concise",
+                    "confidence": 0.95,
+                    "evidence_message_ids": [1, 2],
+                }
+            ]
+        )
+        return await database.get_global_memory_facts(-100)
+
+    facts = asyncio.run(_run())
+
+    assert len(facts) == 1
+    assert facts[0].chat_id == -100
+    assert facts[0].fact_type == "style"
+    assert facts[0].fact_text == "Keep group replies concise"
+    assert facts[0].confidence == 0.95
+    assert facts[0].evidence_message_ids == [1, 2]
+
+
+def test_list_global_memory_chat_overviews(monkeypatch, tmp_path):
+    db_path = tmp_path / "global_memory_chats.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def fake_embed_message_content(*args, **kwargs):
+        raise RuntimeError("skip embeddings")
+
+    monkeypatch.setattr(database, "_embed_message_content", fake_embed_message_content)
+
+    async def _run():
+        await database.add_message(-100, "Alice @alice", "hello from group one")
+        await database.add_message(-200, "Bob @bob", "hello from group two")
+        await database.upsert_global_memory_facts(
+            -100,
+            [{"fact_type": "style", "fact_text": "Keep replies concise", "confidence": 0.9}],
+        )
+        await database.upsert_global_memory_facts(
+            -300,
+            [{"fact_type": "note", "fact_text": "Memory-only chat", "confidence": 0.8}],
+        )
+        return await database.list_global_memory_chat_overviews(limit=10)
+
+    rows = asyncio.run(_run())
+    by_chat = {row.chat_id: row for row in rows}
+
+    assert set(by_chat) == {-100, -200, -300}
+    assert by_chat[-100].message_count == 1
+    assert by_chat[-100].global_fact_count == 1
+    assert by_chat[-100].latest_message_username == "Alice @alice"
+    assert by_chat[-300].message_count == 0
+    assert by_chat[-300].global_fact_count == 1
 
 
 def test_user_memory_admin_overview_search_and_display_lookup(monkeypatch, tmp_path):

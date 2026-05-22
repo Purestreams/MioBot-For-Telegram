@@ -23,6 +23,8 @@ from app.runtime_config import get_runtime_bool, get_runtime_int, get_runtime_va
 
 DB_FILE = get_runtime_value("DB_FILE")
 logger = logging.getLogger(__name__)
+DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION_KEY = "schema_version"
 
 
 def _db_file_path() -> str:
@@ -114,6 +116,64 @@ class UserMemoryFactRow:
     evidence_message_ids: list[int]
     first_observed_at: Optional[str] = None
     last_confirmed_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GlobalMemoryFactRow:
+    id: int
+    chat_id: int
+    fact_type: str
+    fact_text: str
+    confidence: float
+    evidence_message_ids: list[int]
+    first_observed_at: Optional[str] = None
+    last_confirmed_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GlobalMemoryChatOverviewRow:
+    chat_id: int
+    message_count: int
+    global_fact_count: int
+    latest_message_at: Optional[str]
+    latest_message_username: Optional[str]
+    latest_message_preview: Optional[str]
+
+
+@dataclass(frozen=True)
+class WebAdminLoginTokenRow:
+    id: int
+    token_hash: str
+    admin_user_id: Optional[int]
+    admin_username: str
+    expires_at: str
+    used_at: Optional[str]
+    created_at: Optional[str]
+
+
+@dataclass(frozen=True)
+class WebAdminDashboardStats:
+    message_count: int
+    chat_count: int
+    user_memory_count: int
+    user_memory_fact_count: int
+    pending_candidate_count: int
+    global_memory_fact_count: int
+    db_schema_version: int
+
+
+@dataclass(frozen=True)
+class WebAdminMessageRow:
+    id: int
+    chat_id: int
+    username: str
+    content: str
+    timestamp: str
+    telegram_user_key: Optional[str]
+    telegram_message_id: Optional[int]
+    reply_to_telegram_message_id: Optional[int]
+    reply_to_db_message_id: Optional[int]
+    reply_to_username: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -352,6 +412,66 @@ def _get_message_columns(db: sqlite3.Connection) -> set[str]:
     return {str(row[1]) for row in cursor.fetchall()}
 
 
+def _table_exists(db: sqlite3.Connection, table_name: str) -> bool:
+    row = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _get_table_columns(db: sqlite3.Connection, table_name: str) -> set[str]:
+    cursor = db.execute(f"PRAGMA table_info({table_name})")
+    return {str(row[1]) for row in cursor.fetchall()}
+
+
+def _init_db_metadata_table(db: sqlite3.Connection) -> None:
+    db.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS db_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        '''
+    )
+
+
+def _get_db_schema_version(db: sqlite3.Connection) -> int:
+    if not _table_exists(db, "db_metadata"):
+        return 0
+    row = db.execute(
+        "SELECT value FROM db_metadata WHERE key = ?",
+        (DB_SCHEMA_VERSION_KEY,),
+    ).fetchone()
+    if not row:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_db_schema_version(db: sqlite3.Connection, version: int) -> None:
+    db.execute(
+        '''
+        INSERT INTO db_metadata (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        ''',
+        (DB_SCHEMA_VERSION_KEY, str(version)),
+    )
+
+
+def get_db_schema_version() -> int:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+    with sqlite3.connect(db_file) as db:
+        return _get_db_schema_version(db)
+
+
 def _migrate_messages_table(db: sqlite3.Connection) -> None:
     columns = _get_message_columns(db)
 
@@ -484,6 +604,72 @@ def _init_user_memory_facts_table(db: sqlite3.Connection) -> None:
     )
 
 
+def _init_global_memory_facts_table(db: sqlite3.Connection) -> None:
+    legacy_backup_name: Optional[str] = None
+    if _table_exists(db, "global_memory_facts"):
+        columns = _get_table_columns(db, "global_memory_facts")
+        if "chat_id" not in columns:
+            base_backup_name = "global_memory_facts_unscoped_backup"
+            legacy_backup_name = base_backup_name
+            suffix = 1
+            while _table_exists(db, legacy_backup_name):
+                suffix += 1
+                legacy_backup_name = f"{base_backup_name}_{suffix}"
+            db.execute(f"ALTER TABLE global_memory_facts RENAME TO {legacy_backup_name}")
+
+    db.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS global_memory_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            fact_type TEXT NOT NULL,
+            fact_text TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            evidence_message_ids TEXT NOT NULL DEFAULT '[]',
+            first_observed_at TEXT,
+            last_confirmed_at TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, fact_type, fact_text)
+        )
+        '''
+    )
+    if legacy_backup_name:
+        db.execute(
+            f'''
+            INSERT OR IGNORE INTO global_memory_facts (
+                chat_id,
+                fact_type,
+                fact_text,
+                confidence,
+                evidence_message_ids,
+                first_observed_at,
+                last_confirmed_at,
+                is_active,
+                created_at,
+                updated_at
+            )
+            SELECT
+                0,
+                fact_type,
+                fact_text,
+                confidence,
+                evidence_message_ids,
+                first_observed_at,
+                last_confirmed_at,
+                is_active,
+                created_at,
+                updated_at
+            FROM {legacy_backup_name}
+            '''
+        )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_global_memory_facts_chat_active ON global_memory_facts "
+        "(chat_id, is_active, fact_type, confidence)"
+    )
+
+
 def _init_user_memory_candidates_table(db: sqlite3.Connection) -> None:
     db.execute(
         '''
@@ -514,6 +700,26 @@ def _init_user_memory_candidates_table(db: sqlite3.Connection) -> None:
     )
 
 
+def _init_webadmin_login_tokens_table(db: sqlite3.Connection) -> None:
+    db.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS webadmin_login_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            admin_user_id INTEGER,
+            admin_username TEXT NOT NULL DEFAULT '',
+            expires_at DATETIME NOT NULL,
+            used_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        '''
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_webadmin_login_tokens_expiry "
+        "ON webadmin_login_tokens (expires_at, used_at)"
+    )
+
+
 async def _embed_message_content(username: str, content: str) -> tuple[np.ndarray, EmbeddingMetadata]:
     return await embed_text_with_metadata(f"{username}: {content}")
 
@@ -524,6 +730,8 @@ def init_db():
 
     with sqlite3.connect(db_file) as db:
         db.execute("PRAGMA foreign_keys = ON")
+        _init_db_metadata_table(db)
+        previous_schema_version = _get_db_schema_version(db)
         db.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -559,9 +767,14 @@ def init_db():
         _init_stickers_table(db)
         _init_user_memories_table(db)
         _init_user_memory_facts_table(db)
+        _init_global_memory_facts_table(db)
         _init_user_memory_candidates_table(db)
+        _init_webadmin_login_tokens_table(db)
+        _set_db_schema_version(db, DB_SCHEMA_VERSION)
 
         db.commit()
+        if previous_schema_version != DB_SCHEMA_VERSION:
+            logger.info("Database schema version updated: %s -> %s", previous_schema_version, DB_SCHEMA_VERSION)
         logger.info("Database initialized: %s", db_file)
 
 async def add_message(
@@ -1045,6 +1258,459 @@ async def get_user_memory_facts(
         )
         for row in rows
     ]
+
+
+async def get_global_memory_facts(
+    chat_id: int,
+    *,
+    limit: int = 8,
+    min_confidence: float = 0.0,
+) -> list[GlobalMemoryFactRow]:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        cursor = await db.execute(
+            '''
+            SELECT id, chat_id, fact_type, fact_text, confidence,
+                   evidence_message_ids, first_observed_at, last_confirmed_at
+            FROM global_memory_facts
+            WHERE chat_id = ? AND is_active = 1 AND confidence >= ?
+            ORDER BY confidence DESC, updated_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (chat_id, min_confidence, limit),
+        )
+        rows = await cursor.fetchall()
+
+    return [
+        GlobalMemoryFactRow(
+            id=int(row[0]),
+            chat_id=int(row[1]),
+            fact_type=str(row[2]),
+            fact_text=str(row[3]),
+            confidence=float(row[4]),
+            evidence_message_ids=_decode_evidence_ids(row[5]),
+            first_observed_at=row[6],
+            last_confirmed_at=row[7],
+        )
+        for row in rows
+    ]
+
+
+async def upsert_global_memory_facts(chat_id: int, facts: list[Mapping[str, Any]]) -> None:
+    if not facts:
+        return
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        for fact in facts:
+            fact_type = str(fact.get("fact_type") or fact.get("type") or "note").strip().lower() or "note"
+            fact_text = str(fact.get("fact_text") or fact.get("text") or "").strip()
+            if not fact_text:
+                continue
+
+            confidence = _clamp_confidence(fact.get("confidence", 0.5))
+            new_evidence_ids = _decode_evidence_ids(fact.get("evidence_message_ids") or fact.get("evidence_ids"))
+            observed_at = fact.get("first_observed_at") or fact.get("observed_at")
+            confirmed_at = fact.get("last_confirmed_at") or fact.get("observed_at")
+
+            cursor = await db.execute(
+                '''
+                SELECT evidence_message_ids, confidence, first_observed_at
+                FROM global_memory_facts
+                WHERE chat_id = ? AND fact_type = ? AND fact_text = ?
+                ''',
+                (chat_id, fact_type, fact_text),
+            )
+            existing = await cursor.fetchone()
+
+            if existing:
+                merged_evidence_ids = _decode_evidence_ids(existing[0]) + new_evidence_ids
+                merged_confidence = max(float(existing[1] or 0.0), confidence)
+                first_observed_at = existing[2] or observed_at
+                await db.execute(
+                    '''
+                    UPDATE global_memory_facts
+                    SET confidence = ?,
+                        evidence_message_ids = ?,
+                        first_observed_at = ?,
+                        last_confirmed_at = COALESCE(?, CURRENT_TIMESTAMP),
+                        is_active = 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE chat_id = ? AND fact_type = ? AND fact_text = ?
+                    ''',
+                    (
+                        merged_confidence,
+                        _encode_evidence_ids(merged_evidence_ids),
+                        first_observed_at,
+                        confirmed_at,
+                        chat_id,
+                        fact_type,
+                        fact_text,
+                    ),
+                )
+                continue
+
+            await db.execute(
+                '''
+                INSERT INTO global_memory_facts (
+                    chat_id,
+                    fact_type,
+                    fact_text,
+                    confidence,
+                    evidence_message_ids,
+                    first_observed_at,
+                    last_confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ''',
+                (
+                    chat_id,
+                    fact_type,
+                    fact_text,
+                    confidence,
+                    _encode_evidence_ids(new_evidence_ids),
+                    observed_at,
+                    confirmed_at,
+                ),
+            )
+        await db.commit()
+
+
+async def archive_global_memory_fact(chat_id: int, fact_id: int) -> bool:
+    if fact_id <= 0:
+        return False
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        cursor = await db.execute(
+            '''
+            UPDATE global_memory_facts
+            SET is_active = 0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND chat_id = ? AND is_active = 1
+            ''',
+            (fact_id, chat_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def list_global_memory_chat_overviews(*, limit: int = 40) -> list[GlobalMemoryChatOverviewRow]:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        message_cursor = await db.execute(
+            '''
+            SELECT summary.chat_id,
+                   summary.message_count,
+                   summary.latest_message_at,
+                   latest.username,
+                   latest.content
+            FROM (
+                SELECT chat_id,
+                       COUNT(*) AS message_count,
+                       MAX(timestamp) AS latest_message_at
+                FROM messages
+                GROUP BY chat_id
+            ) summary
+            LEFT JOIN messages latest ON latest.id = (
+                SELECT id
+                FROM messages
+                WHERE chat_id = summary.chat_id
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+            )
+            '''
+        )
+        message_rows = await message_cursor.fetchall()
+
+        fact_cursor = await db.execute(
+            '''
+            SELECT chat_id, COUNT(*)
+            FROM global_memory_facts
+            WHERE is_active = 1
+            GROUP BY chat_id
+            '''
+        )
+        fact_rows = await fact_cursor.fetchall()
+
+    overview_by_chat: dict[int, dict[str, Any]] = {}
+    for row in message_rows:
+        chat_id = int(row[0])
+        overview_by_chat[chat_id] = {
+            "chat_id": chat_id,
+            "message_count": int(row[1] or 0),
+            "global_fact_count": 0,
+            "latest_message_at": row[2],
+            "latest_message_username": row[3],
+            "latest_message_preview": row[4],
+        }
+
+    for row in fact_rows:
+        chat_id = int(row[0])
+        existing = overview_by_chat.setdefault(
+            chat_id,
+            {
+                "chat_id": chat_id,
+                "message_count": 0,
+                "global_fact_count": 0,
+                "latest_message_at": None,
+                "latest_message_username": None,
+                "latest_message_preview": None,
+            },
+        )
+        existing["global_fact_count"] = int(row[1] or 0)
+
+    overviews = [
+        GlobalMemoryChatOverviewRow(
+            chat_id=value["chat_id"],
+            message_count=value["message_count"],
+            global_fact_count=value["global_fact_count"],
+            latest_message_at=value["latest_message_at"],
+            latest_message_username=value["latest_message_username"],
+            latest_message_preview=value["latest_message_preview"],
+        )
+        for value in overview_by_chat.values()
+    ]
+    overviews.sort(
+        key=lambda row: (
+            row.latest_message_at or "",
+            row.global_fact_count,
+            row.message_count,
+            row.chat_id,
+        ),
+        reverse=True,
+    )
+    return overviews[: max(0, limit)]
+
+
+def _webadmin_token_from_row(row) -> WebAdminLoginTokenRow:
+    return WebAdminLoginTokenRow(
+        id=int(row[0]),
+        token_hash=str(row[1]),
+        admin_user_id=int(row[2]) if row[2] is not None else None,
+        admin_username=str(row[3] or ""),
+        expires_at=str(row[4]),
+        used_at=row[5],
+        created_at=row[6],
+    )
+
+
+def _utc_timestamp_after(seconds: int) -> str:
+    expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=max(1, seconds))
+    return expiry.strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def create_webadmin_login_token(
+    token_hash: str,
+    *,
+    admin_user_id: Optional[int] = None,
+    admin_username: str = "",
+    ttl_seconds: int = 600,
+) -> WebAdminLoginTokenRow:
+    cleaned_hash = (token_hash or "").strip()
+    if not cleaned_hash:
+        raise ValueError("token_hash is required")
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+    expires_at = _utc_timestamp_after(ttl_seconds)
+
+    async with aiosqlite.connect(db_file) as db:
+        await db.execute("DELETE FROM webadmin_login_tokens WHERE expires_at <= datetime('now', '-1 day')")
+        cursor = await db.execute(
+            '''
+            INSERT INTO webadmin_login_tokens (
+                token_hash,
+                admin_user_id,
+                admin_username,
+                expires_at
+            ) VALUES (?, ?, ?, ?)
+            ''',
+            (cleaned_hash, admin_user_id, admin_username or "", expires_at),
+        )
+        token_id = int(cursor.lastrowid) if cursor.lastrowid is not None else 0
+        await db.commit()
+
+    return WebAdminLoginTokenRow(
+        id=token_id,
+        token_hash=cleaned_hash,
+        admin_user_id=admin_user_id,
+        admin_username=admin_username or "",
+        expires_at=expires_at,
+        used_at=None,
+        created_at=None,
+    )
+
+
+async def consume_webadmin_login_token(token_hash: str) -> Optional[WebAdminLoginTokenRow]:
+    cleaned_hash = (token_hash or "").strip()
+    if not cleaned_hash:
+        return None
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            '''
+            SELECT id, token_hash, admin_user_id, admin_username, expires_at, used_at, created_at
+            FROM webadmin_login_tokens
+            WHERE token_hash = ?
+              AND used_at IS NULL
+              AND expires_at > CURRENT_TIMESTAMP
+            LIMIT 1
+            ''',
+            (cleaned_hash,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await db.commit()
+            return None
+
+        await db.execute(
+            "UPDATE webadmin_login_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL",
+            (int(row[0]),),
+        )
+        await db.commit()
+
+    return _webadmin_token_from_row(row)
+
+
+async def get_webadmin_dashboard_stats() -> WebAdminDashboardStats:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        cursor = await db.execute(
+            '''
+            SELECT
+                (SELECT COUNT(*) FROM messages),
+                (SELECT COUNT(DISTINCT chat_id) FROM messages),
+                (SELECT COUNT(*) FROM user_memories),
+                (SELECT COUNT(*) FROM user_memory_facts WHERE is_active = 1),
+                (SELECT COUNT(*) FROM user_memory_candidates WHERE status = 'pending'),
+                (SELECT COUNT(*) FROM global_memory_facts WHERE is_active = 1),
+                COALESCE((SELECT value FROM db_metadata WHERE key = ?), '0')
+            ''',
+            (DB_SCHEMA_VERSION_KEY,),
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        return WebAdminDashboardStats(0, 0, 0, 0, 0, 0, 0)
+    try:
+        schema_version = int(row[6] or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    return WebAdminDashboardStats(
+        message_count=int(row[0] or 0),
+        chat_count=int(row[1] or 0),
+        user_memory_count=int(row[2] or 0),
+        user_memory_fact_count=int(row[3] or 0),
+        pending_candidate_count=int(row[4] or 0),
+        global_memory_fact_count=int(row[5] or 0),
+        db_schema_version=schema_version,
+    )
+
+
+async def list_webadmin_chat_messages(
+    chat_id: int,
+    *,
+    limit: int = 100,
+    before_id: Optional[int] = None,
+    search: Optional[str] = None,
+) -> list[WebAdminMessageRow]:
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+
+    params: list[Any] = [chat_id]
+    query = '''
+        SELECT id, chat_id, username, content, timestamp, telegram_user_key,
+               telegram_message_id, reply_to_telegram_message_id, reply_to_db_message_id, reply_to_username
+        FROM messages
+        WHERE chat_id = ?
+    '''
+    if before_id is not None and before_id > 0:
+        query += " AND id < ?"
+        params.append(before_id)
+    needle = (search or "").strip().lower()
+    if needle:
+        query += " AND (LOWER(username) LIKE ? OR LOWER(content) LIKE ? OR LOWER(COALESCE(telegram_user_key, '')) LIKE ?)"
+        like_value = f"%{needle}%"
+        params.extend([like_value, like_value, like_value])
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 100), 500)))
+
+    async with aiosqlite.connect(db_file) as db:
+        cursor = await db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+
+    return [
+        WebAdminMessageRow(
+            id=int(row[0]),
+            chat_id=int(row[1]),
+            username=str(row[2] or ""),
+            content=str(row[3] or ""),
+            timestamp=str(row[4] or ""),
+            telegram_user_key=str(row[5]) if row[5] is not None else None,
+            telegram_message_id=int(row[6]) if row[6] is not None else None,
+            reply_to_telegram_message_id=int(row[7]) if row[7] is not None else None,
+            reply_to_db_message_id=int(row[8]) if row[8] is not None else None,
+            reply_to_username=str(row[9]) if row[9] is not None else None,
+        )
+        for row in rows
+    ]
+
+
+async def update_global_memory_fact(
+    chat_id: int,
+    fact_id: int,
+    *,
+    fact_text: Optional[str] = None,
+    fact_type: Optional[str] = None,
+    confidence: Optional[float] = None,
+) -> bool:
+    if fact_id <= 0:
+        return False
+
+    assignments: list[str] = []
+    params: list[Any] = []
+    if fact_text is not None:
+        cleaned_text = fact_text.strip()
+        if not cleaned_text:
+            return False
+        assignments.append("fact_text = ?")
+        params.append(cleaned_text)
+    if fact_type is not None:
+        cleaned_type = fact_type.strip().lower() or "note"
+        assignments.append("fact_type = ?")
+        params.append(cleaned_type)
+    if confidence is not None:
+        assignments.append("confidence = ?")
+        params.append(_clamp_confidence(confidence))
+    if not assignments:
+        return False
+
+    assignments.append("updated_at = CURRENT_TIMESTAMP")
+    params.extend([fact_id, chat_id])
+
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+    async with aiosqlite.connect(db_file) as db:
+        cursor = await db.execute(
+            f"UPDATE global_memory_facts SET {', '.join(assignments)} WHERE id = ? AND chat_id = ? AND is_active = 1",
+            tuple(params),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_user_memory_fact_by_id(fact_id: int) -> Optional[UserMemoryFactRow]:
@@ -2015,12 +2681,18 @@ def cli_main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("health", help="Show embedding health and drift status.")
+    subparsers.add_parser("migrate", help="Run DB schema migrations and print schema version.")
 
     reindex_parser = subparsers.add_parser("reindex", help="Rebuild message embeddings with the current runtime backend.")
     reindex_parser.add_argument("--chat-id", type=int, default=None, help="Optional chat id to reindex.")
 
     args = parser.parse_args()
     init_db()
+
+    if args.command == "migrate":
+        print(f"db_file={_db_file_path()}")
+        print(f"schema_version={get_db_schema_version()}")
+        return
 
     if args.command == "health":
         report = asyncio.run(get_embedding_health_report())

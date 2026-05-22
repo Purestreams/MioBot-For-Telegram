@@ -74,6 +74,31 @@ High-signal messages create pending candidates in the background. Fast candidate
 - `/crypto` returns Coinbase price data and Allez APR snapshots.
 - `/med2jpg` converts natural-language prescription requests into a rendered medical image. This requires optional TeX/PDF dependencies.
 
+### Web Admin
+
+MioBot includes a small FastAPI web admin under [webadmin](webadmin). It is intended for private operation, bound to `127.0.0.1` by default.
+
+Start it with:
+
+```bash
+miobot-webadmin
+```
+
+or:
+
+```bash
+uv run miobot-webadmin
+```
+
+Create a one-time login URL from a private Telegram chat with the bot:
+
+```text
+/webadmin_token
+/webadmin_token 30m
+```
+
+The admin UI supports Chinese and English, browsing chat history, editing personal memory summaries and facts, accepting or rejecting memory candidates, and editing group-scoped global memory.
+
 ## Architecture
 
 | Area | Files | Notes |

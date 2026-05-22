@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -16,6 +16,141 @@ INFO_FILE_PATH = Path(__file__).resolve().parent.parent / "config" / "info.txt"
 class ReplyStickerChoice:
     file_unique_id: str
     send_text: bool = True
+
+
+@dataclass(frozen=True)
+class ReplyActivationDecision:
+    should_reply: bool
+    reason: str = ""
+    reply_target: str = "sender"
+    memory_focus: list[str] = field(default_factory=list)
+    conversation_intent: str = "unknown"
+    response_mode: str = "direct_answer"
+    language_hint: str = "same_as_latest"
+    needs_rag: bool = True
+    rag_query_hint: str = ""
+    sensitivity: str = "normal"
+    sticker_hint: str = "none"
+    generation_notes: str = ""
+
+
+DEFAULT_MEMORY_SUBJECT_KEY = "sender"
+
+
+def _compact_string(value: object, *, max_chars: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _normalize_string_choice(value: object, *, allowed: set[str], default: str, max_chars: int = 80) -> str:
+    text = _compact_string(value, max_chars=max_chars).strip().lower()
+    if text in allowed:
+        return text
+    return default
+
+
+def _available_memory_subject_keys(available_memory_subjects: Optional[list[Mapping[str, Any]]]) -> list[str]:
+    keys: list[str] = []
+    for subject in available_memory_subjects or []:
+        key = _compact_string(subject.get("key"), max_chars=64)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _normalize_memory_focus(value: object, *, available_keys: list[str], should_reply: bool) -> list[str]:
+    if isinstance(value, str):
+        raw_items: list[object] = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+
+    allowed = set(available_keys)
+    selected: list[str] = []
+    for item in raw_items:
+        key = _compact_string(item, max_chars=64)
+        if key in allowed and key not in selected:
+            selected.append(key)
+        if len(selected) >= 3:
+            break
+
+    if not selected and should_reply and DEFAULT_MEMORY_SUBJECT_KEY in allowed:
+        selected.append(DEFAULT_MEMORY_SUBJECT_KEY)
+    return selected
+
+
+def _parse_reply_activation_decision(
+    payload: Optional[dict],
+    *,
+    available_memory_subjects: Optional[list[Mapping[str, Any]]] = None,
+) -> ReplyActivationDecision:
+    if payload is None:
+        return ReplyActivationDecision(should_reply=False, reason="invalid activation payload")
+
+    should_reply = _parse_json_boolean(payload.get("should_reply"))
+    if should_reply is None:
+        logger.warning("Model returned non-boolean should_reply field: %r", payload.get("should_reply"))
+        return ReplyActivationDecision(should_reply=False, reason="non-boolean should_reply")
+
+    subject_keys = _available_memory_subject_keys(available_memory_subjects)
+    reply_target_allowed = {"sender", "replied_to_author", "group", "bot", "none"}
+    intent_allowed = {"unknown", "answer_question", "banter", "clarify", "acknowledge", "help_task", "correct_misunderstanding"}
+    mode_allowed = {"direct_answer", "playful_short", "ask_clarifying_question", "supportive", "factual", "silent"}
+    language_allowed = {"same_as_latest", "zh", "en", "mixed"}
+    sensitivity_allowed = {"normal", "personal", "conflict", "technical", "unsafe_or_decline"}
+    sticker_allowed = {"none", "maybe", "prefer_sticker_only"}
+
+    return ReplyActivationDecision(
+        should_reply=should_reply,
+        reason=_compact_string(payload.get("reason"), max_chars=180),
+        reply_target=_normalize_string_choice(payload.get("reply_target"), allowed=reply_target_allowed, default="sender"),
+        memory_focus=_normalize_memory_focus(payload.get("memory_focus"), available_keys=subject_keys, should_reply=should_reply),
+        conversation_intent=_normalize_string_choice(payload.get("conversation_intent"), allowed=intent_allowed, default="unknown"),
+        response_mode=_normalize_string_choice(payload.get("response_mode"), allowed=mode_allowed, default="direct_answer" if should_reply else "silent"),
+        language_hint=_normalize_string_choice(payload.get("language_hint"), allowed=language_allowed, default="same_as_latest"),
+        needs_rag=_parse_json_boolean(payload.get("needs_rag")) if _parse_json_boolean(payload.get("needs_rag")) is not None else True,
+        rag_query_hint=_compact_string(payload.get("rag_query_hint"), max_chars=240),
+        sensitivity=_normalize_string_choice(payload.get("sensitivity"), allowed=sensitivity_allowed, default="normal"),
+        sticker_hint=_normalize_string_choice(payload.get("sticker_hint"), allowed=sticker_allowed, default="none"),
+        generation_notes=_compact_string(payload.get("generation_notes"), max_chars=240),
+    )
+
+
+def direct_reply_activation_decision(*, memory_focus: Optional[list[str]] = None, reason: str = "direct trigger") -> ReplyActivationDecision:
+    return ReplyActivationDecision(
+        should_reply=True,
+        reason=reason,
+        reply_target="sender",
+        memory_focus=memory_focus or [DEFAULT_MEMORY_SUBJECT_KEY],
+        conversation_intent="answer_question",
+        response_mode="direct_answer",
+        needs_rag=True,
+    )
+
+
+def reply_activation_decision_context_lines(decision: ReplyActivationDecision) -> list[str]:
+    memory_focus = ", ".join(decision.memory_focus) if decision.memory_focus else "(none)"
+    lines = [
+        "reply_plan:",
+        f"should_reply: {str(decision.should_reply).lower()}",
+        f"reason: {decision.reason or '(none)'}",
+        f"reply_target: {decision.reply_target}",
+        f"memory_focus: {memory_focus}",
+        f"conversation_intent: {decision.conversation_intent}",
+        f"response_mode: {decision.response_mode}",
+        f"language_hint: {decision.language_hint}",
+        f"needs_rag: {str(decision.needs_rag).lower()}",
+        f"sensitivity: {decision.sensitivity}",
+        f"sticker_hint: {decision.sticker_hint}",
+    ]
+    if decision.rag_query_hint:
+        lines.append(f"rag_query_hint: {decision.rag_query_hint}")
+    if decision.generation_notes:
+        lines.append(f"generation_notes: {decision.generation_notes}")
+    return lines
 
 
 def _strip_markdown_code_fence(text: str) -> str:
@@ -125,7 +260,7 @@ def _split_additional_context(additional_context: Optional[list[str]]) -> tuple[
     message_specific_context: list[str] = []
 
     for line in additional_context or []:
-        if line.startswith("user_memory_key:") or line.startswith("user_personal_memory:"):
+        if line.startswith(("global_memory", "chat_memory", "user_memory_key", "user_personal_memory")):
             durable_context.append(line)
         else:
             message_specific_context.append(line)
@@ -175,16 +310,62 @@ def _build_probe_system_prompt() -> str:
 You decide whether Mioo / 小小宫 should reply to the latest message in a Telegram group chat.
 
 Rules:
-- Return valid JSON with exactly two keys: \"should_reply\" and \"reason\".
+- Return valid JSON only.
+- Include these keys: "should_reply", "reason", "reply_target", "memory_focus", "conversation_intent", "response_mode", "language_hint", "needs_rag", "rag_query_hint", "sensitivity", "sticker_hint", and "generation_notes".
 - The section named \"LATEST MESSAGE TO RESPOND TO\" is the newest message.
 - The section named \"EARLIER HISTORY\" excludes that newest message and remains ordered from oldest to newest.
-- Decide only whether the bot should reply. Do not draft the reply itself.
+- Decide whether the bot should reply and produce a compact generation plan. Do not draft the reply itself.
 - Prefer silence unless the latest message clearly invites the bot in.
 - Reply when the latest message directly addresses the bot, asks the bot a question, gives the bot a task, or continues an active back-and-forth with the bot.
 - Stay silent for low-signal chat, acknowledgements, emoji-only reactions, or human-to-human banter that does not need the bot.
 - If the chat clearly says not to reply, prefer silence.
-- Keep \"reason\" short and specific.
+- "reply_target" must be one of: sender, replied_to_author, group, bot, none.
+- "memory_focus" must be a list containing only keys from AVAILABLE MEMORY SUBJECTS. Use [] when no personal memory should be used.
+- "conversation_intent" must be one of: unknown, answer_question, banter, clarify, acknowledge, help_task, correct_misunderstanding.
+- "response_mode" must be one of: direct_answer, playful_short, ask_clarifying_question, supportive, factual, silent.
+- "language_hint" must be one of: same_as_latest, zh, en, mixed.
+- "needs_rag" is true when retrieved chat history could improve the answer.
+- "rag_query_hint" is a short search query for later retrieval, or an empty string.
+- "sensitivity" must be one of: normal, personal, conflict, technical, unsafe_or_decline.
+- "sticker_hint" must be one of: none, maybe, prefer_sticker_only.
+- Keep "reason" and "generation_notes" short and operational. Do not include private memory content in generation_notes.
 """.strip()
+
+
+def _build_available_memory_subjects_block(available_memory_subjects: Optional[list[Mapping[str, Any]]]) -> str:
+    subjects = []
+    for subject in available_memory_subjects or []:
+        key = _compact_string(subject.get("key"), max_chars=64)
+        if not key:
+            continue
+        display = _compact_string(subject.get("display"), max_chars=120) or "(unknown)"
+        role = _compact_string(subject.get("role"), max_chars=80) or key
+        telegram_user_key = _compact_string(subject.get("telegram_user_key"), max_chars=80) or "(none)"
+        subjects.append(f"- key: {key}; role: {role}; display: {display}; telegram_user_key: {telegram_user_key}")
+    return "\n".join(subjects) if subjects else "(none)"
+
+
+def _build_probe_user_prompt(
+    message_history: list[str],
+    *,
+    rag_related_messages: Optional[list[str]] = None,
+    additional_context: Optional[list[str]] = None,
+    runtime_state: Optional[list[str]] = None,
+    direct_address_state: Optional[list[str]] = None,
+    available_memory_subjects: Optional[list[Mapping[str, Any]]] = None,
+) -> str:
+    return (
+        _build_user_prompt(
+            message_history,
+            rag_related_messages=rag_related_messages,
+            additional_context=additional_context,
+            runtime_state=runtime_state,
+            direct_address_state=direct_address_state,
+        )
+        + "\n### AVAILABLE MEMORY SUBJECTS\n"
+        + _build_available_memory_subjects_block(available_memory_subjects)
+        + "\n"
+    )
 
 
 def _build_generation_system_prompt(
@@ -341,8 +522,10 @@ async def should_activate_reply(
     is_reply_to_bot: bool = False,
     is_mentioned: bool = False,
     runtime_state: Optional[list[str]] = None,
+    available_memory_subjects: Optional[list[Mapping[str, Any]]] = None,
+    return_decision: bool = False,
     model: Optional[str] = None,
-) -> bool:
+) -> bool | ReplyActivationDecision:
     direct_address_state = _build_direct_address_state(
         is_reply_to_bot=is_reply_to_bot,
         is_mentioned=is_mentioned,
@@ -356,12 +539,13 @@ async def should_activate_reply(
                 },
                 {
                     "role": "user",
-                    "content": _build_user_prompt(
+                    "content": _build_probe_user_prompt(
                         message_history,
                         rag_related_messages=rag_related_messages,
                         additional_context=additional_context,
                         runtime_state=runtime_state,
                         direct_address_state=direct_address_state,
+                        available_memory_subjects=available_memory_subjects,
                     ),
                 },
             ],
@@ -372,18 +556,16 @@ async def should_activate_reply(
         result_json = _parse_reply_payload(completion.content or "")
         if result_json is None:
             logger.warning("Model returned invalid activation payload. Raw prefix: %r", (completion.content or "")[:200])
-            return False
-
-        should_reply = _parse_json_boolean(result_json.get("should_reply"))
-        if should_reply is None:
-            logger.warning("Model returned non-boolean should_reply field: %r", result_json.get("should_reply"))
-            return False
-
-        logger.info("Reply activation probe: %s", result_json)
-        return should_reply
+        decision = _parse_reply_activation_decision(
+            result_json,
+            available_memory_subjects=available_memory_subjects,
+        )
+        logger.info("Reply activation probe: %s", decision)
+        return decision if return_decision else decision.should_reply
     except Exception as exc:
         logger.exception("An error occurred in should_activate_reply: %s", exc)
-        return False
+        decision = ReplyActivationDecision(should_reply=False, reason="activation probe error")
+        return decision if return_decision else False
 
 
 async def generate_group_reply(

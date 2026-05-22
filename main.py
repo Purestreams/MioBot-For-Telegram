@@ -7,7 +7,8 @@ import io
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 from telegram import InputMediaPhoto, Update
 from telegram.constants import ParseMode
@@ -42,21 +43,33 @@ from app.youtube_dl import (
     compress_video_if_needed,
     resolve_caption_url,
 )
-from app.reply2message import choose_reply_sticker, generate_group_reply, should_activate_reply
+from app.reply2message import (
+    ReplyActivationDecision,
+    choose_reply_sticker,
+    direct_reply_activation_decision,
+    generate_group_reply,
+    reply_activation_decision_context_lines,
+    should_activate_reply,
+)
 from app.rag_embeddings import ensure_fastembed_ready
 from app.user_memory import (
     accept_user_memory_candidate,
     audit_user_memory_texts,
     extract_user_memory_candidate_from_message,
+    get_global_memory_context,
     get_personal_memory_context,
     refresh_user_memory_if_due,
     reject_user_memory_candidate,
 )
 from app.database import (
     add_message,
+    archive_global_memory_fact,
     archive_user_memory_fact,
+    create_webadmin_login_token,
     find_sticker_reply_candidates,
+    get_global_memory_facts,
     get_latest_display_name_for_user,
+    list_global_memory_chat_overviews,
     get_prompt_context_parts,
     get_sticker_text,
     get_user_memory,
@@ -69,8 +82,16 @@ from app.database import (
     record_sticker_reply_usage,
     search_user_memories,
     update_user_memory_fact,
+    upsert_global_memory_facts,
     upsert_user_memory,
     upsert_sticker_text,
+)
+from webadmin.security import (
+    format_ttl,
+    generate_login_token,
+    hash_login_token,
+    parse_login_token_ttl_seconds,
+    webadmin_base_url,
 )
 from app.image2text import StickerUnderstanding, image_to_text, sticker_to_understanding
 
@@ -267,7 +288,42 @@ async def handle_memory_admin_help(update: Update, context: ContextTypes.DEFAULT
         "/memory_accept <candidate_id> - accept a candidate into facts\n"
         "/memory_reject <candidate_id> - reject a candidate\n"
         "/memory_fact_set <fact_id> <text> - edit an active fact\n"
-        "/memory_fact_delete <fact_id> - archive an active fact"
+        "/memory_fact_delete <fact_id> - archive an active fact\n"
+        "/global_memory <chat_id> - view group-scoped global memory\n"
+        "/global_memory_set <chat_id> <fact_type> <text> - add/update group-scoped global memory\n"
+        "/global_memory_delete <chat_id> <fact_id> - archive a group-scoped global memory fact\n"
+        "/webadmin_token [10m] - create a one-time web admin login token"
+    )
+
+
+async def handle_webadmin_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    args = _admin_command_args(context)
+    ttl_seconds = parse_login_token_ttl_seconds(args[0] if args else None)
+    raw_token = generate_login_token()
+    user_id = getattr(update.effective_user, "id", None)
+    username = str(getattr(update.effective_user, "username", "") or "").lstrip("@")
+    token_row = await create_webadmin_login_token(
+        hash_login_token(raw_token),
+        admin_user_id=user_id if isinstance(user_id, int) else None,
+        admin_username=username,
+        ttl_seconds=ttl_seconds,
+    )
+    login_url = f"{webadmin_base_url()}/?token={quote(raw_token)}"
+    await message.reply_text(
+        _truncate_admin_reply(
+            "Web admin login token created.\n"
+            f"URL: {login_url}\n"
+            f"Token: {raw_token}\n"
+            f"Expires at UTC: {token_row.expires_at}\n"
+            f"TTL: {format_ttl(ttl_seconds)}\n"
+            "The token is single-use."
+        )
     )
 
 
@@ -469,6 +525,135 @@ def _parse_non_negative_int(value: str) -> Optional[int]:
     return parsed if parsed >= 0 else None
 
 
+def _parse_chat_id(value: str) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed != 0 else None
+
+
+def _resolve_global_memory_chat_args(args: list[str]) -> tuple[Optional[int], list[str], Optional[str]]:
+    chat_id = _parse_chat_id(args[0]) if args else None
+    if chat_id is None:
+        return None, args, "A chat_id is required for global memory commands."
+    return chat_id, args[1:], None
+
+
+async def _build_global_memory_chat_list_text(*, prefix: str = "") -> str:
+    rows = await list_global_memory_chat_overviews(limit=40)
+    lines: list[str] = []
+    if prefix:
+        lines.append(prefix.rstrip())
+        lines.append("")
+
+    if not rows:
+        lines.append("No chats found yet. Global memory commands require an explicit chat_id once chats exist.")
+        return _truncate_admin_reply("\n".join(lines))
+
+    lines.append(f"Available chat_ids ({len(rows)} shown):")
+    for row in rows:
+        latest = row.latest_message_at or "none"
+        latest_user = row.latest_message_username or "unknown"
+        preview = _compact_admin_text(row.latest_message_preview or "", max_chars=120) or "(no preview)"
+        lines.append(
+            f"- chat_id={row.chat_id} | messages={row.message_count} | global_facts={row.global_fact_count} | "
+            f"latest={latest} | {latest_user}: {preview}"
+        )
+    return _truncate_admin_reply("\n".join(lines))
+
+
+async def _reply_global_memory_chat_list(message, *, prefix: str = "") -> None:
+    await message.reply_text(await _build_global_memory_chat_list_text(prefix=prefix))
+
+
+async def handle_global_memory_admin_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    chat_id, _remaining_args, error = _resolve_global_memory_chat_args(_admin_command_args(context))
+    if error or chat_id is None:
+        await _reply_global_memory_chat_list(
+            message,
+            prefix="Usage: /global_memory <chat_id>\nA chat_id is required. Choose one below.",
+        )
+        return
+
+    facts = await get_global_memory_facts(chat_id, limit=25, min_confidence=0.0)
+    lines = [f"Global memory for chat_id={chat_id}:"]
+    if facts:
+        for fact in facts:
+            lines.append(f"- #{fact.id} [{fact.fact_type}] {fact.fact_text} (confidence={fact.confidence:.2f})")
+    else:
+        lines.append("(empty)")
+    await message.reply_text(_truncate_admin_reply("\n".join(lines)))
+
+
+async def handle_global_memory_admin_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    chat_id, remaining_args, error = _resolve_global_memory_chat_args(_admin_command_args(context))
+    if error or chat_id is None or len(remaining_args) < 2:
+        await _reply_global_memory_chat_list(
+            message,
+            prefix="Usage: /global_memory_set <chat_id> <fact_type> <text>\nChoose a chat_id below.",
+        )
+        return
+
+    fact_type = remaining_args[0].strip().lower()
+    fact_text = " ".join(remaining_args[1:]).strip()
+    if not fact_type or not fact_text:
+        await _reply_global_memory_chat_list(
+            message,
+            prefix="Usage: /global_memory_set <chat_id> <fact_type> <text>\nChoose a chat_id below.",
+        )
+        return
+
+    await upsert_global_memory_facts(
+        chat_id,
+        [
+            {
+                "fact_type": fact_type,
+                "fact_text": fact_text,
+                "confidence": 0.9,
+                "evidence_message_ids": [],
+            }
+        ],
+    )
+    await message.reply_text(
+        "Global memory fact saved.\n"
+        f"chat_id: {chat_id}\n"
+        f"[{fact_type}] {_compact_admin_text(fact_text)}"
+    )
+
+
+async def handle_global_memory_admin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_admin_private_chat(update):
+        return
+    message = update.message
+    if not message:
+        return
+
+    chat_id, remaining_args, error = _resolve_global_memory_chat_args(_admin_command_args(context))
+    fact_id = _parse_positive_int(remaining_args[0]) if remaining_args else None
+    if error or chat_id is None or fact_id is None:
+        await _reply_global_memory_chat_list(
+            message,
+            prefix="Usage: /global_memory_delete <chat_id> <fact_id>\nChoose a chat_id below, then run /global_memory <chat_id> to see fact IDs.",
+        )
+        return
+
+    archived = await archive_global_memory_fact(chat_id, fact_id)
+    await message.reply_text(f"Global memory fact #{fact_id} archived for chat_id={chat_id}." if archived else f"Global memory fact #{fact_id} was not found for chat_id={chat_id}.")
+
+
 async def handle_memory_admin_candidates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _ensure_admin_private_chat(update):
         return
@@ -627,6 +812,112 @@ def _build_group_reply_runtime_state(
         f"trigger_type: {trigger_type}",
         f"direct_addressed: {str(direct_addressed).lower()}",
     ]
+
+
+def _build_group_reply_memory_subjects(update: Update, *, sender_user, sender_display: str, telegram_user_key: Optional[str]) -> list[dict[str, str]]:
+    subjects: list[dict[str, str]] = []
+    if telegram_user_key:
+        subjects.append(
+            {
+                "key": "sender",
+                "role": "latest_message_author",
+                "display": sender_display,
+                "telegram_user_key": telegram_user_key,
+            }
+        )
+
+    replied_message = getattr(getattr(update, "message", None), "reply_to_message", None)
+    replied_user = getattr(replied_message, "from_user", None) if replied_message else None
+    replied_user_key = _telegram_user_key_from_user(replied_user)
+    if replied_user_key and replied_user_key != telegram_user_key and not getattr(replied_user, "is_bot", False):
+        subjects.append(
+            {
+                "key": "replied_to_author",
+                "role": "replied_message_author",
+                "display": _display_name_from_user(replied_user),
+                "telegram_user_key": replied_user_key,
+            }
+        )
+    return subjects
+
+
+def _coerce_activation_decision(value: object, *, direct_reason: str = "direct trigger") -> ReplyActivationDecision:
+    if isinstance(value, ReplyActivationDecision):
+        return value
+    if isinstance(value, bool):
+        if value:
+            return direct_reply_activation_decision(reason=direct_reason)
+        return ReplyActivationDecision(should_reply=False, reason="activation probe declined")
+    should_reply = bool(getattr(value, "should_reply", False))
+    if should_reply:
+        memory_focus = getattr(value, "memory_focus", None)
+        return direct_reply_activation_decision(
+            memory_focus=memory_focus if isinstance(memory_focus, list) else None,
+            reason=str(getattr(value, "reason", direct_reason) or direct_reason),
+        )
+    return ReplyActivationDecision(should_reply=False, reason=str(getattr(value, "reason", "activation probe declined") or "activation probe declined"))
+
+
+def _memory_subjects_by_key(subjects: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    return {subject["key"]: subject for subject in subjects if subject.get("key")}
+
+
+def _activation_memory_query(
+    *,
+    message_text: str,
+    additional_context: list[str],
+    sender_display: str,
+    decision: ReplyActivationDecision,
+) -> str:
+    parts = [decision.rag_query_hint, decision.conversation_intent, message_text]
+    for line in additional_context:
+        if line.startswith(("replied_to_content:", "message_relation:", "input_type:", "sticker_")):
+            parts.append(line)
+    parts.append(sender_display)
+    return "\n".join(part.strip() for part in parts if part and part.strip())
+
+
+async def _load_group_reply_memory_context(
+    *,
+    chat_id: int,
+    memory_subjects: list[dict[str, str]],
+    decision: ReplyActivationDecision,
+    query_text: str,
+) -> list[str]:
+    context_lines: list[str] = []
+
+    try:
+        global_memory = await get_global_memory_context(
+            chat_id,
+            query_text=query_text,
+            intent=decision.conversation_intent,
+        )
+        if global_memory:
+            context_lines.append(global_memory)
+    except Exception as exc:
+        logger.exception("Failed to read global memory context: %s", exc)
+
+    subjects_by_key = _memory_subjects_by_key(memory_subjects)
+    focus_keys = decision.memory_focus or (["sender"] if "sender" in subjects_by_key and decision.should_reply else [])
+    for focus_key in focus_keys[:3]:
+        subject = subjects_by_key.get(focus_key)
+        if not subject:
+            continue
+        telegram_user_key = subject.get("telegram_user_key")
+        if not telegram_user_key:
+            continue
+        try:
+            personal_memory = await get_personal_memory_context(
+                telegram_user_key,
+                query_text=query_text,
+                intent=decision.conversation_intent,
+            )
+            if personal_memory:
+                context_lines.append(f"user_memory_key[{focus_key}]: {telegram_user_key}")
+                context_lines.append(f"user_personal_memory: subject={focus_key}; display={subject.get('display') or telegram_user_key}\n{personal_memory}")
+        except Exception as exc:
+            logger.exception("Failed to read personal memory for %s: %s", telegram_user_key, exc)
+    return context_lines
 
 
 def _sticker_reply_enabled() -> bool:
@@ -1361,15 +1652,14 @@ async def _handle_group_ai_reply_pipeline(
     reply_to_tg_id = getattr(replied_message, "message_id", None) if replied_message else None
     reply_to_username = _display_name_from_user(getattr(replied_message, "from_user", None)) if replied_message else None
     raw_user_text = (getattr(update.message, "text", None) or getattr(update.message, "caption", None) or "").strip()
+    memory_subjects = _build_group_reply_memory_subjects(
+        update,
+        sender_user=sender_user,
+        sender_display=sender_display,
+        telegram_user_key=telegram_user_key,
+    )
 
     if telegram_user_key:
-        try:
-            personal_memory = await get_personal_memory_context(telegram_user_key)
-            if personal_memory:
-                merged_additional_context.append(f"user_memory_key: {telegram_user_key}")
-                merged_additional_context.append(f"user_personal_memory:\n{personal_memory}")
-        except Exception as exc:
-            logger.exception("Failed to read personal memory for %s: %s", telegram_user_key, exc)
         _schedule_personal_memory_refresh(context, telegram_user_key, sender_display)
 
     logger.info("Adding message to history for %s", sender_display)
@@ -1403,23 +1693,43 @@ async def _handle_group_ai_reply_pipeline(
 
     if is_directly_addressed:
         logger.info("User %s directly triggered the bot via %s.", sender_display, trigger_type)
+        activation_decision = direct_reply_activation_decision(reason=trigger_type)
     else:
         probe_history_messages, _ = await get_prompt_context_parts(chat_id, query="")
-        should_reply = await should_activate_reply(
+        probe_result = await should_activate_reply(
             message_history=probe_history_messages,
             additional_context=merged_additional_context or None,
             runtime_state=runtime_state,
             is_reply_to_bot=is_reply_to_bot,
             is_mentioned=is_mentioned,
+            available_memory_subjects=memory_subjects,
+            return_decision=True,
         )
-        if not should_reply:
+        activation_decision = _coerce_activation_decision(probe_result, direct_reason="activation probe approved")
+        if not activation_decision.should_reply:
             return
 
-    rag_query = _build_rag_query_from_message(
-        message_text,
+    memory_query = _activation_memory_query(
+        message_text=message_text,
         additional_context=merged_additional_context,
         sender_display=sender_display,
+        decision=activation_decision,
     )
+    merged_additional_context.extend(
+        await _load_group_reply_memory_context(
+            chat_id=chat_id,
+            memory_subjects=memory_subjects,
+            decision=activation_decision,
+            query_text=memory_query,
+        )
+    )
+    merged_additional_context.extend(reply_activation_decision_context_lines(activation_decision))
+
+    rag_query = _build_rag_query_from_message(
+        activation_decision.rag_query_hint or message_text,
+        additional_context=merged_additional_context,
+        sender_display=sender_display,
+    ) if activation_decision.needs_rag else ""
     history_messages, rag_related_messages = await get_prompt_context_parts(chat_id, query=rag_query)
 
     ai_reply = await generate_group_reply(
@@ -1831,7 +2141,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", handle_help))
 
-    # Private memory administration commands
+    # Memory administration commands
     application.add_handler(CommandHandler("memory_help", handle_memory_admin_help, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memories", handle_memory_admin_list, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memory_audit", handle_memory_admin_audit, filters=filters.ChatType.PRIVATE))
@@ -1844,6 +2154,10 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("memory_reject", handle_memory_admin_reject, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memory_fact_set", handle_memory_admin_fact_set, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("memory_fact_delete", handle_memory_admin_fact_delete, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("global_memory", handle_global_memory_admin_view, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("global_memory_set", handle_global_memory_admin_set, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("global_memory_delete", handle_global_memory_admin_delete, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("webadmin_token", handle_webadmin_token, filters=filters.ChatType.PRIVATE))
 
     # Commands for rendering to image
     application.add_handler(CommandHandler("md2jpg", handle_md2jpg_and_text2jpg))

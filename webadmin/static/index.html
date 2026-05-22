@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MioBot Web Admin</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="loginView" class="auth-shell">
+    <section class="auth-panel">
+      <div class="auth-head">
+        <div>
+          <p class="eyebrow">MioBot</p>
+          <h1 data-i18n="login.title">后台管理</h1>
+        </div>
+        <div class="lang-switch" role="group" aria-label="Language">
+          <button type="button" class="lang-button" data-lang="zh">中文</button>
+          <button type="button" class="lang-button" data-lang="en">EN</button>
+        </div>
+      </div>
+      <label class="field-label" for="tokenInput" data-i18n="login.tokenLabel">登录令牌</label>
+      <input id="tokenInput" class="text-input" autocomplete="one-time-code" spellcheck="false">
+      <div class="auth-actions">
+        <button id="loginButton" class="primary-button" type="button" data-i18n="login.button">登录</button>
+        <span id="loginStatus" class="status-text"></span>
+      </div>
+      <p class="hint" data-i18n="login.hint">在 Telegram 私聊里使用 /webadmin_token 生成临时令牌。</p>
+    </section>
+  </div>
+
+  <div id="appView" class="app-shell" hidden>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">MioBot</p>
+        <h1 data-i18n="app.title">后台管理</h1>
+      </div>
+      <div class="topbar-actions">
+        <span id="adminIdentity" class="admin-id"></span>
+        <div class="lang-switch" role="group" aria-label="Language">
+          <button type="button" class="lang-button" data-lang="zh">中文</button>
+          <button type="button" class="lang-button" data-lang="en">EN</button>
+        </div>
+        <button id="logoutButton" class="ghost-button" type="button" data-i18n="app.logout">退出</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <nav class="nav-list" aria-label="Admin views">
+          <button type="button" class="nav-item active" data-view="dashboard" data-i18n="nav.dashboard">概览</button>
+          <button type="button" class="nav-item" data-view="chats" data-i18n="nav.chats">聊天记录</button>
+          <button type="button" class="nav-item" data-view="memory" data-i18n="nav.memory">个人记忆</button>
+          <button type="button" class="nav-item" data-view="global" data-i18n="nav.global">全局记忆</button>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <section id="dashboardView" class="view active">
+          <div class="section-head">
+            <h2 data-i18n="dashboard.title">概览</h2>
+            <button id="refreshDashboard" class="ghost-button" type="button" data-i18n="actions.refresh">刷新</button>
+          </div>
+          <div id="metricGrid" class="metric-grid"></div>
+        </section>
+
+        <section id="chatsView" class="view">
+          <div class="section-head">
+            <h2 data-i18n="chats.title">聊天记录</h2>
+            <button id="refreshChats" class="ghost-button" type="button" data-i18n="actions.refresh">刷新</button>
+          </div>
+          <div class="split-layout">
+            <section class="panel list-panel">
+              <div class="panel-head">
+                <h3 data-i18n="chats.chatList">Chat ID</h3>
+              </div>
+              <div id="chatList" class="table-wrap"></div>
+            </section>
+            <section class="panel detail-panel">
+              <div class="panel-head inline-controls">
+                <h3 id="chatDetailTitle" data-i18n="chats.messages">消息</h3>
+                <input id="messageSearch" class="text-input compact" data-i18n-placeholder="chats.search" placeholder="搜索消息">
+                <button id="messageSearchButton" class="ghost-button" type="button" data-i18n="actions.search">搜索</button>
+              </div>
+              <div id="messageList" class="message-list empty-state" data-i18n="chats.pickChat">选择一个 chat_id 查看消息。</div>
+            </section>
+          </div>
+        </section>
+
+        <section id="memoryView" class="view">
+          <div class="section-head">
+            <h2 data-i18n="memory.title">个人记忆</h2>
+            <button id="refreshUsers" class="ghost-button" type="button" data-i18n="actions.refresh">刷新</button>
+          </div>
+          <div class="split-layout">
+            <section class="panel list-panel">
+              <div class="panel-head">
+                <h3 data-i18n="memory.users">用户</h3>
+              </div>
+              <div id="userList" class="table-wrap"></div>
+            </section>
+            <section class="panel detail-panel">
+              <div class="panel-head">
+                <h3 id="memoryDetailTitle" data-i18n="memory.detail">详情</h3>
+              </div>
+              <div id="memoryDetail" class="empty-state" data-i18n="memory.pickUser">选择一个用户查看记忆。</div>
+            </section>
+          </div>
+        </section>
+
+        <section id="globalView" class="view">
+          <div class="section-head">
+            <h2 data-i18n="global.title">全局记忆</h2>
+            <button id="refreshGlobal" class="ghost-button" type="button" data-i18n="actions.refresh">刷新</button>
+          </div>
+          <div class="split-layout">
+            <section class="panel list-panel">
+              <div class="panel-head">
+                <h3 data-i18n="global.chats">群聊</h3>
+              </div>
+              <div id="globalChatList" class="table-wrap"></div>
+            </section>
+            <section class="panel detail-panel">
+              <div class="panel-head">
+                <h3 id="globalDetailTitle" data-i18n="global.detail">记忆事实</h3>
+              </div>
+              <div class="fact-form">
+                <input id="globalFactType" class="text-input compact" data-i18n-placeholder="fields.type" placeholder="类型">
+                <input id="globalFactText" class="text-input" data-i18n-placeholder="fields.text" placeholder="内容">
+                <input id="globalFactConfidence" class="text-input tiny" value="0.9" inputmode="decimal">
+                <button id="addGlobalFact" class="primary-button" type="button" data-i18n="actions.add">添加</button>
+              </div>
+              <div id="globalFactList" class="empty-state" data-i18n="global.pickChat">选择一个 chat_id 查看全局记忆。</div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -123,6 +123,52 @@ def test_should_activate_reply_parses_json_with_prefixed_text(monkeypatch, tmp_p
     assert result is True
 
 
+def test_should_activate_reply_can_return_generation_plan(monkeypatch):
+    called = {}
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        called["user_prompt"] = messages[1]["content"]
+        return _Completion(
+            json.dumps(
+                {
+                    "should_reply": True,
+                    "reason": "direct question",
+                    "reply_target": "sender",
+                    "memory_focus": ["sender", "replied_to_author", "made_up"],
+                    "conversation_intent": "answer_question",
+                    "response_mode": "direct_answer",
+                    "language_hint": "zh",
+                    "needs_rag": True,
+                    "rag_query_hint": "deploy pipeline",
+                    "sensitivity": "technical",
+                    "sticker_hint": "none",
+                    "generation_notes": "answer briefly",
+                }
+            )
+        )
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+
+    result = asyncio.run(
+        reply2message.should_activate_reply(
+            ["u: hi"],
+            available_memory_subjects=[
+                {"key": "sender", "display": "Alice", "telegram_user_key": "tg_user:1", "role": "latest_message_author"},
+                {"key": "replied_to_author", "display": "Bob", "telegram_user_key": "tg_user:2", "role": "replied_message_author"},
+            ],
+            return_decision=True,
+        )
+    )
+
+    assert isinstance(result, reply2message.ReplyActivationDecision)
+    assert result.should_reply is True
+    assert result.memory_focus == ["sender", "replied_to_author"]
+    assert result.conversation_intent == "answer_question"
+    assert result.rag_query_hint == "deploy pipeline"
+    assert "AVAILABLE MEMORY SUBJECTS" in called["user_prompt"]
+    assert "key: sender" in called["user_prompt"]
+
+
 def test_should_activate_reply_rejects_string_boolean_values(monkeypatch, tmp_path):
     info_file = tmp_path / "info.txt"
     info_file.write_text("x\n", encoding="utf-8")

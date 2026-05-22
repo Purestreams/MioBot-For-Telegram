@@ -12,12 +12,12 @@ class _FakeMessage:
         self.replies.append(text)
 
 
-def _update(*, user_id=42, username="Natsume_Mio", chat_type="private"):
+def _update(*, user_id=42, username="Natsume_Mio", chat_type="private", chat_id=123):
     message = _FakeMessage()
     return SimpleNamespace(
         message=message,
         effective_user=SimpleNamespace(id=user_id, username=username),
-        effective_chat=SimpleNamespace(type=chat_type),
+        effective_chat=SimpleNamespace(type=chat_type, id=chat_id),
     )
 
 
@@ -48,6 +48,40 @@ def test_memory_admin_help_requires_private_admin(monkeypatch):
 
     assert group_update.message.replies == ["Memory admin commands are only available in a private chat."]
     assert non_admin_update.message.replies == ["You are not allowed to use memory admin commands."]
+
+
+def test_webadmin_token_creates_private_admin_login_url(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    monkeypatch.setenv("WEBADMIN_BASE_URL", "http://admin.local")
+    update = _update(username="AdminUser")
+    captured = {}
+
+    async def fake_create_webadmin_login_token(token_hash, *, admin_user_id=None, admin_username="", ttl_seconds=600):
+        captured.update(
+            {
+                "token_hash": token_hash,
+                "admin_user_id": admin_user_id,
+                "admin_username": admin_username,
+                "ttl_seconds": ttl_seconds,
+            }
+        )
+        return SimpleNamespace(expires_at="2026-05-22 12:00:00")
+
+    monkeypatch.setattr(main, "generate_login_token", lambda: "raw-token")
+    monkeypatch.setattr(main, "hash_login_token", lambda token: f"hash:{token}")
+    monkeypatch.setattr(main, "create_webadmin_login_token", fake_create_webadmin_login_token)
+
+    asyncio.run(main.handle_webadmin_token(update, _context(["30m"])))
+
+    reply = update.message.replies[0]
+    assert captured == {
+        "token_hash": "hash:raw-token",
+        "admin_user_id": 42,
+        "admin_username": "AdminUser",
+        "ttl_seconds": 1800,
+    }
+    assert "http://admin.local/?token=raw-token" in reply
+    assert "single-use" in reply
 
 
 def test_memory_admin_list_formats_overviews(monkeypatch):
@@ -312,3 +346,107 @@ def test_memory_admin_fact_edit_commands(monkeypatch):
     assert calls == {"update": (5, "Prefers short answers"), "archive": 5}
     assert "updated" in update.message.replies[0]
     assert "archived" in update.message.replies[1]
+
+
+def test_global_memory_admin_commands_require_private_chat(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update(chat_type="group", chat_id=-100)
+
+    asyncio.run(main.handle_global_memory_admin_view(update, _context(["-100"])))
+
+    assert update.message.replies == ["Memory admin commands are only available in a private chat."]
+
+
+def test_global_memory_admin_commands_use_private_explicit_chat_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update(chat_type="private")
+    calls = {"upsert": None, "archive": None}
+
+    async def fake_get_global_memory_facts(chat_id, *, limit=25, min_confidence=0.0):
+        assert chat_id == -100
+        return [
+            SimpleNamespace(
+                id=9,
+                chat_id=chat_id,
+                fact_type="style",
+                fact_text="Keep group replies concise",
+                confidence=0.9,
+            )
+        ]
+
+    async def fake_upsert_global_memory_facts(chat_id, facts):
+        calls["upsert"] = (chat_id, facts)
+
+    async def fake_archive_global_memory_fact(chat_id, fact_id):
+        calls["archive"] = (chat_id, fact_id)
+        return True
+
+    monkeypatch.setattr(main, "get_global_memory_facts", fake_get_global_memory_facts)
+    monkeypatch.setattr(main, "upsert_global_memory_facts", fake_upsert_global_memory_facts)
+    monkeypatch.setattr(main, "archive_global_memory_fact", fake_archive_global_memory_fact)
+
+    asyncio.run(main.handle_global_memory_admin_view(update, _context(["-100"])))
+    asyncio.run(main.handle_global_memory_admin_set(update, _context(["-100", "style", "Keep", "it", "short"])))
+    asyncio.run(main.handle_global_memory_admin_delete(update, _context(["-100", "9"])))
+
+    assert "chat_id=-100" in update.message.replies[0]
+    assert "Keep group replies concise" in update.message.replies[0]
+    assert calls["upsert"][0] == -100
+    assert calls["upsert"][1][0]["fact_type"] == "style"
+    assert calls["upsert"][1][0]["fact_text"] == "Keep it short"
+    assert calls["archive"] == (-100, 9)
+
+
+def test_global_memory_admin_private_chat_requires_chat_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update(chat_type="private")
+
+    async def fake_list_global_memory_chat_overviews(*, limit=40):
+        return [
+            SimpleNamespace(
+                chat_id=-100,
+                message_count=12,
+                global_fact_count=2,
+                latest_message_at="2026-05-22 10:00:00",
+                latest_message_username="Alice @alice",
+                latest_message_preview="latest group message",
+            )
+        ]
+
+    monkeypatch.setattr(main, "list_global_memory_chat_overviews", fake_list_global_memory_chat_overviews)
+
+    asyncio.run(main.handle_global_memory_admin_view(update, _context()))
+
+    reply = update.message.replies[0]
+    assert "Usage: /global_memory <chat_id>" in reply
+    assert "Available chat_ids" in reply
+    assert "chat_id=-100" in reply
+    assert "messages=12" in reply
+    assert "global_facts=2" in reply
+
+
+def test_global_memory_admin_set_and_delete_missing_args_show_chat_list(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42")
+    update = _update(chat_type="private")
+
+    async def fake_list_global_memory_chat_overviews(*, limit=40):
+        return [
+            SimpleNamespace(
+                chat_id=-200,
+                message_count=5,
+                global_fact_count=1,
+                latest_message_at="2026-05-22 11:00:00",
+                latest_message_username="Bob @bob",
+                latest_message_preview="another group message",
+            )
+        ]
+
+    monkeypatch.setattr(main, "list_global_memory_chat_overviews", fake_list_global_memory_chat_overviews)
+
+    asyncio.run(main.handle_global_memory_admin_set(update, _context()))
+    asyncio.run(main.handle_global_memory_admin_delete(update, _context()))
+
+    assert "Usage: /global_memory_set <chat_id>" in update.message.replies[0]
+    assert "chat_id=-200" in update.message.replies[0]
+    assert "Usage: /global_memory_delete <chat_id>" in update.message.replies[1]
+    assert "chat_id=-200" in update.message.replies[1]

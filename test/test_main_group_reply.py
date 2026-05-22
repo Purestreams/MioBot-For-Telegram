@@ -150,6 +150,69 @@ def test_group_reply_pipeline_includes_reply_relation_context(monkeypatch):
     assert any("user_personal_memory:" in line for line in captured["additional_context"])
 
 
+def test_group_reply_pipeline_uses_probe_memory_focus(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="A asks about B", message_id=102)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
+
+    parent = _FakeMessage(text="B project context", message_id=55)
+    parent.from_user = _FakeUser(name="UserB", is_bot=False, username="user_b", user_id=20202)
+    update.message.reply_to_message = parent
+
+    captured = {"memory_keys": [], "additional_context": []}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        return None
+
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+        return ["[t] UserA @user_a: A asks about B"], []
+
+    async def fake_should_activate_reply(**kwargs):
+        assert any(subject["key"] == "replied_to_author" for subject in kwargs["available_memory_subjects"])
+        return main.ReplyActivationDecision(
+            should_reply=True,
+            reason="asks about replied author",
+            reply_target="sender",
+            memory_focus=["replied_to_author"],
+            conversation_intent="answer_question",
+            rag_query_hint="B project context",
+        )
+
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
+        captured["memory_keys"].append(telegram_user_key)
+        assert kwargs["query_text"]
+        return f"memory for {telegram_user_key}"
+
+    async def fake_get_global_memory_context(chat_id, **kwargs):
+        assert chat_id == update.effective_chat.id
+        return "global_memory:\n- [style] keep it short"
+
+    async def fake_generate_group_reply(**kwargs):
+        captured["additional_context"] = kwargs.get("additional_context") or []
+        return "看 B 的记忆来回"
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "get_global_memory_context", fake_get_global_memory_context)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
+
+    update_any: Any = update
+    asyncio.run(main._handle_group_ai_reply_pipeline(update_any, "A asks about B"))
+
+    assert captured["memory_keys"] == ["tg_user:20202"]
+    assert any(line.startswith("global_memory:") for line in captured["additional_context"])
+    assert any(line.startswith("user_personal_memory: subject=replied_to_author") for line in captured["additional_context"])
+    assert any(line == "reply_target: sender" for line in captured["additional_context"])
+    assert update.message.replies == ["看 B 的记忆来回"]
+
+
 def test_group_reply_pipeline_stops_after_negative_probe(monkeypatch):
     update = _FakeUpdate()
 

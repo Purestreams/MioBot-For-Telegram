@@ -13,9 +13,11 @@ from typing import Any, Optional
 
 from app.ai_model import chat_completion_text
 from app.database import (
+    GlobalMemoryFactRow,
     MessageRow,
     UserMemoryCandidateRow,
     archive_user_memory_facts,
+    get_global_memory_facts,
     get_user_memory,
     get_user_memory_candidate,
     get_user_memory_facts,
@@ -57,6 +59,18 @@ def _personal_memory_context_max_chars() -> int:
     return get_runtime_int("PERSONAL_MEMORY_CONTEXT_MAX_CHARS", 1800)
 
 
+def _personal_memory_candidate_facts() -> int:
+    return get_runtime_int("PERSONAL_MEMORY_CANDIDATE_FACTS", 24)
+
+
+def _global_memory_context_max_chars() -> int:
+    return get_runtime_int("GLOBAL_MEMORY_CONTEXT_MAX_CHARS", 1000)
+
+
+def _global_memory_candidate_facts() -> int:
+    return get_runtime_int("GLOBAL_MEMORY_CANDIDATE_FACTS", 32)
+
+
 def _memory_candidate_auto_refresh_count() -> int:
     return get_runtime_int("MEMORY_CANDIDATE_AUTO_REFRESH_COUNT", 3)
 
@@ -93,6 +107,115 @@ def _trim_text(text: str, *, max_chars: int) -> str:
     if max_chars <= 0 or len(value) <= max_chars:
         return value
     return value[: max_chars - 1].rstrip() + "…"
+
+
+def _memory_selection_terms(*parts: Optional[str]) -> set[str]:
+    text = " ".join(part or "" for part in parts).lower()
+    terms: set[str] = set()
+    for token in re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]", text):
+        if len(token) >= 2 or re.match(r"[\u4e00-\u9fff]", token):
+            terms.add(token)
+    return terms
+
+
+def _fact_text_terms(fact) -> set[str]:
+    return _memory_selection_terms(getattr(fact, "fact_type", ""), getattr(fact, "fact_text", ""))
+
+
+def _intent_fact_type_priority(intent: Optional[str], preferred_fact_types: Optional[list[str]] = None) -> list[str]:
+    preferred = [fact_type.strip().lower() for fact_type in (preferred_fact_types or []) if fact_type and fact_type.strip()]
+    intent_key = (intent or "").strip().lower()
+    intent_defaults = {
+        "answer_question": ["project", "goal", "preference", "identity", "style", "relationship", "note"],
+        "help_task": ["project", "goal", "style", "preference", "identity", "note"],
+        "banter": ["relationship", "style", "preference", "identity", "note"],
+        "acknowledge": ["relationship", "style", "preference", "note"],
+        "clarify": ["project", "goal", "identity", "preference", "note"],
+        "correct_misunderstanding": ["identity", "relationship", "project", "note"],
+    }
+    for fact_type in intent_defaults.get(intent_key, ["identity", "style", "preference", "project", "goal", "relationship", "note"]):
+        if fact_type not in preferred:
+            preferred.append(fact_type)
+    return preferred
+
+
+def _memory_fact_score(fact, *, query_terms: set[str], type_priority: list[str]) -> float:
+    fact_type = str(getattr(fact, "fact_type", "note") or "note").lower()
+    confidence = float(getattr(fact, "confidence", 0.0) or 0.0)
+    fact_terms = _fact_text_terms(fact)
+    overlap = len(query_terms & fact_terms) / max(len(query_terms), 1) if query_terms else 0.0
+    type_rank = type_priority.index(fact_type) if fact_type in type_priority else len(type_priority)
+    type_score = max(0.0, 1.0 - (type_rank / max(len(type_priority), 1)))
+    evidence_count = len(getattr(fact, "evidence_message_ids", []) or [])
+    evidence_score = min(evidence_count, 5) / 5
+    recency_score = 1.0 if getattr(fact, "last_confirmed_at", None) else 0.0
+    return (confidence * 0.35) + (overlap * 0.35) + (type_score * 0.15) + (recency_score * 0.10) + (evidence_score * 0.05)
+
+
+def _select_memory_facts(
+    facts,
+    *,
+    max_facts: int,
+    query_text: Optional[str] = None,
+    intent: Optional[str] = None,
+    preferred_fact_types: Optional[list[str]] = None,
+) -> list:
+    if max_facts <= 0:
+        return []
+
+    type_priority = _intent_fact_type_priority(intent, preferred_fact_types)
+    query_terms = _memory_selection_terms(query_text, intent)
+
+    ranked = sorted(
+        facts,
+        key=lambda fact: (
+            _memory_fact_score(fact, query_terms=query_terms, type_priority=type_priority),
+            float(getattr(fact, "confidence", 0.0) or 0.0),
+            int(getattr(fact, "id", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+    selected: list = []
+    selected_ids: set[int] = set()
+    type_counts: dict[str, int] = {}
+
+    for fact_type in type_priority[:4]:
+        match = next(
+            (
+                fact
+                for fact in ranked
+                if int(getattr(fact, "id", 0) or 0) not in selected_ids
+                and str(getattr(fact, "fact_type", "") or "").lower() == fact_type
+            ),
+            None,
+        )
+        if match is None:
+            continue
+        selected.append(match)
+        selected_ids.add(int(getattr(match, "id", 0) or 0))
+        type_counts[fact_type] = type_counts.get(fact_type, 0) + 1
+        if len(selected) >= max_facts:
+            return selected
+
+    for fact in ranked:
+        fact_id = int(getattr(fact, "id", 0) or 0)
+        if fact_id in selected_ids:
+            continue
+        fact_type = str(getattr(fact, "fact_type", "note") or "note").lower()
+        if type_counts.get(fact_type, 0) >= 2 and len(ranked) - len(selected) > max_facts - len(selected):
+            continue
+        selected.append(fact)
+        selected_ids.add(fact_id)
+        type_counts[fact_type] = type_counts.get(fact_type, 0) + 1
+        if len(selected) >= max_facts:
+            break
+
+    return selected
+
+
+def _format_context_facts(facts) -> list[str]:
+    return [f"- [{fact.fact_type}] {fact.fact_text}" for fact in facts]
 
 
 def _format_facts_for_prompt(facts) -> str:
@@ -519,18 +642,30 @@ async def get_personal_memory_context(
     *,
     max_facts: int = 6,
     max_chars: Optional[int] = None,
+    query_text: Optional[str] = None,
+    intent: Optional[str] = None,
+    preferred_fact_types: Optional[list[str]] = None,
+    max_candidate_facts: Optional[int] = None,
 ) -> Optional[str]:
     if not telegram_user_key:
         return None
 
     current = await get_user_memory(telegram_user_key)
-    facts = await get_user_memory_facts(telegram_user_key, limit=max_facts, min_confidence=0.2)
+    candidate_limit = max(max_facts, max_candidate_facts or _personal_memory_candidate_facts())
+    candidate_facts = await get_user_memory_facts(telegram_user_key, limit=candidate_limit, min_confidence=0.2)
+    facts = _select_memory_facts(
+        candidate_facts,
+        max_facts=max_facts,
+        query_text=query_text,
+        intent=intent,
+        preferred_fact_types=preferred_fact_types,
+    )
     normalized_memory_text = _coerce_memory_text(current.memory_text) if current else ""
 
     sections: list[str] = []
     if facts:
         sections.append("structured_facts:")
-        sections.extend(f"- [{fact.fact_type}] {fact.fact_text}" for fact in facts)
+        sections.extend(_format_context_facts(facts))
     if normalized_memory_text:
         sections.append("summary:")
         sections.extend(normalized_memory_text.splitlines())
@@ -539,6 +674,30 @@ async def get_personal_memory_context(
         return None
 
     return _trim_text("\n".join(sections), max_chars=max_chars or _personal_memory_context_max_chars()) or None
+
+
+async def get_global_memory_context(
+    chat_id: int,
+    *,
+    max_facts: int = 8,
+    max_chars: Optional[int] = None,
+    query_text: Optional[str] = None,
+    intent: Optional[str] = None,
+    preferred_fact_types: Optional[list[str]] = None,
+    max_candidate_facts: Optional[int] = None,
+) -> Optional[str]:
+    candidate_limit = max(max_facts, max_candidate_facts or _global_memory_candidate_facts())
+    candidate_facts: list[GlobalMemoryFactRow] = await get_global_memory_facts(chat_id, limit=candidate_limit, min_confidence=0.2)
+    facts = _select_memory_facts(
+        candidate_facts,
+        max_facts=max_facts,
+        query_text=query_text,
+        intent=intent,
+        preferred_fact_types=preferred_fact_types,
+    )
+    if not facts:
+        return None
+    return _trim_text(f"global_memory[chat_id={chat_id}]:\n" + "\n".join(_format_context_facts(facts)), max_chars=max_chars or _global_memory_context_max_chars()) or None
 
 
 async def audit_user_memory_texts(*, limit: Optional[int] = 200) -> list[MemoryTextAuditRow]:

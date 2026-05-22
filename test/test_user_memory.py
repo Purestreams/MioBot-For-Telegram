@@ -226,6 +226,82 @@ def test_refresh_user_memory_parses_structured_facts(monkeypatch, tmp_path):
     assert facts[0].confidence == 0.84
 
 
+def test_personal_memory_context_prefers_query_relevant_facts(monkeypatch, tmp_path):
+    db_path = tmp_path / "memory_relevance.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def _run():
+        await database.upsert_user_memory_facts(
+            "tg_user:777",
+            [
+                {
+                    "fact_type": "preference",
+                    "fact_text": "Prefers tea over coffee",
+                    "confidence": 0.99,
+                    "evidence_message_ids": [1],
+                },
+                {
+                    "fact_type": "project",
+                    "fact_text": "Working on the deploy pipeline",
+                    "confidence": 0.55,
+                    "evidence_message_ids": [2],
+                },
+            ],
+        )
+        return await user_memory.get_personal_memory_context(
+            "tg_user:777",
+            max_facts=1,
+            query_text="help with deploy pipeline",
+            intent="help_task",
+        )
+
+    context = asyncio.run(_run())
+
+    assert context is not None
+    assert "Working on the deploy pipeline" in context
+    assert "Prefers tea over coffee" not in context
+
+
+def test_global_memory_context_uses_same_selector(monkeypatch, tmp_path):
+    db_path = tmp_path / "global_memory.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    async def _run():
+        await database.upsert_global_memory_facts(
+            -100,
+            [
+                {
+                    "fact_type": "style",
+                    "fact_text": "Keep replies warm and concise",
+                    "confidence": 0.9,
+                    "evidence_message_ids": [],
+                },
+                {
+                    "fact_type": "project",
+                    "fact_text": "The group often discusses the deploy pipeline",
+                    "confidence": 0.6,
+                    "evidence_message_ids": [3],
+                },
+            ]
+        )
+        return await user_memory.get_global_memory_context(
+            -100,
+            max_facts=1,
+            query_text="deploy pipeline",
+            intent="answer_question",
+        )
+
+    context = asyncio.run(_run())
+
+    assert context is not None
+    assert context.startswith("global_memory[chat_id=-100]:")
+    assert "deploy pipeline" in context
+
+
 def test_parse_memory_refresh_payload_coerces_list_memory_text():
     payload = user_memory._parse_memory_refresh_payload(
         json.dumps(

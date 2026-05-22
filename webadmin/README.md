@@ -14,6 +14,10 @@ Default URL:
 http://127.0.0.1:8765
 ```
 
+When running the Docker image, the default container command starts webadmin automatically together with the bot. Publish port `8765` from the container if you need browser access.
+
+For debugging you can start only the web admin with `BOT_ENABLED=0`, or disable webadmin with `WEBADMIN_ENABLED=0`.
+
 ## Login
 
 Create a one-time login URL in a private Telegram chat with the bot:
@@ -38,9 +42,11 @@ Tokens are short-lived and single-use. The web session is stored in an HttpOnly 
 ## Runtime Settings
 
 ```text
+BOT_ENABLED=1
 WEBADMIN_HOST=127.0.0.1
 WEBADMIN_PORT=8765
 WEBADMIN_BASE_URL=http://127.0.0.1:8765
+WEBADMIN_ENABLED=1
 WEBADMIN_SESSION_TTL_SECONDS=43200
 WEBADMIN_COOKIE_SECURE=0
 WEBADMIN_SECRET_KEY=

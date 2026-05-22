@@ -131,6 +131,23 @@ def test_webadmin_chat_messages_filter_by_search(monkeypatch, tmp_path):
     assert rows[0].telegram_user_key == "tg_user:1"
 
 
+def test_init_db_enables_wal_and_async_busy_timeout(monkeypatch, tmp_path):
+    db_path = tmp_path / "sqlite_pragmas.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    database.init_db()
+
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    async def _run():
+        async with database.aiosqlite.connect(str(db_path)) as db:
+            row = await (await db.execute("PRAGMA busy_timeout")).fetchone()
+            return int(row[0] or 0)
+
+    assert asyncio.run(_run()) == database.SQLITE_BUSY_TIMEOUT_MS
+
+
 def test_find_sticker_reply_candidates_prefers_matching_descriptions(monkeypatch, tmp_path):
     db_path = tmp_path / "sticker_candidates.db"
     monkeypatch.setenv("DB_FILE", str(db_path))

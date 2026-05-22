@@ -25,6 +25,7 @@ DB_FILE = get_runtime_value("DB_FILE")
 logger = logging.getLogger(__name__)
 DB_SCHEMA_VERSION = 3
 DB_SCHEMA_VERSION_KEY = "schema_version"
+SQLITE_BUSY_TIMEOUT_MS = 5000
 
 
 def _db_file_path() -> str:
@@ -407,6 +408,43 @@ async def _enable_foreign_keys(db: aiosqlite.Connection) -> None:
         pass
 
 
+def _configure_sqlite_connection(db: sqlite3.Connection) -> None:
+    db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA synchronous = NORMAL")
+    db.execute("PRAGMA foreign_keys = ON")
+
+
+async def _configure_async_sqlite_connection(db: aiosqlite.Connection) -> None:
+    await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    await db.execute("PRAGMA journal_mode = WAL")
+    await db.execute("PRAGMA synchronous = NORMAL")
+    await _enable_foreign_keys(db)
+
+
+class _ConfiguredAioSqliteConnection:
+    def __init__(self, connection: aiosqlite.Connection):
+        self._connection = connection
+
+    async def __aenter__(self) -> aiosqlite.Connection:
+        db = await self._connection.__aenter__()
+        await _configure_async_sqlite_connection(db)
+        return db
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._connection.__aexit__(exc_type, exc, tb)
+
+
+_ORIGINAL_AIOSQLITE_CONNECT = aiosqlite.connect
+
+
+def _configured_aiosqlite_connect(*args, **kwargs):
+    return _ConfiguredAioSqliteConnection(_ORIGINAL_AIOSQLITE_CONNECT(*args, **kwargs))
+
+
+aiosqlite.connect = _configured_aiosqlite_connect  # type: ignore[assignment]
+
+
 def _get_message_columns(db: sqlite3.Connection) -> set[str]:
     cursor = db.execute("PRAGMA table_info(messages)")
     return {str(row[1]) for row in cursor.fetchall()}
@@ -469,6 +507,7 @@ def get_db_schema_version() -> int:
     db_file = _db_file_path()
     _ensure_db_parent_dir(db_file)
     with sqlite3.connect(db_file) as db:
+        _configure_sqlite_connection(db)
         return _get_db_schema_version(db)
 
 
@@ -729,7 +768,7 @@ def init_db():
     _ensure_db_parent_dir(db_file)
 
     with sqlite3.connect(db_file) as db:
-        db.execute("PRAGMA foreign_keys = ON")
+        _configure_sqlite_connection(db)
         _init_db_metadata_table(db)
         previous_schema_version = _get_db_schema_version(db)
         db.execute('''

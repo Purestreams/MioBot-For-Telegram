@@ -90,7 +90,7 @@ or:
 uv run miobot-webadmin
 ```
 
-In Docker, the default container command now starts both the Telegram bot and the web admin. Publish the port explicitly, for example `-p 8765:8765`.
+Running `main.py` also starts the web admin automatically in a child process. In Docker, the default container command is still `python main.py`, so publish the port explicitly when you need browser access, for example `-p 8765:8765`.
 
 Create a one-time login URL from a private Telegram chat with the bot:
 

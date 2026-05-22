@@ -3,6 +3,23 @@ import pytest
 import main
 
 
+class _FakeProcess:
+    def __init__(self):
+        self.pid = 4321
+
+    def is_alive(self):
+        return False
+
+    def terminate(self):
+        return None
+
+    def join(self, timeout=None):
+        return None
+
+    def kill(self):
+        return None
+
+
 def test_main_raises_when_fastembed_check_fails(monkeypatch):
     async def fake_ensure_fastembed_ready(*, model_name=None):
         raise RuntimeError("fastembed startup failure")
@@ -79,6 +96,8 @@ def test_main_auto_reindexes_embeddings_when_health_requires_it(monkeypatch):
 
     monkeypatch.setattr(main, "ensure_fastembed_ready", fake_ensure_fastembed_ready)
     monkeypatch.setattr(main, "init_db", fake_init_db)
+    monkeypatch.setattr(main, "_start_webadmin_process", lambda: _FakeProcess())
+    monkeypatch.setattr(main, "_stop_webadmin_process", lambda process: None)
     monkeypatch.setattr(main, "log_embedding_health_report", fake_log_embedding_health_report)
     monkeypatch.setattr(main, "reindex_message_embeddings", fake_reindex_message_embeddings)
     monkeypatch.setattr(main, "register_handlers", fake_register_handlers)
@@ -87,3 +106,60 @@ def test_main_auto_reindexes_embeddings_when_health_requires_it(monkeypatch):
     main.main()
 
     assert calls == {"health": 2, "reindex": 1, "register": 1, "run_polling": 1}
+
+
+def test_main_starts_and_stops_webadmin_process(monkeypatch):
+    calls = {"start": 0, "stop": 0, "register": 0, "run_polling": 0}
+    process = _FakeProcess()
+
+    async def fake_ensure_fastembed_ready(*, model_name=None):
+        return None
+
+    async def fake_ensure_embedding_index_ready():
+        return None
+
+    class _FakeBuiltApplication:
+        def add_error_handler(self, handler):
+            return None
+
+        def run_polling(self):
+            calls["run_polling"] += 1
+
+    class _FakeApplicationBuilder:
+        def token(self, token):
+            return self
+
+        def read_timeout(self, timeout):
+            return self
+
+        def write_timeout(self, timeout):
+            return self
+
+        def build(self):
+            return _FakeBuiltApplication()
+
+    class _FakeApplication:
+        @staticmethod
+        def builder():
+            return _FakeApplicationBuilder()
+
+    monkeypatch.setattr(main, "ensure_fastembed_ready", fake_ensure_fastembed_ready)
+    monkeypatch.setattr(main, "_ensure_embedding_index_ready", fake_ensure_embedding_index_ready)
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "register_handlers", lambda application: calls.__setitem__("register", calls["register"] + 1))
+    monkeypatch.setattr(main, "Application", _FakeApplication)
+
+    def fake_start_webadmin_process():
+        calls["start"] += 1
+        return process
+
+    def fake_stop_webadmin_process(value):
+        calls["stop"] += 1
+        assert value is process
+
+    monkeypatch.setattr(main, "_start_webadmin_process", fake_start_webadmin_process)
+    monkeypatch.setattr(main, "_stop_webadmin_process", fake_stop_webadmin_process)
+
+    main.main()
+
+    assert calls == {"start": 1, "stop": 1, "register": 1, "run_polling": 1}

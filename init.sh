@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-declare -a child_pids=()
-
 bootstrap_runtime() {
 	if [[ "${EUID}" -ne 0 ]]; then
 		return
@@ -28,46 +26,10 @@ bootstrap_runtime() {
 	fi
 }
 
-run_service() {
-	if command -v uv >/dev/null 2>&1; then
-		uv run "$@"
-	else
-		"$@"
-	fi
-}
-
-cleanup() {
-	for pid in "${child_pids[@]:-}"; do
-		if [[ -n "$pid" ]]; then
-			kill "$pid" 2>/dev/null || true
-		fi
-	done
-}
-
-trap cleanup EXIT INT TERM
-
 bootstrap_runtime
 
-if [[ "${WEBADMIN_ENABLED:-1}" != "0" ]]; then
-	run_service miobot-webadmin &
-	child_pids+=("$!")
+if command -v uv >/dev/null 2>&1; then
+	exec uv run python main.py
 fi
 
-if [[ "${BOT_ENABLED:-1}" != "0" ]]; then
-	run_service python main.py &
-	child_pids+=("$!")
-fi
-
-if [[ "${#child_pids[@]}" -eq 0 ]]; then
-	echo "No services enabled. Set BOT_ENABLED=1 or WEBADMIN_ENABLED=1." >&2
-	exit 1
-fi
-
-set +e
-wait -n "${child_pids[@]}"
-exit_code=$?
-set -e
-
-cleanup
-wait || true
-exit "$exit_code"
+exec python main.py

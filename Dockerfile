@@ -27,21 +27,15 @@ COPY app ./app
 COPY config ./config
 COPY webadmin ./webadmin
 COPY main.py ./
-COPY init.sh ./
 
 # Install project and Playwright browser runtime.
-RUN python -m pip install --upgrade pip \
-    && python -m pip install ".[med]" \
-    && python -m playwright install --with-deps chromium
-
-RUN chmod +x /app/init.sh
+RUN python -m pip install --upgrade pip && python -m pip install ".[med]" && python -m playwright install --with-deps chromium
 
 # Prepare runtime directories.
 RUN mkdir -p /app/output /app/data
 
 # Use an unprivileged user at runtime.
-RUN useradd -m -u 10001 botuser \
-    && chown -R botuser:botuser /app /ms-playwright
+RUN useradd -m -u 10001 botuser && chown -R botuser:botuser /app /ms-playwright
 USER botuser
 
-CMD ["./init.sh"]
+CMD ["python", "main.py"]

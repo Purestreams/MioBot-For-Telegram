@@ -5,6 +5,7 @@ import asyncio
 import datetime
 import io
 import logging
+import multiprocessing
 import os
 import time
 from typing import Any, Optional
@@ -2200,6 +2201,30 @@ async def _ensure_embedding_index_ready() -> None:
     await log_embedding_health_report()
 
 
+def _run_webadmin_server() -> None:
+    from webadmin.app import main as webadmin_main
+
+    webadmin_main()
+
+
+def _start_webadmin_process() -> multiprocessing.Process:
+    process = multiprocessing.Process(target=_run_webadmin_server, name="miobot-webadmin", daemon=True)
+    process.start()
+    logger.info("Started webadmin process pid=%s", process.pid)
+    return process
+
+
+def _stop_webadmin_process(process: Optional[multiprocessing.Process]) -> None:
+    if process is None:
+        return
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1)
+
+
 def main() -> None:
     """Start the bot."""
 
@@ -2209,14 +2234,19 @@ def main() -> None:
     init_db()
     asyncio.run(_ensure_embedding_index_ready())
 
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()
+    webadmin_process = _start_webadmin_process()
 
-    register_handlers(application)
-    application.add_error_handler(handle_application_error)
+    try:
+        # Create the Application and pass it your bot's token.
+        application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()
 
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling()
+        register_handlers(application)
+        application.add_error_handler(handle_application_error)
+
+        # Run the bot until the user presses Ctrl-C
+        application.run_polling()
+    finally:
+        _stop_webadmin_process(webadmin_process)
 
 
 if __name__ == "__main__":

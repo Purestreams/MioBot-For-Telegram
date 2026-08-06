@@ -17,8 +17,14 @@ async def md_to_image(md_text, theme='cute_anime', output_path='output.png', wid
     # Get current date
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    # Convert Markdown to HTML
-    html_body = markdown2.markdown(md_text, extras=["fenced-code-blocks", "tables"])
+    # Raw HTML is not needed for Markdown rendering and would give a public
+    # bot command a way to make Chromium request arbitrary URLs.  Escape it
+    # rather than rendering it as active markup.
+    html_body = markdown2.markdown(
+        md_text,
+        extras=["fenced-code-blocks", "tables"],
+        safe_mode="escape",
+    )
 
     # CSS for themes
     base_css = f"""
@@ -84,6 +90,13 @@ async def md_to_image(md_text, theme='cute_anime', output_path='output.png', wid
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(device_scale_factor=4)
+
+        async def _block_network(route):
+            await route.abort()
+
+        # Markdown links and image syntax can still create network requests
+        # after HTML escaping.  Rendering is intentionally offline.
+        await page.route("**/*", _block_network)
         await page.set_content(html_content)
         
         # Set a viewport width. Height will be determined by full_page screenshot.

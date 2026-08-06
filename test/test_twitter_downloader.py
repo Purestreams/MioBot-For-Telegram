@@ -6,6 +6,7 @@ from yt_dlp.utils import DownloadError
 from app.twitter_downloader import (
     P_TWT_LINK,
     TwitterDownloader,
+    _extract_text_from_rich_payload,
     build_twitter_caption,
     format_tweet_text_for_reply,
     is_twitter_status_url,
@@ -16,12 +17,19 @@ class TwitterDownloaderRegexTests(unittest.TestCase):
     def test_detects_twitter_status_url(self):
         self.assertTrue(is_twitter_status_url("https://x.com/minokakay/status/2035538892175405329?s=46&t=abc"))
         self.assertTrue(is_twitter_status_url("https://twitter.com/user/status/1234567890"))
+        self.assertFalse(is_twitter_status_url("https://foo.x.com/user/status/1234567890"))
 
     def test_detects_html_escaped_twitter_status_url(self):
         escaped = "https://x.com/minokakay/status/2035538892175405329?s=46&amp;t=6C5C8msOW1klCHHbUUlASA"
         self.assertTrue(is_twitter_status_url(escaped))
         match = P_TWT_LINK.findall(escaped.replace("&amp;", "&"))
         self.assertEqual(match[0][1], "2035538892175405329")
+
+    def test_extracts_text_nested_in_an_article_post(self):
+        self.assertEqual(
+            _extract_text_from_rich_payload({"article": {"content": "long-form post"}}),
+            "long-form post",
+        )
 
 
 class TwitterDownloaderComponentTests(unittest.TestCase):
@@ -521,6 +529,20 @@ class TwitterDownloaderComponentTests(unittest.TestCase):
         self.assertEqual(text, {"123": "look pic.twitter.com/AbCdEf12"})
         resolver.assert_called_once_with("pic.twitter.com/AbCdEf12")
         downloader.assert_called_once_with("https://pbs.twimg.com/media/resolved.jpg")
+
+    def test_download_media_bytes_rejects_oversized_response(self):
+        response = mock.Mock()
+        response.headers = {"Content-Length": str(100)}
+        response.raise_for_status.return_value = None
+
+        with (
+            mock.patch.object(self.downloader.session, "get", return_value=response),
+            mock.patch("app.twitter_downloader.MAX_TWITTER_MEDIA_BYTES", 99),
+        ):
+            with self.assertRaises(ValueError):
+                self.downloader.download_media_bytes("https://video.twimg.com/example.mp4")
+
+        response.close.assert_called_once()
 
 
 class TwitterDownloaderFormattingTests(unittest.TestCase):

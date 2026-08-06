@@ -47,6 +47,7 @@ from webadmin.security import (
     hash_login_token,
     parse_session_cookie,
     session_ttl_seconds,
+    validate_webadmin_security_configuration,
     webadmin_cookie_secure,
     webadmin_host,
     webadmin_port,
@@ -87,6 +88,7 @@ def require_session(request: Request) -> dict[str, Any]:
 
 
 def create_app() -> FastAPI:
+    validate_webadmin_security_configuration()
     init_db()
     application = FastAPI(title="MioBot Web Admin", docs_url=None, redoc_url=None)
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

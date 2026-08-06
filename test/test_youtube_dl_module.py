@@ -48,6 +48,25 @@ def test_get_bilibili_permanent_url_returns_none_when_invalid_input():
     assert asyncio.run(youtube_dl.get_bilibili_permanent_url("")) is None
 
 
+def test_bilibili_canonicalizer_supports_av_and_query_style_links():
+    assert youtube_dl._extract_bilibili_canonical_url(
+        "https://www.bilibili.com/video/av170001?p=2"
+    ) == "https://www.bilibili.com/video/av170001/"
+    assert youtube_dl._extract_bilibili_canonical_url(
+        "bilibili.com/watch?bvid=BV1TuLA6ZEE7&from=share"
+    ) == "https://www.bilibili.com/video/BV1TuLA6ZEE7/"
+    assert youtube_dl._extract_bilibili_canonical_url(
+        "https://evil.example/video/BV1TuLA6ZEE7"
+    ) is None
+
+
+def test_bilibili_matcher_accepts_short_links_and_canonical_av_links():
+    assert youtube_dl._is_bilibili_url("https://b23.tv/Enqggyo")
+    assert youtube_dl._is_bilibili_url("https://www.bilibili.com/video/av170001")
+    assert youtube_dl._is_bilibili_url("https://www.bilibili.com/watch?bvid=BV1TuLA6ZEE7")
+    assert not youtube_dl._is_bilibili_url("https://foo.bilibili.com/video/BV1TuLA6ZEE7")
+
+
 def test_get_bilibili_permanent_url_fallbacks_to_followed_get(monkeypatch):
     head_response = _Response("https://b23.tv/abc123", status_code=302, headers={})
     get_response = _Response("https://www.bilibili.com/video/BV1TuLA6ZEE7?from=share", status_code=200)

@@ -8,7 +8,7 @@ import os
 import hashlib
 import subprocess
 import logging
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
 TELEGRAM_VIDEO_MAX_SIZE_BYTES = 50 * 1024 * 1024
 COMPRESSION_TARGET_RATIO = 0.96
@@ -30,25 +30,56 @@ BILIBILI_HTTP_HEADERS = {
 }
 
 BILIBILI_URL_REGEX = (
-    r'(https?://)?(?:www\.|m\.)?'
-    r'(bilibili\.com/|b23\.tv/)'
-    r'(?:video/|watch\?bvid=)?'
-    r'([A-Za-z0-9_-]{6,12})'
-    r'(?:[/?#][^\s]*)?'
+    r'(?<![\w@.])(?:https?://)?(?:www\.|m\.)?'
+    r'(?:bilibili\.com/(?:video/(?:BV[0-9A-Za-z]{10}|av\d+)|watch\?bvid=(?:BV[0-9A-Za-z]{10}|av\d+))'
+    r'|b23\.tv/[A-Za-z0-9_-]{6,32})'
+    r'(?![A-Za-z0-9_-])'
+    r'(?:[/?#&][^\s]*)?'
 )
+_BILIBILI_VIDEO_ID_REGEX = re.compile(r'(?i)^(BV[0-9A-Za-z]{10}|av\d+)$')
 
 
 def _is_bilibili_url(url: str) -> bool:
-    return bool(re.match(BILIBILI_URL_REGEX, url or ''))
+    return bool(re.match(BILIBILI_URL_REGEX, url or '', flags=re.IGNORECASE))
+
+
+def _extract_bilibili_video_id(url: str) -> Optional[str]:
+    """Extract a BV/AV identifier from canonical and query-style URLs."""
+    value = str(url or '').strip()
+    if not value:
+        return None
+    if not re.match(r'https?://', value, flags=re.IGNORECASE):
+        value = f'https://{value}'
+
+    parsed = urlsplit(value)
+    hostname = (parsed.hostname or '').lower().rstrip('.')
+    if hostname not in {'bilibili.com', 'www.bilibili.com', 'm.bilibili.com', 'b23.tv'}:
+        return None
+    path_parts = [unquote(part) for part in parsed.path.split('/') if part]
+    for index, part in enumerate(path_parts[:-1]):
+        if part.lower() == 'video':
+            candidate = path_parts[index + 1]
+            if _BILIBILI_VIDEO_ID_REGEX.fullmatch(candidate):
+                return candidate
+
+    query = parse_qs(parsed.query)
+    for key in ('bvid', 'aid'):
+        candidate = (query.get(key) or [None])[0]
+        if candidate:
+            normalized = str(candidate)
+            if key == 'aid' and normalized.isdigit():
+                return f'av{normalized}'
+            if _BILIBILI_VIDEO_ID_REGEX.fullmatch(normalized):
+                return normalized
+    return None
 
 
 def _extract_bilibili_canonical_url(url: str) -> Optional[str]:
     # Always normalize to a tracking-free canonical format.
-    match = re.search(r'https?://(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})', url or '')
-    if not match:
+    video_id = _extract_bilibili_video_id(url)
+    if not video_id:
         return None
-    bvid = match.group(1)
-    return f'https://www.bilibili.com/video/{bvid}/'
+    return f'https://www.bilibili.com/video/{video_id}/'
 
 
 def _build_ydl_base_opts(url: str) -> dict:
@@ -311,7 +342,7 @@ async def get_video_title(url: str) -> Optional[str]:
 
 async def resolve_caption_url(video_url: str) -> str:
     """Resolve canonical Bilibili URL for caption display when available."""
-    if re.match(BILIBILI_URL_REGEX, video_url):
+    if _is_bilibili_url(video_url):
         permanent_url = await get_bilibili_permanent_url(video_url)
         if permanent_url:
             return permanent_url

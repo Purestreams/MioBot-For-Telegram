@@ -35,10 +35,12 @@ Related modules: [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py
 
 ### Media Download
 
-- Plain text messages containing YouTube, Bilibili, Twitter/X, or Zhihu links trigger the media flow automatically.
+- Text messages containing one or more YouTube, Bilibili, Twitter/X, or Zhihu links trigger the media flow automatically; links can be protocol-less, punctuation-wrapped, or Telegram text links.
 - YouTube and Bilibili use [app/youtube_dl.py](app/youtube_dl.py), prefer MP4 up to 720p, and try ffmpeg compression when Telegram size limits are exceeded.
-- Twitter/X uses [app/twitter_downloader.py](app/twitter_downloader.py) and supports photos, videos, GIFs, and text-only fallback replies.
-- Zhihu uses [app/zhihu_dl.py](app/zhihu_dl.py) and returns parsed question, author, and answer text from answer links.
+- Twitter/X uses [app/twitter_downloader.py](app/twitter_downloader.py) and supports text/article posts, photos, videos, GIFs, and any combination of those payloads.
+- Supported links in group photo captions are processed alongside the image’s normal vision/reply pipeline.
+- Zhihu uses [app/zhihu_dl.py](app/zhihu_dl.py) with separate handling for answer/response links, column articles, posts/ideas, and bare questions.
+- Zhihu rich-content images are extracted from API/HTML payloads, downloaded from the image CDN without forwarding API cookies, and sent as Telegram photo albums (with large-image document fallback).
 - After successful media delivery, the original link message is deleted.
 
 ### Group Replies
@@ -109,7 +111,7 @@ The admin UI supports Chinese and English, browsing chat history, editing person
 | Runtime config | [app/runtime_config.py](app/runtime_config.py) | Loads env files and derives Ark chat/Responses endpoints |
 | LLM abstraction | [app/ai_model.py](app/ai_model.py) | Ark, Azure OpenAI, and Ollama chat completion wrapper |
 | Rendering | [app/text2md.py](app/text2md.py), [app/md2jpg.py](app/md2jpg.py) | Text shaping, HTML rendering, Playwright screenshot |
-| Media | [app/youtube_dl.py](app/youtube_dl.py), [app/twitter_downloader.py](app/twitter_downloader.py), [app/zhihu_dl.py](app/zhihu_dl.py) | Download, compression, captions, fallback parsing, Zhihu answer extraction |
+| Media | [app/youtube_dl.py](app/youtube_dl.py), [app/twitter_downloader.py](app/twitter_downloader.py), [app/zhihu_dl.py](app/zhihu_dl.py) | Download, compression, captions, fallback parsing, and type-aware Zhihu extraction |
 | Group replies | [app/reply2message.py](app/reply2message.py), [main.py](main.py) | Activation probe and reply generation |
 | Storage and RAG | [app/database.py](app/database.py), [app/rag_embeddings.py](app/rag_embeddings.py) | SQLite, embeddings, vector search, keyword search, reindexing |
 | Personal memory | [app/user_memory.py](app/user_memory.py) | Candidate extraction, summary refresh, structured facts |
@@ -163,7 +165,7 @@ Text messages are inspected for supported media URLs by helpers in [app/main_hel
 
 Twitter/X links are handled by [app/twitter_downloader.py](app/twitter_downloader.py). The extractor supports direct tweet parsing plus fallback services. It can return photos, videos, GIFs, or text-only content. Because the extraction stack uses synchronous network and parsing work, [main.py](main.py) runs it through `asyncio.to_thread()` so the async Telegram event loop is not blocked.
 
-Zhihu answer links are handled by [app/zhihu_dl.py](app/zhihu_dl.py). The parser reuses a logged-in requests session and cookie file to fetch the answer JSON, then [main.py](main.py) sends the parsed question, author, and answer text back as a Telegram message. This synchronous parser also runs through `asyncio.to_thread()`.
+Zhihu answer/response links, articles, posts/ideas, and bare questions are classified separately by [app/zhihu_dl.py](app/zhihu_dl.py). Answers use the answer API; other content uses its resource API with an HTML page fallback. Rich image references are returned separately from cleaned text, downloaded without API cookies, and sent as Telegram albums. This synchronous parser also runs through `asyncio.to_thread()`.
 
 After media is sent, status messages and original link messages are deleted best-effort. Cleanup failures are logged but do not break the reply flow.
 
@@ -347,11 +349,11 @@ Optional Twitter/X cookie configuration:
 
 ## Admin Commands
 
-Set `TELEGRAM_ADMIN_USER_IDS` to comma- or space-separated Telegram numeric user IDs or `@usernames`. Admin commands only work in private chat with the bot.
+Set `TELEGRAM_ADMIN_USER_IDS` to comma- or space-separated immutable Telegram numeric user IDs. Admin commands only work in private chat with the bot.
 
 ### Managing Personal Memory In Private Chat
 
-1. Add yourself to `TELEGRAM_ADMIN_USER_IDS`, for example `TELEGRAM_ADMIN_USER_IDS=@Natsume_Mio` or `TELEGRAM_ADMIN_USER_IDS=123456789`.
+1. Add yourself to `TELEGRAM_ADMIN_USER_IDS`, for example `TELEGRAM_ADMIN_USER_IDS=123456789`.
 2. Restart the bot so the runtime config is reloaded.
 3. Open a private Telegram chat with the bot. These commands are rejected in groups.
 4. Send `/memory_help` to see the available memory commands.
@@ -533,7 +535,8 @@ Some *markdown* here,,,
 - 文本消息中出现 YouTube、Bilibili、Twitter/X、知乎链接时自动触发。
 - YouTube / Bilibili 使用 [app/youtube_dl.py](app/youtube_dl.py)，优先下载不高于 720p 的 MP4，超过 Telegram 限制时尝试压缩。
 - Twitter/X 使用 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图片、视频、GIF 和纯文本兜底。
-- 知乎回答链接使用 [app/zhihu_dl.py](app/zhihu_dl.py)，返回问题、回答者和回答正文。
+- 知乎链接由 [app/zhihu_dl.py](app/zhihu_dl.py) 区分回答/回复、专栏文章、想法/帖子和问题，分别抓取对应内容。
+- 知乎正文中的图片链接会独立提取并发送为 Telegram 图片组；超大图片自动改为文件发送，下载图片时不会转发 API 登录 cookie。
 - 媒体成功发送后会删除原始链接消息。
 
 ### 群聊回复
@@ -610,7 +613,7 @@ Some *markdown* here,,,
 
 Twitter/X 走 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图片、视频、GIF 和纯文本兜底。因为这部分有同步网络和解析逻辑，[main.py](main.py) 使用 `asyncio.to_thread()` 执行，避免阻塞 async Telegram event loop。
 
-知乎回答链接走 [app/zhihu_dl.py](app/zhihu_dl.py)，使用保存的 cookie 会话请求知乎回答 JSON，然后把问题、作者和正文整理成文本消息返回。因为这部分也是同步网络请求，[main.py](main.py) 同样通过 `asyncio.to_thread()` 执行，避免阻塞 Telegram 的 async 事件循环。
+知乎回答/回复、文章、想法/帖子和问题链接走 [app/zhihu_dl.py](app/zhihu_dl.py)，回答使用回答 API，其他类型使用对应资源 API 并在必要时回退到页面解析；正文图片会与清理后的文本分开提取、下载并发送。因为这部分也是同步网络请求，[main.py](main.py) 同样通过 `asyncio.to_thread()` 执行，避免阻塞 Telegram 的 async 事件循环。
 
 媒体发送成功后，状态消息和原始链接消息会 best-effort 删除；删除失败只记录日志，不影响主流程。
 
@@ -694,7 +697,7 @@ RAG query 不只是当前文本。[app/main_helpers.py](app/main_helpers.py) 会
 
 ### 记忆管理员工具
 
-管理员工具在 [main.py](main.py) 中实现。权限检查同时校验私聊和 `TELEGRAM_ADMIN_USER_IDS`，支持 Telegram 数字 ID 和 `@username`。
+管理员工具在 [main.py](main.py) 中实现。权限检查同时校验私聊和 `TELEGRAM_ADMIN_USER_IDS`，只接受不会变更的 Telegram 数字 ID。
 
 管理员能力分三类：
 
@@ -771,11 +774,11 @@ Ark endpoint 已统一：只配置 `ARK_API_ENDPOINT`。文本模型使用自动
 
 ## 管理员命令
 
-`TELEGRAM_ADMIN_USER_IDS` 支持 Telegram 数字用户 ID 或 `@username`，逗号或空格分隔。管理员命令只在私聊 bot 时生效。
+`TELEGRAM_ADMIN_USER_IDS` 只支持 Telegram 数字用户 ID，逗号或空格分隔。管理员命令只在私聊 bot 时生效。
 
 ### 在私聊里管理个人记忆
 
-1. 先把自己加入 `TELEGRAM_ADMIN_USER_IDS`，例如 `TELEGRAM_ADMIN_USER_IDS=@Natsume_Mio` 或 `TELEGRAM_ADMIN_USER_IDS=123456789`。
+1. 先把自己加入 `TELEGRAM_ADMIN_USER_IDS`，例如 `TELEGRAM_ADMIN_USER_IDS=123456789`。
 2. 重启 bot，让运行时配置重新加载。
 3. 在 Telegram 里打开和 bot 的私聊。下面这些命令在群聊里会被拒绝。
 4. 发送 `/memory_help` 查看所有记忆管理命令。

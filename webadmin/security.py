@@ -9,7 +9,9 @@ import json
 import re
 import secrets
 import time
+from ipaddress import ip_address
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from app.runtime_config import get_runtime_bool, get_runtime_int, get_runtime_value
 
@@ -17,6 +19,7 @@ SESSION_COOKIE_NAME = "miobot_webadmin_session"
 DEFAULT_LOGIN_TOKEN_TTL_SECONDS = 600
 MAX_LOGIN_TOKEN_TTL_SECONDS = 1800
 DEFAULT_SESSION_TTL_SECONDS = 12 * 60 * 60
+_EPHEMERAL_SESSION_SECRET = secrets.token_bytes(32)
 
 
 def generate_login_token() -> str:
@@ -67,7 +70,9 @@ def webadmin_port() -> int:
 
 
 def webadmin_cookie_secure() -> bool:
-    return get_runtime_bool("WEBADMIN_COOKIE_SECURE", False)
+    # HTTPS deployments must never allow the session cookie over HTTP.  A
+    # local HTTP server may opt in explicitly if needed for development.
+    return webadmin_base_url().lower().startswith("https://") or get_runtime_bool("WEBADMIN_COOKIE_SECURE", False)
 
 
 def session_ttl_seconds() -> int:
@@ -75,8 +80,35 @@ def session_ttl_seconds() -> int:
 
 
 def _session_secret() -> bytes:
-    secret = get_runtime_value("WEBADMIN_SECRET_KEY") or get_runtime_value("TELEGRAM_BOT_KEY") or "miobot-webadmin-dev-secret"
-    return secret.encode("utf-8")
+    secret = get_runtime_value("WEBADMIN_SECRET_KEY")
+    # A random process-local value is safe for local development and avoids a
+    # predictable fallback. Sessions intentionally expire after a restart.
+    return secret.encode("utf-8") if secret else _EPHEMERAL_SESSION_SECRET
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = (host or "").strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_webadmin_security_configuration() -> None:
+    """Reject public insecure configurations before serving private data."""
+    host = webadmin_host()
+    base_url = webadmin_base_url()
+    scheme = urlsplit(base_url).scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise RuntimeError("WEBADMIN_BASE_URL must use http or https.")
+    if _is_loopback_host(host):
+        return
+    if scheme != "https":
+        raise RuntimeError("A non-loopback web admin requires an HTTPS WEBADMIN_BASE_URL.")
+    if not get_runtime_value("WEBADMIN_SECRET_KEY"):
+        raise RuntimeError("A non-loopback web admin requires WEBADMIN_SECRET_KEY.")
 
 
 def _b64encode(raw: bytes) -> str:

@@ -25,17 +25,16 @@ def _context(args=None):
     return SimpleNamespace(args=args or [])
 
 
-def test_admin_ids_accept_numeric_and_tg_user_tokens(monkeypatch):
+def test_admin_ids_accept_only_numeric_and_tg_user_tokens(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "42, tg_user:100 @Natsume_Mio")
 
     assert main._configured_admin_user_ids() == {42, 100}
-    assert main._configured_admin_usernames() == {"natsume_mio"}
 
 
-def test_admin_check_accepts_configured_username(monkeypatch):
+def test_admin_check_rejects_configured_username(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "@Natsume_Mio")
 
-    assert main._is_admin_update(_update(user_id=999, username="natsume_mio")) is True
+    assert main._is_admin_update(_update(user_id=999, username="natsume_mio")) is False
 
 
 def test_memory_admin_help_requires_private_admin(monkeypatch):
@@ -254,7 +253,7 @@ def test_memory_admin_refresh_forces_refresh(monkeypatch):
 
 
 def test_memory_admin_set_replaces_summary(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "@Natsume_Mio")
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "999")
     update = _update(user_id=999, username="Natsume_Mio")
     captured = {}
 
@@ -284,7 +283,7 @@ def test_memory_admin_set_replaces_summary(monkeypatch):
 
 
 def test_memory_admin_candidate_review_commands(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "@Natsume_Mio")
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "999")
     update = _update(user_id=999, username="Natsume_Mio")
     calls = {"accept": None, "reject": None}
 
@@ -325,7 +324,7 @@ def test_memory_admin_candidate_review_commands(monkeypatch):
 
 
 def test_memory_admin_fact_edit_commands(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "@Natsume_Mio")
+    monkeypatch.setenv("TELEGRAM_ADMIN_USER_IDS", "999")
     update = _update(user_id=999, username="Natsume_Mio")
     calls = {"update": None, "archive": None}
 

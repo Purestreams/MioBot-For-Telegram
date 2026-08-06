@@ -4,37 +4,64 @@ import logging
 import os
 import re
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 OUTPUT_DIR = "output"
 logger = logging.getLogger(__name__)
 
 # URL regex patterns
 YOUTUBE_URL_REGEX = (
-    r'(https?://)?(www\.)?'
+    r'(?<![\w@.])(https?://)?(www\.)?'
     r'(youtube\.com/|youtu\.be/|youtube-nocookie\.com/)'
     r'(?:watch\?v=|embed/|v/|shorts/|live/)?'
-    r'([a-zA-Z0-9_-]{11})'
+    r'([a-zA-Z0-9_-]{11})(?![a-zA-Z0-9_-])'
+    r'(?:[/?#&][^\s]*)?'
 )
 BILIBILI_URL_REGEX = (
-    r'(https?://)?(?:www\.|m\.)?'
-    r'(bilibili\.com/|b23\.tv/)'
-    r'(?:video/|watch\?bvid=)?'
-    r'([A-Za-z0-9_-]{6,12})'
-    r'(?:[/?#][^\s]*)?'
+    r'(?<![\w@.])(?:https?://)?(?:www\.|m\.)?'
+    r'(?:bilibili\.com/(?:video/(?:BV[0-9A-Za-z]{10}|av\d+)|watch\?bvid=(?:BV[0-9A-Za-z]{10}|av\d+))'
+    r'|b23\.tv/[A-Za-z0-9_-]{6,32})'
+    r'(?![A-Za-z0-9_-])'
+    r'(?:[/?#&][^\s]*)?'
 )
 TWITTER_URL_REGEX = (
     # Keep protocol optional to match existing YouTube/Bilibili behavior.
-    r'(https?://)?(?:www\.)?'
+    r'(?<![\w@.])(https?://)?(?:www\.)?'
     r'(twitter\.com/|x\.com/)'
-    r'[A-Za-z0-9_]+/status/\d+'
+    r'[A-Za-z0-9_]+/status/\d+(?![A-Za-z0-9_])'
     r'(?:[/?#][^\s]*)?'
 )
-ZHIHU_URL_REGEX = (
-    r'(https?://)?(?:www\.)?'
+ZHIHU_ANSWER_URL_REGEX = (
+    r'(?<![\w@.])(?:https?://)?(?:www\.)?'
     r'zhihu\.com/'
-    r'(?:question/\d+(?:/answer/\d+)?|answer/\d+)'
+    r'(?:question/\d+(?![A-Za-z0-9_])/answer/\d+(?![A-Za-z0-9_])|answer/\d+(?![A-Za-z0-9_]))'
     r'(?:[/?#][^\s]*)?'
 )
+ZHIHU_ARTICLE_URL_REGEX = (
+    r'(?<![\w@.])(?:https?://)?'
+    r'(?:(?:www\.)?zhihu\.com/(?:article/\d+(?![A-Za-z0-9_])|column/[^/\s]+/p/\d+(?![A-Za-z0-9_]))|'
+    r'zhuanlan\.zhihu\.com/p/\d+(?![A-Za-z0-9_]))'
+    r'(?:[/?#][^\s]*)?'
+)
+ZHIHU_POST_URL_REGEX = (
+    r'(?<![\w@.])(?:https?://)?(?:www\.)?zhihu\.com/'
+    r'(?:(?:pin|p)/\d+(?![A-Za-z0-9_])|people/[^/\s]+/(?:pins|posts)/\d+(?![A-Za-z0-9_]))'
+    r'(?:[/?#][^\s]*)?'
+)
+ZHIHU_QUESTION_URL_REGEX = (
+    r'(?<![\w@.])(?:https?://)?(?:www\.)?'
+    r'zhihu\.com/'
+    r'question/\d+(?![A-Za-z0-9_])'
+    r'(?:[/?#][^\s]*)?'
+)
+ZHIHU_URL_REGEX = "(?:" + "|".join(
+    (
+        ZHIHU_ANSWER_URL_REGEX,
+        ZHIHU_ARTICLE_URL_REGEX,
+        ZHIHU_POST_URL_REGEX,
+        ZHIHU_QUESTION_URL_REGEX,
+    )
+) + ")"
 
 MD2JPG_REGEX = r'/md2jpg(?:@\w+)?\s*,,,(.*),,,'
 TEXT2JPG_REGEX = r'/text2jpg(?:@\w+)?\s*,,,(.*),,,'
@@ -78,24 +105,135 @@ async def _delete_message_if_exists(message) -> None:
 
 
 def _extract_video_url(message_text: str) -> Optional[str]:
-    youtube_match = re.search(YOUTUBE_URL_REGEX, message_text)
-    bilibili_match = re.search(BILIBILI_URL_REGEX, message_text)
-    twitter_match = re.search(TWITTER_URL_REGEX, message_text)
-    zhihu_match = re.search(ZHIHU_URL_REGEX, message_text)
+    """Return the first supported link, preserving the legacy API.
 
-    if youtube_match:
-        return youtube_match.group(0)
-    if bilibili_match:
-        return bilibili_match.group(0)
-    if twitter_match:
-        return twitter_match.group(0)
-    if zhihu_match:
-        return zhihu_match.group(0)
-    return None
+    New callers should use :func:`extract_supported_links` when a message may
+    contain more than one link.  Keeping this wrapper avoids changing callers
+    that only need one URL.
+    """
+    links = extract_supported_links(message_text)
+    return links[0] if links else None
+
+
+_SUPPORTED_LINK_PATTERNS = (
+    ("youtube", re.compile(YOUTUBE_URL_REGEX, re.IGNORECASE)),
+    ("bilibili", re.compile(BILIBILI_URL_REGEX, re.IGNORECASE)),
+    ("twitter", re.compile(TWITTER_URL_REGEX, re.IGNORECASE)),
+    ("zhihu", re.compile(ZHIHU_URL_REGEX, re.IGNORECASE)),
+)
+_URL_TRAILING_PUNCTUATION = ".,!?;:'\"”’)]}>。，！？；："
+_QUERY_ALLOWLISTS = {
+    # Keep only fields that select the requested video/page or intentional
+    # playback position.  Share IDs and campaign parameters are discarded.
+    "youtube": frozenset({"v", "list", "index", "start", "end", "t"}),
+    "bilibili": frozenset({"bvid", "aid", "p", "t"}),
+    "twitter": frozenset(),
+    "zhihu": frozenset(),
+}
+
+
+def _clean_extracted_url(url: str, provider: Optional[str] = None) -> str:
+    """Normalize a supported URL and remove non-essential tracking fields."""
+    cleaned = (url or "").strip().lstrip("<")
+    cleaned = cleaned.rstrip(_URL_TRAILING_PUNCTUATION)
+    if cleaned and not re.match(r"https?://", cleaned, re.IGNORECASE):
+        cleaned = f"https://{cleaned}"
+    if not cleaned:
+        return ""
+
+    try:
+        parsed = urlsplit(cleaned)
+    except ValueError:
+        return cleaned
+
+    allowed_query_keys = _QUERY_ALLOWLISTS.get(provider or "", frozenset())
+    query_items = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() in allowed_query_keys
+    ]
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query_items, doseq=True), "")
+    )
+
+
+def extract_supported_links(message_text: str) -> list[str]:
+    """Extract every supported media/article link in source-text order.
+
+    Telegram messages frequently contain prose around a link, multiple links,
+    or links wrapped in Markdown/HTML punctuation.  Searching each supported
+    provider independently and sorting by match position keeps all links while
+    retaining the provider priority used by the old single-link helper.
+    """
+    text = str(message_text or "")
+    matches: list[tuple[int, int, int, str]] = []
+    for priority, (provider, pattern) in enumerate(_SUPPORTED_LINK_PATTERNS):
+        for match in pattern.finditer(text):
+            url = _clean_extracted_url(match.group(0), provider)
+            if url:
+                matches.append((match.start(), match.end(), priority, url))
+
+    matches.sort(key=lambda item: (item[0], item[1], item[2]))
+    links: list[str] = []
+    seen: set[str] = set()
+    occupied_until = -1
+    for start, end, _priority, url in matches:
+        normalized = url.casefold()
+        if normalized in seen or start < occupied_until:
+            continue
+        seen.add(normalized)
+        links.append(url)
+        occupied_until = end
+    return links
+
+
+def extract_supported_links_from_message(message) -> list[str]:
+    """Extract supported links from text, captions, and Telegram text links."""
+    links: list[str] = []
+    for value in (
+        getattr(message, "text", None),
+        getattr(message, "caption", None),
+    ):
+        links.extend(extract_supported_links(value or ""))
+
+    # A Telegram ``TEXT_LINK`` entity has no URL in the visible text.  Include
+    # it when present; regular URL entities are already found by the text scan.
+    for entities_attr in ("entities", "caption_entities"):
+        for entity in getattr(message, entities_attr, None) or []:
+            entity_url = getattr(entity, "url", None)
+            if entity_url:
+                links.extend(extract_supported_links(str(entity_url)))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for link in links:
+        normalized = link.casefold()
+        if normalized not in seen:
+            seen.add(normalized)
+            deduped.append(link)
+    return deduped
 
 
 def is_zhihu_answer_url(url: str) -> bool:
-    return bool(url and re.search(ZHIHU_URL_REGEX, url))
+    return bool(url and re.search(ZHIHU_ANSWER_URL_REGEX, url, flags=re.IGNORECASE))
+
+
+def classify_zhihu_url(url: str) -> Optional[str]:
+    """Return the Zhihu content kind represented by a URL."""
+    value = str(url or "")
+    for kind, pattern in (
+        ("answer", ZHIHU_ANSWER_URL_REGEX),
+        ("article", ZHIHU_ARTICLE_URL_REGEX),
+        ("post", ZHIHU_POST_URL_REGEX),
+        ("question", ZHIHU_QUESTION_URL_REGEX),
+    ):
+        if re.search(pattern, value, flags=re.IGNORECASE):
+            return kind
+    return None
+
+
+def is_zhihu_url(url: str) -> bool:
+    return classify_zhihu_url(url) is not None
 
 
 def _normalize_telegram_username(value: Optional[str]) -> str:

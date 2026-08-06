@@ -2,6 +2,8 @@ import asyncio
 from types import SimpleNamespace
 
 import main
+import pytest
+from app.main_helpers import classify_zhihu_url, extract_supported_links_from_message, is_zhihu_answer_url
 from app.twitter_downloader import format_tweet_text_for_reply, summarize_tweet_text
 
 
@@ -16,6 +18,98 @@ def test_extract_video_url_supports_zhihu_answer_links():
     message = "看看这个 https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097"
     extracted = main._extract_video_url(message)
     assert extracted == "https://www.zhihu.com/question/1951390530626889625/answer/2032324947259942097"
+
+
+def test_zhihu_url_classification_does_not_treat_questions_as_answers():
+    assert classify_zhihu_url("https://www.zhihu.com/question/123/answer/456") == "answer"
+    assert classify_zhihu_url("https://zhuanlan.zhihu.com/p/789") == "article"
+    assert classify_zhihu_url("https://www.zhihu.com/pin/789") == "post"
+    assert classify_zhihu_url("https://www.zhihu.com/question/123") == "question"
+    assert is_zhihu_answer_url("https://www.zhihu.com/question/123") is False
+    assert main.extract_supported_links(
+        "https://zhuanlan.zhihu.com/p/789 https://www.zhihu.com/pin/987"
+    ) == [
+        "https://zhuanlan.zhihu.com/p/789",
+        "https://www.zhihu.com/pin/987",
+    ]
+
+
+def test_extract_supported_links_keeps_all_mixed_links_in_source_order():
+    message = (
+        "text https://www.youtube.com/watch?v=dQw4w9WgXcQ. "
+        "post x.com/user/status/123, article "
+        "https://www.zhihu.com/question/1/answer/2; video b23.tv/BV1xx411c7mD!"
+    )
+
+    assert main.extract_supported_links(message) == [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://x.com/user/status/123",
+        "https://www.zhihu.com/question/1/answer/2",
+        "https://b23.tv/BV1xx411c7mD",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("youtu.be/dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ"),
+        (
+            "youtube.com/shorts/dQw4w9WgXcQ?t=30&si=abc&feature=share",
+            "https://youtube.com/shorts/dQw4w9WgXcQ?t=30",
+        ),
+        (
+            "www.bilibili.com/watch?bvid=BV1TuLA6ZEE7&p=2&spm_id_from=333.999",
+            "https://www.bilibili.com/watch?bvid=BV1TuLA6ZEE7&p=2",
+        ),
+        (
+            "x.com/user/status/123?t=abc&s=20",
+            "https://x.com/user/status/123",
+        ),
+        (
+            "zhuanlan.zhihu.com/p/789?utm_source=share",
+            "https://zhuanlan.zhihu.com/p/789",
+        ),
+        (
+            "www.zhihu.com/people/example/pins/987?share_code=x",
+            "https://www.zhihu.com/people/example/pins/987",
+        ),
+        (
+            "www.zhihu.com/question/123?utm_id=1",
+            "https://www.zhihu.com/question/123",
+        ),
+    ],
+)
+def test_extract_supported_links_normalizes_variants_and_removes_tracking(source, expected):
+    assert main.extract_supported_links(source) == [expected]
+
+
+def test_extract_supported_links_deduplicates_urls_after_tracking_cleanup():
+    assert main.extract_supported_links(
+        "https://www.zhihu.com/pin/789?share_code=alice "
+        "https://www.zhihu.com/pin/789?share_code=bob"
+    ) == ["https://www.zhihu.com/pin/789"]
+
+
+def test_extract_supported_links_rejects_provider_names_inside_other_hosts():
+    assert main.extract_supported_links(
+        "notyoutube.com/watch?v=dQw4w9WgXcQ foo.x.com/user/status/123 "
+        "foo.bilibili.com/video/BV1xx411c7mD foo.zhihu.com/pin/789"
+    ) == []
+    assert main.extract_supported_links(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQx "
+        "https://x.com/user/status/1234x"
+    ) == []
+
+
+def test_extract_supported_links_from_message_includes_caption_text_links():
+    message = SimpleNamespace(
+        text=None,
+        caption="look at this image",
+        entities=None,
+        caption_entities=[SimpleNamespace(url="https://x.com/user/status/123")],
+    )
+
+    assert extract_supported_links_from_message(message) == ["https://x.com/user/status/123"]
 
 
 def test_extract_search_keywords_deduplicates_and_filters_stopwords():
@@ -368,6 +462,150 @@ def test_handle_zhihu_link_message_sends_text_and_persists_content(monkeypatch):
     assert message.deleted is True
 
 
+def test_handle_zhihu_link_message_sends_extracted_images_after_text(monkeypatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.text = "see https://www.zhihu.com/question/1/answer/2"
+            self.message_id = 809
+            self.reply_to_message = None
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    class _FakeBot:
+        def __init__(self):
+            self.messages = []
+            self.photos = []
+            self.media_groups = []
+            self.documents = []
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+
+        async def send_photo(self, **kwargs):
+            self.photos.append(kwargs)
+
+        async def send_media_group(self, **kwargs):
+            self.media_groups.append(kwargs)
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+
+    class _FakeStatus:
+        def __init__(self):
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    async def fake_add_message(**kwargs):
+        return 1
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main,
+        "parse_zhihu_link",
+        lambda url: {
+            "content_type": "answer",
+            "question": "Question",
+            "author": "Answerer",
+            "content": "Answer body",
+            "time": "2026-08-05 10:00",
+            "image_urls": [
+                "https://picx.zhimg.com/one",
+                "https://picx.zhimg.com/two",
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "download_zhihu_image_media",
+        lambda urls: [
+            {"content": b"image-one", "filename": "one.jpg"},
+            {"content": b"image-two", "filename": "two.jpg"},
+        ],
+    )
+    monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+
+    message = _FakeMessage()
+    bot = _FakeBot()
+    status = _FakeStatus()
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=42),
+    )
+    context = SimpleNamespace(bot=bot)
+
+    handled = asyncio.run(
+        main._handle_zhihu_link_message(
+            update=update,
+            context=context,
+            video_url="https://www.zhihu.com/question/1/answer/2",
+            sender_display="Tester @tester",
+            status_message=status,
+        )
+    )
+
+    assert handled is True
+    assert len(bot.messages) == 1
+    assert bot.messages[0]["disable_web_page_preview"] is True
+    assert len(bot.media_groups) == 1
+    assert len(bot.media_groups[0]["media"]) == 2
+    assert bot.photos == []
+    assert bot.documents == []
+    assert status.deleted is True
+    assert message.deleted is True
+
+
+def test_send_zhihu_image_media_chunks_albums_and_falls_back_for_large_images():
+    class _FakeBot:
+        def __init__(self):
+            self.photos = []
+            self.media_groups = []
+            self.documents = []
+
+        async def send_photo(self, **kwargs):
+            self.photos.append(kwargs)
+
+        async def send_media_group(self, **kwargs):
+            self.media_groups.append(kwargs)
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+
+    bot = _FakeBot()
+    context = SimpleNamespace(bot=bot)
+    image_media = [
+        {"content": f"image-{index}".encode(), "filename": f"image-{index}.jpg"}
+        for index in range(11)
+    ]
+    image_media.append(
+        {
+            "content": b"x" * (10 * 1024 * 1024 + 1),
+            "filename": "large.jpg",
+        }
+    )
+
+    asyncio.run(
+        main._send_zhihu_image_media(
+            context=context,
+            chat_id=1,
+            image_media=image_media,
+        )
+    )
+
+    assert len(bot.media_groups) == 1
+    assert len(bot.media_groups[0]["media"]) == 10
+    assert len(bot.photos) == 1
+    assert len(bot.documents) == 1
+    assert bot.documents[0]["document"].name == "large.jpg"
+
+
 def test_handle_twitter_media_message_persists_semantic_tweet_content(monkeypatch):
     class _FakeMessage:
         def __init__(self):
@@ -415,7 +653,11 @@ def test_handle_twitter_media_message_persists_semantic_tweet_content(monkeypatc
 
     class _FakeTwitterDownloader:
         def extract_twitter_media(self, url):
-            return [("pic", b"img1"), ("gif", b"gif1")], {"1": "tweet body with sqlite lock context"}
+            return [
+                ("pic", b"img1"),
+                ("gif", b"gif1"),
+                ("vid", b"vid1"),
+            ], {"1": "tweet body with sqlite lock context"}
 
     captured = {}
 
@@ -453,11 +695,13 @@ def test_handle_twitter_media_message_persists_semantic_tweet_content(monkeypatc
     assert captured["chat_id"] == 1
     assert captured["username"] == "Tester @tester"
     assert "shared_twitter_link: https://x.com/u/status/1" in captured["content"]
-    assert "shared_twitter_media: 1 image(s), 1 gif(s)" in captured["content"]
+    assert "shared_twitter_media: 1 image(s), 1 video(s), 1 gif(s)" in captured["content"]
     assert "user_comment: check this out" in captured["content"]
     assert "tweet_text: tweet body with sqlite lock context" in captured["content"]
     assert captured["kwargs"]["telegram_user_key"] == "tg_user:42"
     assert captured["kwargs"]["telegram_message_id"] == 123
+    assert len(bot.videos) == 1
+    assert bot.videos[0]["caption"].startswith("tweet body with sqlite lock context")
     assert status.deleted is True
     assert message.deleted is True
 
@@ -1038,6 +1282,225 @@ def test_handle_text_for_youtube_or_group_schedules_video_processing_in_backgrou
     assert message.reply_calls[0]["text"] == "Downloading your video, please wait a moment..."
     assert scheduled["context"] is context
     assert scheduled["coro"] is not None
+
+
+def test_handle_text_for_youtube_or_group_schedules_every_supported_link(monkeypatch):
+    class _FakeStatusMessage:
+        async def delete(self):
+            return None
+
+    class _FakeMessage:
+        def __init__(self):
+            self.text = (
+                "first https://www.youtube.com/watch?v=dQw4w9WgXcQ and "
+                "second x.com/user/status/123"
+            )
+            self.message_id = 656
+            self.reply_calls = []
+
+        async def reply_text(self, text, **kwargs):
+            self.reply_calls.append(text)
+            return _FakeStatusMessage()
+
+    scheduled = {}
+    message = _FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1, type="group"),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=1),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace())
+
+    def fake_process_video_link_batch(**kwargs):
+        scheduled.update(kwargs)
+        async def no_op():
+            return None
+
+        return no_op()
+
+    def fake_schedule_background_task(context_arg, coro):
+        assert context_arg is context
+        coro.close()
+
+    monkeypatch.setattr(main, "_process_video_link_batch", fake_process_video_link_batch)
+    monkeypatch.setattr(main, "_schedule_background_task", fake_schedule_background_task)
+
+    asyncio.run(main.handle_text_for_youtube_or_group(update, context))
+
+    assert scheduled["video_urls"] == [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://x.com/user/status/123",
+    ]
+    assert scheduled["delete_source_message"] is True
+    assert len(scheduled["status_messages"]) == 2
+    assert len(message.reply_calls) == 2
+
+
+def test_handle_text_for_youtube_or_group_limits_links_per_message(monkeypatch):
+    class _FakeStatusMessage:
+        async def delete(self):
+            return None
+
+    class _FakeMessage:
+        text = "https://x.com/user/status/123 https://x.com/user/status/456"
+        message_id = 657
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+            return _FakeStatusMessage()
+
+    scheduled = {}
+    message = _FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=1, type="group"),
+        effective_user=SimpleNamespace(full_name="Tester", username="tester", id=1),
+    )
+
+    def fake_process_video_link_batch(**kwargs):
+        scheduled.update(kwargs)
+
+        async def no_op():
+            return None
+
+        return no_op()
+
+    def fake_schedule_background_task(_context, coro):
+        coro.close()
+
+    monkeypatch.setattr(main, "MAX_MEDIA_LINKS_PER_MESSAGE", 1)
+    monkeypatch.setattr(main, "_process_video_link_batch", fake_process_video_link_batch)
+    monkeypatch.setattr(main, "_schedule_background_task", fake_schedule_background_task)
+
+    asyncio.run(main.handle_text_for_youtube_or_group(update, SimpleNamespace(bot=SimpleNamespace())))
+
+    assert scheduled["video_urls"] == ["https://x.com/user/status/123"]
+    assert message.replies[0] == "Processing the first 1 of 2 supported links."
+
+
+def test_document_renderer_uses_generated_safe_download_path(monkeypatch, tmp_path):
+    class _FakeDownloadedFile:
+        def __init__(self):
+            self.path = None
+
+        async def download_to_drive(self, custom_path):
+            self.path = custom_path
+            with open(custom_path, "w", encoding="utf-8") as output:
+                output.write("# title")
+            return custom_path
+
+    class _FakeDocument:
+        file_name = "../../runtime.env.md"
+        file_size = 16
+
+        def __init__(self, file):
+            self.file = file
+
+        async def get_file(self):
+            return self.file
+
+    class _FakeStatus:
+        async def edit_text(self, _text):
+            return None
+
+        async def delete(self):
+            return None
+
+    class _FakeMessage:
+        message_id = 123
+
+        def __init__(self, document):
+            self.document = document
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+            return _FakeStatus()
+
+    file = _FakeDownloadedFile()
+    message = _FakeMessage(_FakeDocument(file))
+    update = SimpleNamespace(message=message, effective_chat=SimpleNamespace(id=1))
+
+    monkeypatch.setattr(
+        main,
+        "_build_output_path",
+        lambda prefix, _message_id, extension="jpg": str(tmp_path / f"{prefix}.{extension}"),
+    )
+
+    async def fake_render(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "_render_and_send_image_from_markdown", fake_render)
+
+    asyncio.run(main.handle_text_or_markdown_document(update, SimpleNamespace()))
+
+    assert file.path == str(tmp_path / "source.md")
+    assert not (tmp_path / "source.md").exists()
+
+
+def test_process_video_link_batch_deletes_source_after_all_links_finish(monkeypatch):
+    events = []
+
+    class _FakeMessage:
+        async def delete(self):
+            events.append("source-deleted")
+
+    async def fake_process_video_link_request(**kwargs):
+        events.append(f"start:{kwargs['video_url']}")
+        await asyncio.sleep(0)
+        events.append(f"done:{kwargs['video_url']}")
+        return True
+
+    monkeypatch.setattr(main, "_process_video_link_request", fake_process_video_link_request)
+    update = SimpleNamespace(message=_FakeMessage())
+
+    asyncio.run(
+        main._process_video_link_batch(
+            update=update,
+            context=SimpleNamespace(),
+            video_urls=["youtube", "twitter"],
+            sender_display="Tester",
+            status_messages=[SimpleNamespace(), SimpleNamespace()],
+        )
+    )
+
+    assert events == [
+        "start:youtube",
+        "start:twitter",
+        "done:youtube",
+        "done:twitter",
+        "source-deleted",
+    ]
+
+
+def test_process_video_link_batch_keeps_source_when_a_link_fails(monkeypatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    async def fake_process_video_link_request(**kwargs):
+        return kwargs["video_url"] != "failed"
+
+    monkeypatch.setattr(main, "_process_video_link_request", fake_process_video_link_request)
+    message = _FakeMessage()
+
+    asyncio.run(
+        main._process_video_link_batch(
+            update=SimpleNamespace(message=message),
+            context=SimpleNamespace(),
+            video_urls=["ok", "failed"],
+            sender_display="Tester",
+            status_messages=[SimpleNamespace(), SimpleNamespace()],
+        )
+    )
+
+    assert message.deleted is False
 
 
 def test_handle_text_for_youtube_or_group_uses_zhihu_status_text(monkeypatch):

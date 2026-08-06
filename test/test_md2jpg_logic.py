@@ -19,6 +19,12 @@ class _FakeImg:
 
 
 class _FakePage:
+    def __init__(self):
+        self.routes = []
+
+    async def route(self, pattern, handler):
+        self.routes.append((pattern, handler))
+
     async def set_content(self, html):
         self.html = html
 
@@ -63,3 +69,36 @@ def test_md_to_image_appends_jpg_when_no_extension(monkeypatch, tmp_path):
     asyncio.run(md2jpg.md_to_image("# title", output_path=str(out_base), theme="formal_code"))
 
     assert (tmp_path / "rendered.jpg").exists()
+
+
+def test_md_to_image_escapes_raw_html_and_blocks_network(monkeypatch, tmp_path):
+    page = _FakePage()
+
+    class _Browser(_FakeBrowser):
+        async def new_page(self, device_scale_factor=1):
+            return page
+
+    class _Chromium(_FakeChromium):
+        async def launch(self):
+            return _Browser()
+
+    class _Playwright(_FakePlaywright):
+        def __init__(self):
+            self.chromium = _Chromium()
+
+    class _Context(_FakeContextManager):
+        async def __aenter__(self):
+            return _Playwright()
+
+    monkeypatch.setattr(md2jpg, "async_playwright", lambda: _Context())
+    monkeypatch.setattr(md2jpg.Image, "open", lambda path: _FakeImg())
+
+    asyncio.run(
+        md2jpg.md_to_image(
+            '<img src="http://127.0.0.1/private">',
+            output_path=str(tmp_path / "rendered"),
+        )
+    )
+
+    assert "&lt;img" in page.html
+    assert page.routes and page.routes[0][0] == "**/*"

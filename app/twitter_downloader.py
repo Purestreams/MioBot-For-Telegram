@@ -8,12 +8,16 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 import requests
 import yt_dlp
 from yt_dlp.utils import DownloadError
-from app.runtime_config import get_runtime_value
+from app.runtime_config import get_runtime_int, get_runtime_value
 
 logger = logging.getLogger(__name__)
 
 
-P_TWT_LINK = re.compile(r'https://(?:x|twitter)\.com/(.+?)/status/(\d+)')
+P_TWT_LINK = re.compile(
+    r'(?<![\w@.])(?:https?://)?(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)(?![A-Za-z0-9_])'
+    r'(?:[/?#][^\s<]*)?',
+    re.IGNORECASE,
+)
 P_CSRF_TOKEN = re.compile(r'ct0=(.+?)(?:;|$)')
 P_PIC_TWITTER_LINK = re.compile(r'(?:https?://)?pic\.twitter\.com/[A-Za-z0-9]+')
 P_META_IMAGE = re.compile(
@@ -30,6 +34,8 @@ DEFAULT_HTTP_HEADERS = {
     ),
     'Accept-Language': 'en-US,en;q=0.9',
 }
+MAX_TWITTER_MEDIA_BYTES = max(1, get_runtime_int('MAX_TWITTER_MEDIA_BYTES', 50 * 1024 * 1024))
+MAX_TWITTER_MEDIA_ITEMS = max(1, get_runtime_int('MAX_TWITTER_MEDIA_ITEMS', 10))
 
 
 def is_twitter_status_url(url: str) -> bool:
@@ -47,7 +53,18 @@ def _extract_text_from_rich_payload(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, Mapping):
-        for key in ("text", "raw_text", "full_text", "display_text"):
+        for key in (
+            "text",
+            "raw_text",
+            "full_text",
+            "display_text",
+            "article",
+            "article_text",
+            "content",
+            "body",
+            "title",
+            "description",
+        ):
             extracted = _extract_text_from_rich_payload(value.get(key))
             if extracted:
                 return extracted
@@ -250,7 +267,14 @@ class TwitterDownloader:
                 continue
 
             entry_id = str(entry.get('id') or twt_id)
-            text_value = entry.get('description') or entry.get('title')
+            text_value = _extract_text_from_rich_payload(
+                entry.get('description')
+                or entry.get('title')
+                or entry.get('text')
+                or entry.get('article')
+                or entry.get('content')
+                or ''
+            )
             if text_value:
                 text_dict[entry_id] = text_value
 
@@ -288,6 +312,8 @@ class TwitterDownloader:
                 payload.get("text")
                 or payload.get("full_text")
                 or payload.get("display_text")
+                or payload.get("article")
+                or payload.get("content")
                 or ""
             )
 
@@ -374,7 +400,13 @@ class TwitterDownloader:
             if not isinstance(status, dict):
                 return None
 
-            text_value = _extract_text_from_rich_payload(status.get('text') or status.get('raw_text') or '')
+            text_value = _extract_text_from_rich_payload(
+                status.get('text')
+                or status.get('raw_text')
+                or status.get('article')
+                or status.get('content')
+                or ''
+            )
             media_payload = status.get('media')
             if not isinstance(media_payload, dict):
                 media_payload = {}
@@ -441,7 +473,12 @@ class TwitterDownloader:
             if not isinstance(payload, dict):
                 return None
 
-            text_value = _extract_text_from_rich_payload(payload.get("text") or "")
+            text_value = _extract_text_from_rich_payload(
+                payload.get("text")
+                or payload.get("article")
+                or payload.get("content")
+                or ""
+            )
             pic_list: Dict[str, Dict[str, str]] = {}
             gif_list: Dict[str, Dict[str, str]] = {}
             vid_list: Dict[str, Dict[str, str]] = {}
@@ -631,8 +668,31 @@ class TwitterDownloader:
 
     def download_media_bytes(self, url: str) -> bytes:
         response = self.session.get(url, stream=True, timeout=20)
-        response.raise_for_status()
-        return response.content
+        try:
+            response.raise_for_status()
+            try:
+                content_length = int(response.headers.get('Content-Length') or 0)
+            except (TypeError, ValueError):
+                content_length = 0
+            if content_length > MAX_TWITTER_MEDIA_BYTES:
+                raise ValueError(
+                    f"Twitter/X media exceeds {MAX_TWITTER_MEDIA_BYTES} byte limit."
+                )
+
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_TWITTER_MEDIA_BYTES:
+                    raise ValueError(
+                        f"Twitter/X media exceeds {MAX_TWITTER_MEDIA_BYTES} byte limit."
+                    )
+                chunks.append(chunk)
+            return b''.join(chunks)
+        finally:
+            response.close()
 
     def extract_twitter_media(self, url: str) -> Tuple[List[Tuple[str, bytes]], Dict[str, str]]:
         self._activate_guest_token()
@@ -647,20 +707,22 @@ class TwitterDownloader:
         self._enrich_piclist_from_text_short_links(data_dict)
 
         media_list: List[Tuple[str, bytes]] = []
-        for item in data_dict.get('picList', {}).values():
+        for item in list(data_dict.get('picList', {}).values())[:MAX_TWITTER_MEDIA_ITEMS]:
             try:
                 media_list.append(('pic', self.download_media_bytes(item['url'])))
-            except requests.RequestException as e:
+            except (requests.RequestException, ValueError) as e:
                 logger.warning(f"Failed to download Twitter/X image media {item.get('url')}: {e}")
-        for item in data_dict.get('gifList', {}).values():
+        remaining = max(0, MAX_TWITTER_MEDIA_ITEMS - len(media_list))
+        for item in list(data_dict.get('gifList', {}).values())[:remaining]:
             try:
                 media_list.append(('gif', self.download_media_bytes(item['url'])))
-            except requests.RequestException as e:
+            except (requests.RequestException, ValueError) as e:
                 logger.warning(f"Failed to download Twitter/X GIF media {item.get('url')}: {e}")
-        for item in data_dict.get('vidList', {}).values():
+        remaining = max(0, MAX_TWITTER_MEDIA_ITEMS - len(media_list))
+        for item in list(data_dict.get('vidList', {}).values())[:remaining]:
             try:
                 media_list.append(('vid', self.download_media_bytes(item['url'])))
-            except requests.RequestException as e:
+            except (requests.RequestException, ValueError) as e:
                 logger.warning(f"Failed to download Twitter/X video media {item.get('url')}: {e}")
         text_list = data_dict.get('textList', {})
         if not media_list and not text_list:

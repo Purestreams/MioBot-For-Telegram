@@ -38,6 +38,7 @@ from app.twitter_downloader import (
     is_twitter_status_url,
     summarize_tweet_text,
 )
+from app.zhihu_dl import download_image_media as download_zhihu_image_media
 from app.zhihu_dl import parse_link as parse_zhihu_link
 from app.youtube_dl import (
     download_video_to_file,
@@ -93,6 +94,7 @@ from webadmin.security import (
     hash_login_token,
     parse_login_token_ttl_seconds,
     webadmin_base_url,
+    validate_webadmin_security_configuration,
 )
 from app.image2text import StickerUnderstanding, image_to_text, sticker_to_understanding
 
@@ -112,12 +114,15 @@ from app.main_helpers import (
     _classify_group_reply_trigger,
     _display_name_from_user,
     is_zhihu_answer_url,
+    is_zhihu_url,
     _telegram_user_key_from_user,
     _build_reply_relation_payload,
     _match_command_payload,
     _build_rag_query_from_message,
     _is_group_chat,
     _extract_search_keywords,
+    extract_supported_links,
+    extract_supported_links_from_message,
 )
 
 AZURE_OPENAI_ENDPOINT = get_runtime_value("AZURE_OPENAI_ENDPOINT")
@@ -180,6 +185,10 @@ TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_TEXT_LIMIT = 4096
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _USER_MEMORY_REFRESH_KEYS: set[str] = set()
+MAX_RENDER_DOCUMENT_BYTES = max(1, get_runtime_int("MAX_RENDER_DOCUMENT_BYTES", 10 * 1024 * 1024))
+MAX_MEDIA_LINKS_PER_MESSAGE = max(1, get_runtime_int("MAX_MEDIA_LINKS_PER_MESSAGE", 4))
+MEDIA_PROCESSING_CONCURRENCY = max(1, get_runtime_int("MEDIA_PROCESSING_CONCURRENCY", 2))
+_MEDIA_PROCESSING_SEMAPHORE = asyncio.Semaphore(MEDIA_PROCESSING_CONCURRENCY)
 
 
 def _configured_admin_user_ids() -> set[int]:
@@ -196,19 +205,8 @@ def _configured_admin_user_ids() -> set[int]:
     return admin_ids
 
 
-def _configured_admin_usernames() -> set[str]:
-    raw_value = get_runtime_value("TELEGRAM_ADMIN_USER_IDS")
-    usernames: set[str] = set()
-    for token in raw_value.replace(",", " ").split():
-        value = token.strip()
-        if not value or value.startswith("tg_user:") or value.isdigit():
-            continue
-        usernames.add(value.lstrip("@").lower())
-    return usernames
-
-
 def _has_configured_admins() -> bool:
-    return bool(_configured_admin_user_ids() or _configured_admin_usernames())
+    return bool(_configured_admin_user_ids())
 
 
 def _is_private_chat(update: Update) -> bool:
@@ -217,10 +215,7 @@ def _is_private_chat(update: Update) -> bool:
 
 def _is_admin_update(update: Update) -> bool:
     user_id = getattr(update.effective_user, "id", None)
-    if isinstance(user_id, int) and user_id in _configured_admin_user_ids():
-        return True
-    username = str(getattr(update.effective_user, "username", "") or "").lstrip("@").lower()
-    return bool(username and username in _configured_admin_usernames())
+    return isinstance(user_id, int) and user_id in _configured_admin_user_ids()
 
 
 def _admin_command_args(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -1148,6 +1143,7 @@ async def _handle_twitter_media_message(
     video_url: str,
     sender_display: str,
     status_message,
+    delete_source_message: bool = True,
 ) -> bool:
     """Handle Twitter/X media. Returns True when request is fully handled."""
     if not update.message or not update.effective_chat:
@@ -1224,7 +1220,7 @@ async def _handle_twitter_media_message(
             parse_mode=ParseMode.HTML,
         )
 
-    if video_medias and not image_medias:
+    if video_medias:
         for index, video_bytes in enumerate(video_medias, start=1):
             video_buffer = io.BytesIO(video_bytes)
             video_buffer.name = f"tweet_video_{index}.mp4"
@@ -1261,8 +1257,47 @@ async def _handle_twitter_media_message(
         )
 
     await _delete_message_if_exists(status_message)
-    await _delete_message_if_exists(update.message)
+    if delete_source_message:
+        await _delete_message_if_exists(update.message)
     return True
+
+
+async def _send_zhihu_image_media(*, context, chat_id, image_media) -> None:
+    """Send extracted Zhihu images as photo albums, with large-image fallback."""
+    photo_media = []
+    document_media = []
+    for item in image_media or []:
+        payload = item.get("content") if isinstance(item, dict) else None
+        if not payload:
+            continue
+        filename = str(item.get("filename") or "zhihu_image.jpg") if isinstance(item, dict) else "zhihu_image.jpg"
+        image_buffer = io.BytesIO(payload)
+        image_buffer.name = filename
+        content_type = str(item.get("content_type") or "").split(";", 1)[0].lower() if isinstance(item, dict) else ""
+        photo_compatible = not content_type or content_type in {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if len(payload) <= 10 * 1024 * 1024 and photo_compatible:
+            photo_media.append(image_buffer)
+        else:
+            document_media.append(image_buffer)
+
+    for start in range(0, len(photo_media), 10):
+        batch = photo_media[start:start + 10]
+        if len(batch) == 1:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=batch[0],
+            )
+            continue
+        await context.bot.send_media_group(
+            chat_id=chat_id,
+            media=[InputMediaPhoto(media=image_buffer) for image_buffer in batch],
+        )
+
+    for image_buffer in document_media:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=image_buffer,
+        )
 
 
 async def _handle_zhihu_link_message(
@@ -1272,19 +1307,28 @@ async def _handle_zhihu_link_message(
     video_url: str,
     sender_display: str,
     status_message,
+    delete_source_message: bool = True,
 ) -> bool:
-    """Handle Zhihu answer links. Returns True when request is fully handled."""
+    """Handle Zhihu answers, articles, posts, and question links."""
     if not update.message or not update.effective_chat:
         return False
 
     zhihu_result = await asyncio.to_thread(parse_zhihu_link, video_url)
     raw_message_text = (getattr(update.message, "text", None) or getattr(update.message, "caption", None) or video_url).strip()
 
-    question = str(zhihu_result.get("question") or "(无标题)")
+    content_type = str(zhihu_result.get("content_type") or "answer")
+    question = str(zhihu_result.get("title") or zhihu_result.get("question") or "(无标题)")
     author = str(zhihu_result.get("author") or "(匿名)")
     author_url = str(zhihu_result.get("author_url") or "")
     content = str(zhihu_result.get("content") or "（无内容）")
     time_text = str(zhihu_result.get("time") or "未知")
+    image_urls = [str(url) for url in (zhihu_result.get("image_urls") or []) if str(url).strip()]
+    image_media = []
+    if image_urls:
+        try:
+            image_media = await asyncio.to_thread(download_zhihu_image_media, image_urls)
+        except Exception:
+            logger.exception("Failed to download Zhihu images for %s", video_url)
 
     sender_user = getattr(update, "effective_user", None)
     reply_to_message = getattr(update.message, "reply_to_message", None)
@@ -1298,6 +1342,8 @@ async def _handle_zhihu_link_message(
                 question=question,
                 author=author,
                 content=content,
+                content_type=content_type,
+                image_count=len(image_urls),
             ),
             telegram_user_key=_telegram_user_key_from_user(sender_user),
             telegram_message_id=getattr(update.message, "message_id", None),
@@ -1317,12 +1363,21 @@ async def _handle_zhihu_link_message(
             content=content,
             sender_display=sender_display,
             time_text=time_text,
+            content_type=content_type,
         ),
         disable_web_page_preview=True,
     )
 
+    if image_media:
+        await _send_zhihu_image_media(
+            context=context,
+            chat_id=update.effective_chat.id,
+            image_media=image_media,
+        )
+
     await _delete_message_if_exists(status_message)
-    await _delete_message_if_exists(update.message)
+    if delete_source_message:
+        await _delete_message_if_exists(update.message)
     return True
 
 
@@ -1412,7 +1467,7 @@ def _build_help_text() -> str:
         "/text2jpg ,,,...,,, - Convert plain text to Markdown, then render it\n"
         "Upload a .txt or .md file - Render it as an image\n\n"
         "Media handling:\n"
-        "Send a YouTube, Bilibili, Twitter/X, or Zhihu link - Download media or parse supported text\n\n"
+        "Send a YouTube, Bilibili, Twitter/X, or Zhihu link - Download media or parse supported text (Zhihu answers, articles, posts, and questions)\n\n"
         "Group AI replies:\n"
         "In group chats, text/photo/sticker messages can trigger contextual replies. Direct triggers include replying to the bot, mentioning @BotUsername, or saying mioo / 小小宫.\n\n"
         "Extra commands:\n"
@@ -1476,6 +1531,8 @@ def _build_zhihu_history_message(
     question: str,
     author: str,
     content: str,
+    content_type: str = "answer",
+    image_count: int = 0,
     max_content_chars: int = 1500,
 ) -> str:
     user_comment = " ".join((raw_message_text or "").replace(zhihu_url, " ").split()).strip()
@@ -1483,15 +1540,32 @@ def _build_zhihu_history_message(
     if len(normalized_content) > max_content_chars:
         normalized_content = normalized_content[: max_content_chars - 1].rstrip() + "…"
 
-    lines = [
-        f"shared_zhihu_link: {zhihu_url}",
-        f"zhihu_question: {' '.join((question or '').split()).strip()}",
-        f"zhihu_author: {' '.join((author or '').split()).strip()}",
-    ]
+    lines = [f"shared_zhihu_link: {zhihu_url}"]
+    if image_count:
+        lines.append(f"shared_zhihu_media: {image_count} image(s)")
+    if content_type == "answer":
+        lines.extend(
+            [
+                f"zhihu_question: {' '.join((question or '').split()).strip()}",
+                f"zhihu_author: {' '.join((author or '').split()).strip()}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"zhihu_type: {content_type}",
+                f"zhihu_title: {' '.join((question or '').split()).strip()}",
+                f"zhihu_author: {' '.join((author or '').split()).strip()}",
+            ]
+        )
     if user_comment:
         lines.append(f"user_comment: {user_comment}")
     if normalized_content:
-        lines.append(f"zhihu_answer: {normalized_content}")
+        lines.append(
+            f"zhihu_answer: {normalized_content}"
+            if content_type == "answer"
+            else f"zhihu_content: {normalized_content}"
+        )
     return "\n".join(lines)
 
 
@@ -1504,6 +1578,7 @@ def _build_zhihu_reply_text(
     content: str,
     sender_display: str,
     time_text: str,
+    content_type: str = "answer",
     max_content_chars: int = 3200,
 ) -> str:
     author_line = author or "(匿名)"
@@ -1515,9 +1590,16 @@ def _build_zhihu_reply_text(
     if len(trimmed_content) > max_content_chars:
         trimmed_content = trimmed_content[: max_content_chars - 1].rstrip() + "…"
 
+    content_labels = {
+        "article": "文章",
+        "post": "想法/帖子",
+        "question": "问题",
+    }
+    title_prefix = f"[知乎{content_labels[content_type]}] " if content_type in content_labels else ""
+
     message = "\n".join(
         [
-            question_line,
+            f"{title_prefix}{question_line}",
             "",
             trimmed_content,
             f"-- {author_line} · {time_text or '未知'}",
@@ -1576,20 +1658,33 @@ async def handle_text_or_markdown_document(update: Update, context: ContextTypes
     if not file_name:
         return
 
-    is_already_markdown = file_name.endswith('.md')
-
-    if file_name.endswith(('.txt', '.md')):
-        tg_file = await document_file.get_file()
-        downloaded_path = await tg_file.download_to_drive(
-            custom_path=os.path.join(OUTPUT_DIR, file_name)
+    extension = os.path.splitext(file_name)[1].lower()
+    if extension not in {'.txt', '.md'}:
+        return
+    try:
+        declared_size = int(getattr(document_file, "file_size", 0) or 0)
+    except (TypeError, ValueError):
+        declared_size = 0
+    if declared_size > MAX_RENDER_DOCUMENT_BYTES:
+        await update.message.reply_text(
+            f"This document is too large to render (limit: {MAX_RENDER_DOCUMENT_BYTES // (1024 * 1024)} MB)."
         )
+        return
+
+    is_already_markdown = extension == '.md'
+    # Do not use the user-controlled Telegram filename as a local path.
+    downloaded_path = _build_output_path("source", update.message.message_id, extension=extension.lstrip('.'))
+    output_file_path = _build_output_path("file", update.message.message_id)
+    status_message = None
+    try:
+        tg_file = await document_file.get_file()
+        await tg_file.download_to_drive(custom_path=downloaded_path)
+        if os.path.getsize(downloaded_path) > MAX_RENDER_DOCUMENT_BYTES:
+            raise ValueError(f"Document exceeds {MAX_RENDER_DOCUMENT_BYTES} byte limit.")
 
         with open(downloaded_path, 'r', encoding='utf-8') as f:
             file_content = f.read()
 
-        output_file_path = _build_output_path("file", update.message.message_id)
-
-        status_message = None
         try:
             status_message = await update.message.reply_text("Converting your file to markdown, please wait a moment...")
 
@@ -1606,9 +1701,12 @@ async def handle_text_or_markdown_document(update: Update, context: ContextTypes
             logger.error(f"Error during image generation or sending: {e}")
             await update.message.reply_text("Sorry, I encountered an error while creating your image.")
             await _delete_message_if_exists(status_message)
-        finally:
-            _remove_file_if_exists(output_file_path)
-            _remove_file_if_exists(downloaded_path)
+    except Exception as exc:
+        logger.warning("Rejected or failed to read document render request: %s", exc)
+        await update.message.reply_text("Sorry, I could not read that text document safely.")
+    finally:
+        _remove_file_if_exists(output_file_path)
+        _remove_file_if_exists(downloaded_path)
 
 
 # Handle Group AI Replies
@@ -1874,31 +1972,32 @@ async def _process_video_link_request(
     video_url: str,
     sender_display: str,
     status_message,
-) -> None:
+    delete_source_message: bool = True,
+) -> bool:
     cleanup_paths: set[str] = set()
     try:
-        if is_zhihu_answer_url(video_url):
-            await _handle_zhihu_link_message(
+        if is_zhihu_url(video_url):
+            return await _handle_zhihu_link_message(
                 update=update,
                 context=context,
                 video_url=video_url,
                 sender_display=sender_display,
                 status_message=status_message,
+                delete_source_message=delete_source_message,
             )
-            return
 
         if is_twitter_status_url(video_url):
-            await _handle_twitter_media_message(
+            return await _handle_twitter_media_message(
                 update=update,
                 context=context,
                 video_url=video_url,
                 sender_display=sender_display,
                 status_message=status_message,
+                delete_source_message=delete_source_message,
             )
-            return
 
         if not update.message or not update.effective_chat:
-            return
+            return False
 
         output_file_name = f"{update.message.message_id}_{str(datetime.datetime.now().timestamp())}.mp4"
         output_file_path = os.path.join(OUTPUT_DIR, output_file_name)
@@ -1927,16 +2026,60 @@ async def _process_video_link_request(
             )
 
         await _delete_message_if_exists(status_message)
-        await _delete_message_if_exists(update.message)
+        if delete_source_message:
+            await _delete_message_if_exists(update.message)
+        return True
     except Exception as e:
         logger.exception("Error during video download or sending")
         message = getattr(update, "message", None)
         if message:
             await message.reply_text(_build_detailed_media_error_message(e))
         await _delete_message_if_exists(status_message)
+        return False
     finally:
         for path in cleanup_paths:
             _remove_file_if_exists(path)
+
+
+async def _process_video_link_batch(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    video_urls: list[str],
+    sender_display: str,
+    status_messages: list,
+    delete_source_message: bool = True,
+) -> None:
+    """Process all links from one message before deleting that source message."""
+    all_succeeded = False
+    try:
+        async def _process_with_capacity(video_url: str, status_message) -> bool:
+            async with _MEDIA_PROCESSING_SEMAPHORE:
+                return await _process_video_link_request(
+                    update=update,
+                    context=context,
+                    video_url=video_url,
+                    sender_display=sender_display,
+                    status_message=status_message,
+                    delete_source_message=False,
+                )
+
+        results = await asyncio.gather(
+            *(
+                _process_with_capacity(video_url, status_message)
+                for video_url, status_message in zip(video_urls, status_messages)
+            ),
+            return_exceptions=True,
+        )
+        all_succeeded = True
+        for result in results:
+            if isinstance(result, Exception) or result is not True:
+                all_succeeded = False
+                logger.error("One link in a mixed media message failed: %s", result)
+    finally:
+        if delete_source_message and all_succeeded:
+            await _delete_message_if_exists(getattr(update, "message", None))
+
 
 # Handle text messages: download media links or parse Zhihu links, else pass to group AI handler
 async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1949,23 +2092,40 @@ async def handle_text_for_youtube_or_group(update: Update, context: ContextTypes
 
     sender_display = _display_name_from_user(update.effective_user)
     message_text = update.message.text.strip()
-    video_url = _extract_video_url(message_text)
+    video_urls = extract_supported_links_from_message(update.message)
+    # Preserve compatibility with integrations/tests that override the legacy
+    # single-link helper while still processing every URL in normal messages.
+    legacy_video_url = _extract_video_url(message_text)
+    if legacy_video_url and legacy_video_url not in video_urls:
+        video_urls.insert(0, legacy_video_url)
 
-    if video_url:
-        status_text = (
-            "Parsing your Zhihu link, please wait a moment..."
-            if is_zhihu_answer_url(video_url)
-            else "Downloading your video, please wait a moment..."
-        )
-        status_message = await update.message.reply_text(status_text)
+    if video_urls:
+        if len(video_urls) > MAX_MEDIA_LINKS_PER_MESSAGE:
+            total_links = len(video_urls)
+            video_urls = video_urls[:MAX_MEDIA_LINKS_PER_MESSAGE]
+            await update.message.reply_text(
+                f"Processing the first {MAX_MEDIA_LINKS_PER_MESSAGE} of {total_links} supported links."
+            )
+        status_messages = []
+        for index, video_url in enumerate(video_urls):
+            status_text = (
+                "Parsing your Zhihu link, please wait a moment..."
+                if is_zhihu_answer_url(video_url)
+                else "Parsing your Zhihu content, please wait a moment..."
+                if is_zhihu_url(video_url)
+                else "Downloading your video, please wait a moment..."
+            )
+            status_message = await update.message.reply_text(status_text)
+            status_messages.append(status_message)
         _schedule_background_task(
             context,
-            _process_video_link_request(
+            _process_video_link_batch(
                 update=update,
                 context=context,
-                video_url=video_url,
+                video_urls=video_urls,
                 sender_display=sender_display,
-                status_message=status_message,
+                status_messages=status_messages,
+                delete_source_message=True,
             ),
         )
         return
@@ -1984,6 +2144,31 @@ async def handle_photo_for_group_ai_reply(update: Update, context: ContextTypes.
         return
     if getattr(_resolve_group_ai_sender(update), "is_bot", False):
         return
+
+    # Captions can contain the same supported links as text messages.  Keep
+    # the photo in the AI pipeline while extracting any linked post/video in
+    # parallel; the link worker must not delete the source photo message.
+    caption_links = extract_supported_links_from_message(update.message)[:MAX_MEDIA_LINKS_PER_MESSAGE]
+    for caption_link in caption_links:
+        status_text = (
+            "Parsing your Zhihu link, please wait a moment..."
+            if is_zhihu_answer_url(caption_link)
+            else "Parsing your Zhihu content, please wait a moment..."
+            if is_zhihu_url(caption_link)
+            else "Downloading your video, please wait a moment..."
+        )
+        status_message = await update.message.reply_text(status_text)
+        _schedule_background_task(
+            context,
+            _process_video_link_request(
+                update=update,
+                context=context,
+                video_url=caption_link,
+                sender_display=_display_name_from_user(_resolve_group_ai_sender(update)),
+                status_message=status_message,
+                delete_source_message=False,
+            ),
+        )
 
     photo = update.message.photo[-1]
     photo_path = _build_output_path("photo", update.message.message_id, extension="jpg")
@@ -2208,6 +2393,7 @@ def _run_webadmin_server() -> None:
 
 
 def _start_webadmin_process() -> multiprocessing.Process:
+    validate_webadmin_security_configuration()
     process = multiprocessing.Process(target=_run_webadmin_server, name="miobot-webadmin", daemon=True)
     process.start()
     logger.info("Started webadmin process pid=%s", process.pid)

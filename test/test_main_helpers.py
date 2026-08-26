@@ -163,6 +163,28 @@ def test_classify_group_reply_trigger_ignores_embedded_alias_text():
     assert trigger == "ambient"
 
 
+def test_mentions_another_bot_only():
+    assert main._mentions_another_bot_only("@other_helper_bot 出来", "MioooooooooBot") is True
+    assert main._mentions_another_bot_only("@MioooooooooBot 出来", "MioooooooooBot") is False
+    assert main._mentions_another_bot_only("普通聊天", "MioooooooooBot") is False
+
+
+def test_stop_reply_regex_requires_a_full_shutdown_phrase():
+    assert main._STOP_REPLY_RE.search("小小宫闭嘴")
+    assert main._STOP_REPLY_RE.search("别吵了")
+    assert main._STOP_REPLY_RE.search("谁问你")
+    assert not main._STOP_REPLY_RE.search("小小宫不要说出去")
+    assert not main._STOP_REPLY_RE.search("别吵架了谢谢")
+
+
+def test_history_query_regex_covers_recent_and_english_cues():
+    assert main._HISTORY_QUERY_RE.search("小小宫刚才说的链接是哪个")
+    assert main._HISTORY_QUERY_RE.search("你说过那个项目")
+    assert main._HISTORY_QUERY_RE.search("remember last time")
+    assert main._HISTORY_QUERY_RE.search("what did I say")
+    assert not main._HISTORY_QUERY_RE.search("mioo look here")
+
+
 def test_is_reply_to_this_bot_matches_username_case_insensitively():
     update = SimpleNamespace(
         message=SimpleNamespace(

@@ -29,6 +29,7 @@ med = [
 miobot = "main:main"
 miobot-rag = "app.database:cli_main"
 miobot-webadmin = "webadmin.app:main"
+miobot-group-eval = "app.group_reply_eval:main"
 
 [dependency-groups]
 dev = [

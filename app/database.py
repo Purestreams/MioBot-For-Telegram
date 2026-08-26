@@ -23,6 +23,7 @@ from app.runtime_config import get_runtime_bool, get_runtime_int, get_runtime_va
 
 DB_FILE = get_runtime_value("DB_FILE")
 logger = logging.getLogger(__name__)
+BOT_HISTORY_USERNAME = "mioo_bot"
 DB_SCHEMA_VERSION = 3
 DB_SCHEMA_VERSION_KEY = "schema_version"
 SQLITE_BUSY_TIMEOUT_MS = 5000
@@ -351,7 +352,7 @@ def _encode_sticker_tags(tags: Optional[list[str]]) -> str:
 def _is_recent_sticker_use(last_used_at: Optional[str], *, cooldown_minutes: int) -> bool:
     if not last_used_at or cooldown_minutes <= 0:
         return False
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(minutes=cooldown_minutes)
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=cooldown_minutes)
     cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     return str(last_used_at) >= cutoff_text
 
@@ -915,6 +916,26 @@ async def get_recent_messages(chat_id: int, *, limit: Optional[int] = None) -> l
         return [MessageRow(*row) for row in rows]
 
 
+async def get_oldest_messages(chat_id: int, *, limit: int) -> list[MessageRow]:
+    """Return the oldest retained messages for an optional prompt-cache anchor."""
+    if limit <= 0:
+        return []
+    db_file = _db_file_path()
+    _ensure_db_parent_dir(db_file)
+    async with aiosqlite.connect(db_file) as db:
+        await _enable_foreign_keys(db)
+        cursor = await db.execute(
+            '''
+            SELECT id, chat_id, username, content, timestamp, reply_to_username FROM messages
+            WHERE chat_id = ?
+            ORDER BY id ASC
+            LIMIT ?
+            ''',
+            (chat_id, limit),
+        )
+        return [MessageRow(*row) for row in await cursor.fetchall()]
+
+
 def _cosine_top_k(query_vec: np.ndarray, matrix: np.ndarray, *, top_k: int) -> np.ndarray:
     q = np.asarray(query_vec, dtype=np.float32)
     qn = np.linalg.norm(q) + 1e-8
@@ -1123,6 +1144,7 @@ async def get_prompt_context_parts(
     *,
     recent_n: Optional[int] = None,
     retrieved_k: Optional[int] = None,
+    cache_anchor_n: int = 0,
 ) -> tuple[list[str], list[str]]:
     """Return context split into recent history and retrieved RAG lines.
 
@@ -1131,11 +1153,15 @@ async def get_prompt_context_parts(
     """
     effective_recent_n = _message_review_back() if recent_n is None else recent_n
     effective_retrieved_k = _rag_top_k() if retrieved_k is None else retrieved_k
+    effective_anchor_n = max(0, min(cache_anchor_n, max(effective_recent_n - 1, 0)))
 
-    recent = await get_recent_messages(chat_id, limit=effective_recent_n)
+    anchor = await get_oldest_messages(chat_id, limit=effective_anchor_n)
+    recent = await get_recent_messages(chat_id, limit=max(1, effective_recent_n - len(anchor)))
+    anchor_ids = {message.id for message in anchor}
+    recent = [message for message in recent if message.id not in anchor_ids]
 
     retrieved: list[MessageRow] = []
-    if _rag_enabled():
+    if _rag_enabled() and effective_retrieved_k > 0 and (query or "").strip():
         try:
             search_k = max(effective_retrieved_k * 2, effective_retrieved_k)
             vector_retrieved = await vector_search_messages(chat_id, query, top_k=search_k)
@@ -1145,14 +1171,22 @@ async def get_prompt_context_parts(
             logger.exception("Vector search failed: %s", e)
             retrieved = []
 
-    recent_ids = {m.id for m in recent}
-    retrieved = [m for m in retrieved if m.id not in recent_ids]
+    prompt_ids = anchor_ids | {m.id for m in recent}
+    retrieved = [m for m in retrieved if m.id not in prompt_ids and m.username != BOT_HISTORY_USERNAME]
     retrieved = retrieved[:effective_retrieved_k]
     retrieved.sort(key=lambda m: m.id)
 
+    anchor_lines = [_format_message(m) for m in anchor]
     recent_lines = [_format_message(m) for m in recent]
     retrieved_lines = [_format_message(m) for m in retrieved]
-    recent_lines = _trim_context_lines(recent_lines, max_chars=_recent_context_max_chars(), keep="last")
+    recent_budget = _recent_context_max_chars()
+    if anchor_lines:
+        anchor_lines = _trim_context_lines(anchor_lines, max_chars=max(1, recent_budget // 3), keep="first")
+        used_anchor_chars = sum(len(line) + 1 for line in anchor_lines)
+        recent_lines = _trim_context_lines(recent_lines, max_chars=max(1, recent_budget - used_anchor_chars), keep="last")
+        recent_lines = anchor_lines + recent_lines
+    else:
+        recent_lines = _trim_context_lines(recent_lines, max_chars=recent_budget, keep="last")
     retrieved_lines = _trim_context_lines(retrieved_lines, max_chars=_rag_context_max_chars(), keep="first")
     return recent_lines, retrieved_lines
 

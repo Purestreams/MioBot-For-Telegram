@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
+from app.ai_model import LLMProvider, get_settings
 from app.runtime_config import get_ark_responses_endpoint, get_runtime_value
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,23 @@ def _extract_text_from_responses_payload(payload: dict[str, Any]) -> str:
         if texts:
             return "\n".join(texts)
 
+    return ""
+
+
+def _extract_text_from_chat_payload(payload: dict[str, Any]) -> str:
+    """Read text from an OpenAI-compatible chat-completions response."""
+    try:
+        content = payload["choices"][0]["message"].get("content", "")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            str(item.get("text", "")).strip()
+            for item in content
+            if isinstance(item, dict) and item.get("type") in {"text", "output_text"} and item.get("text")
+        ).strip()
     return ""
 
 
@@ -214,52 +232,70 @@ async def image_to_text(
         "VISUAL_SUMMARY: 1-2 short sentences about non-text visual content."
     ),
     model: Optional[str] = None,
+    raise_errors: bool = False,
 ) -> Optional[str]:
-    """Convert an image file into text using Ark Responses API."""
-    api_key = get_runtime_value("ARK_API_KEY")
-    if not api_key:
-        logger.warning("ARK_API_KEY is not configured; skipping image-to-text.")
-        return None
-
-    response_url = get_ark_responses_endpoint()
-    selected_model = model or get_runtime_value("ARK_VISION_MODEL") or get_runtime_value("ARK_MODEL")
-
+    """Convert an image file into text using the active provider's vision API."""
+    settings = get_settings()
     base64_file = await asyncio.to_thread(_read_base64_file, image_path)
     mime_type = _guess_mime_type(image_path)
 
-    payload = {
-        "model": selected_model,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{mime_type};base64,{base64_file}",
-                    },
-                    {
-                        "type": "input_text",
-                        "text": prompt,
-                    },
-                ],
-            }
-        ],
-    }
+    if settings.provider == LLMProvider.ZAN:
+        if not settings.zan_api_key or not settings.zan_endpoint:
+            logger.warning("ZAN vision configuration is incomplete; skipping image-to-text.")
+            return None
+        response_url = settings.zan_endpoint
+        selected_model = model or get_runtime_value("ZAN_VISION_MODEL") or settings.zan_model
+        api_key = settings.zan_api_key
+        payload = {
+            "model": selected_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{base64_file}"},
+                        },
+                    ],
+                }
+            ],
+        }
+        extract_text = _extract_text_from_chat_payload
+    else:
+        api_key = get_runtime_value("ARK_API_KEY")
+        if not api_key:
+            logger.warning("ARK_API_KEY is not configured; skipping image-to-text.")
+            return None
+        response_url = get_ark_responses_endpoint()
+        selected_model = model or get_runtime_value("ARK_VISION_MODEL") or get_runtime_value("ARK_MODEL")
+        payload = {
+            "model": selected_model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": f"data:{mime_type};base64,{base64_file}"},
+                        {"type": "input_text", "text": prompt},
+                    ],
+                }
+            ],
+        }
+        extract_text = _extract_text_from_responses_payload
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(response_url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
-        extracted = _extract_text_from_responses_payload(data)
+        extracted = extract_text(data)
         return extracted or None
     except Exception as e:
         logger.warning(f"image_to_text failed: {e}")
+        if raise_errors:
+            raise
         return None
 
 

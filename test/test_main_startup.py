@@ -38,33 +38,14 @@ def test_main_raises_when_fastembed_check_fails(monkeypatch):
         main.main()
 
 
-def test_main_auto_reindexes_embeddings_when_health_requires_it(monkeypatch):
-    calls = {"health": 0, "reindex": 0, "register": 0, "run_polling": 0}
+def test_main_registers_nonblocking_embedding_initializer(monkeypatch):
+    calls = {"register": 0, "run_polling": 0, "post_init": None}
 
     async def fake_ensure_fastembed_ready(*, model_name=None):
         return None
 
     def fake_init_db():
         return None
-
-    async def fake_log_embedding_health_report():
-        calls["health"] += 1
-        if calls["health"] == 1:
-            return {
-                "needs_reindex": True,
-                "db_file": "data/message_history.db",
-                "runtime": {"signature": "fastembed:model"},
-            }
-        return {
-            "needs_reindex": False,
-            "db_file": "data/message_history.db",
-            "runtime": {"signature": "fastembed:model"},
-        }
-
-    async def fake_reindex_message_embeddings(*, chat_id=None):
-        calls["reindex"] += 1
-        assert chat_id is None
-        return {"reindexed": 5, "signature": "fastembed:model"}
 
     class _FakeBuiltApplication:
         def add_error_handler(self, handler):
@@ -81,6 +62,10 @@ def test_main_auto_reindexes_embeddings_when_health_requires_it(monkeypatch):
             return self
 
         def write_timeout(self, timeout):
+            return self
+
+        def post_init(self, callback):
+            calls["post_init"] = callback
             return self
 
         def build(self):
@@ -98,14 +83,16 @@ def test_main_auto_reindexes_embeddings_when_health_requires_it(monkeypatch):
     monkeypatch.setattr(main, "init_db", fake_init_db)
     monkeypatch.setattr(main, "_start_webadmin_process", lambda: _FakeProcess())
     monkeypatch.setattr(main, "_stop_webadmin_process", lambda process: None)
-    monkeypatch.setattr(main, "log_embedding_health_report", fake_log_embedding_health_report)
-    monkeypatch.setattr(main, "reindex_message_embeddings", fake_reindex_message_embeddings)
     monkeypatch.setattr(main, "register_handlers", fake_register_handlers)
     monkeypatch.setattr(main, "Application", _FakeApplication)
 
     main.main()
 
-    assert calls == {"health": 2, "reindex": 1, "register": 1, "run_polling": 1}
+    assert calls == {
+        "register": 1,
+        "run_polling": 1,
+        "post_init": main.prepare_embedding_index,
+    }
 
 
 def test_main_starts_and_stops_webadmin_process(monkeypatch):
@@ -113,9 +100,6 @@ def test_main_starts_and_stops_webadmin_process(monkeypatch):
     process = _FakeProcess()
 
     async def fake_ensure_fastembed_ready(*, model_name=None):
-        return None
-
-    async def fake_ensure_embedding_index_ready():
         return None
 
     class _FakeBuiltApplication:
@@ -135,6 +119,9 @@ def test_main_starts_and_stops_webadmin_process(monkeypatch):
         def write_timeout(self, timeout):
             return self
 
+        def post_init(self, callback):
+            return self
+
         def build(self):
             return _FakeBuiltApplication()
 
@@ -144,7 +131,6 @@ def test_main_starts_and_stops_webadmin_process(monkeypatch):
             return _FakeApplicationBuilder()
 
     monkeypatch.setattr(main, "ensure_fastembed_ready", fake_ensure_fastembed_ready)
-    monkeypatch.setattr(main, "_ensure_embedding_index_ready", fake_ensure_embedding_index_ready)
     monkeypatch.setattr(main, "init_db", lambda: None)
     monkeypatch.setattr(main, "register_handlers", lambda application: calls.__setitem__("register", calls["register"] + 1))
     monkeypatch.setattr(main, "Application", _FakeApplication)

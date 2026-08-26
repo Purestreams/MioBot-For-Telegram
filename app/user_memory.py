@@ -218,6 +218,23 @@ def _format_context_facts(facts) -> list[str]:
     return [f"- [{fact.fact_type}] {fact.fact_text}" for fact in facts]
 
 
+_INSTRUCTIONAL_MEMORY_RE = re.compile(
+    r"(?:future similar (?:replies|interactions|distress)|future (?:replies|interactions)|"
+    r"prioritize immediate safety|require immediate safety|"
+    r"危机支持|危機支援|安全评估|安全評估|"
+    r"(?:未来|以后|以後).{0,12}(?:必须|应当|應當).{0,16}(?:回复|回應|回应|处理|處理))",
+    flags=re.IGNORECASE,
+)
+
+
+def _sanitize_memory_lines(lines: list[str]) -> list[str]:
+    kept = [line for line in lines if not _INSTRUCTIONAL_MEMORY_RE.search(line)]
+    removed = len(lines) - len(kept)
+    if removed:
+        logger.info("Filtered %s directive-like memory line(s) from prompt context", removed)
+    return kept
+
+
 def _format_facts_for_prompt(facts) -> str:
     if not facts:
         return "(empty)"
@@ -256,6 +273,9 @@ def _build_memory_messages(
         "Update the memory using the provided historical memory, structured facts, pending candidates, and source messages.\n"
         "Focus on stable preferences, repeated interests, ongoing projects, habits, tone, social context, and recurring facts that help future replies.\n"
         "Do not include one-off trivial chatter unless it reveals a durable preference or a continuing thread.\n"
+        "Never store instructions about how the bot should respond in the future.\n"
+        "Do not store one-time crisis-handling procedures, emergency escalation advice, police or ambulance guidance, hotlines, or phone numbers.\n"
+        "Facts must describe the user, not prescribe actions for an assistant.\n"
         "Return valid JSON only with keys memory_text, facts, and archive_fact_ids.\n"
         "memory_text must be 4 to 8 short plain-text lines, one durable memory per line.\n"
         "facts must be a list of atomic facts with keys type, text, confidence, and evidence_message_ids.\n"
@@ -664,11 +684,17 @@ async def get_personal_memory_context(
 
     sections: list[str] = []
     if facts:
+        fact_lines = _sanitize_memory_lines(_format_context_facts(facts))
+    else:
+        fact_lines = []
+    if fact_lines:
         sections.append("structured_facts:")
-        sections.extend(_format_context_facts(facts))
+        sections.extend(fact_lines)
     if normalized_memory_text:
-        sections.append("summary:")
-        sections.extend(normalized_memory_text.splitlines())
+        summary_lines = _sanitize_memory_lines(normalized_memory_text.splitlines())
+        if summary_lines:
+            sections.append("summary:")
+            sections.extend(summary_lines)
 
     if not sections:
         return None
@@ -695,9 +721,10 @@ async def get_global_memory_context(
         intent=intent,
         preferred_fact_types=preferred_fact_types,
     )
-    if not facts:
+    fact_lines = _sanitize_memory_lines(_format_context_facts(facts))
+    if not fact_lines:
         return None
-    return _trim_text(f"global_memory[chat_id={chat_id}]:\n" + "\n".join(_format_context_facts(facts)), max_chars=max_chars or _global_memory_context_max_chars()) or None
+    return _trim_text(f"global_memory[chat_id={chat_id}]:\n" + "\n".join(fact_lines), max_chars=max_chars or _global_memory_context_max_chars()) or None
 
 
 async def audit_user_memory_texts(*, limit: Optional[int] = 200) -> list[MemoryTextAuditRow]:

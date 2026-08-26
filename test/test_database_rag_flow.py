@@ -102,6 +102,88 @@ def test_get_prompt_context_parts_uses_keyword_retrieval_when_embeddings_miss(mo
     assert any("sqlite lock handling" in line for line in rag)
 
 
+def test_get_prompt_context_parts_keeps_stable_oldest_anchor(monkeypatch, tmp_path):
+    db_path = tmp_path / "anchor_context.db"
+    monkeypatch.setenv("DB_FILE", str(db_path))
+    monkeypatch.setattr(database, "DB_FILE", str(db_path))
+    monkeypatch.setenv("RAG_ENABLED", "0")
+    database.init_db()
+
+    async def _run() -> tuple[list[str], list[str]]:
+        for number in range(1, 7):
+            await database.add_message(300, "u", f"message-{number}")
+        return await database.get_prompt_context_parts(300, "", recent_n=4, retrieved_k=0, cache_anchor_n=2)
+
+    recent, rag = asyncio.run(_run())
+
+    assert rag == []
+    assert "message-1" in recent[0]
+    assert "message-2" in recent[1]
+    assert "message-5" in recent[-2]
+    assert "message-6" in recent[-1]
+
+
+def test_get_prompt_context_parts_excludes_anchor_and_recent_from_rag(monkeypatch):
+    monkeypatch.setenv("RAG_ENABLED", "1")
+    anchor_row = database.MessageRow(1, 9, "Alice", "oldest anchor context", "2026-08-01")
+    middle_row = database.MessageRow(2, 9, "Bob", "retrieved only context", "2026-08-02")
+    recent_row = database.MessageRow(3, 9, "Cara", "latest recent context", "2026-08-03")
+
+    async def fake_oldest(chat_id, limit):
+        return [anchor_row][:limit]
+
+    async def fake_recent(chat_id, limit):
+        return [recent_row]
+
+    async def fake_vector(chat_id, query, top_k):
+        return [anchor_row, middle_row, recent_row]
+
+    async def fake_keyword(chat_id, query, top_k):
+        return []
+
+    monkeypatch.setattr(database, "get_oldest_messages", fake_oldest)
+    monkeypatch.setattr(database, "get_recent_messages", fake_recent)
+    monkeypatch.setattr(database, "vector_search_messages", fake_vector)
+    monkeypatch.setattr(database, "keyword_search_messages", fake_keyword)
+
+    recent, rag = asyncio.run(
+        database.get_prompt_context_parts(9, "context", recent_n=2, retrieved_k=3, cache_anchor_n=1)
+    )
+    assert any("oldest anchor context" in line for line in recent)
+    assert any("latest recent context" in line for line in recent)
+    assert any("retrieved only context" in line for line in rag)
+    assert all("oldest anchor context" not in line for line in rag)
+    assert all("latest recent context" not in line for line in rag)
+
+
+def test_get_prompt_context_parts_excludes_bot_replies_from_rag(monkeypatch):
+    monkeypatch.setenv("RAG_ENABLED", "1")
+    bot_row = database.MessageRow(1, 7, database.BOT_HISTORY_USERNAME, "old emergency script", "2026-08-01")
+    human_row = database.MessageRow(2, 7, "Alice", "useful human context", "2026-08-02")
+    current_row = database.MessageRow(3, 7, "Bob", "current", "2026-08-03")
+
+    async def fake_oldest(chat_id, limit):
+        return []
+
+    async def fake_recent(chat_id, limit):
+        return [current_row]
+
+    async def fake_vector(chat_id, query, top_k):
+        return [bot_row, human_row]
+
+    async def fake_keyword(chat_id, query, top_k):
+        return []
+
+    monkeypatch.setattr(database, "get_oldest_messages", fake_oldest)
+    monkeypatch.setattr(database, "get_recent_messages", fake_recent)
+    monkeypatch.setattr(database, "vector_search_messages", fake_vector)
+    monkeypatch.setattr(database, "keyword_search_messages", fake_keyword)
+
+    _, rag = asyncio.run(database.get_prompt_context_parts(7, "context", recent_n=1, retrieved_k=2))
+    assert any("useful human context" in line for line in rag)
+    assert all("old emergency script" not in line for line in rag)
+
+
 def test_get_embedding_health_report_flags_signature_drift(monkeypatch, tmp_path):
     db_path = tmp_path / "health.db"
     monkeypatch.setenv("DB_FILE", str(db_path))

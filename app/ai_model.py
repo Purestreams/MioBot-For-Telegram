@@ -27,13 +27,17 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
-from app.runtime_config import get_ark_chat_completions_endpoint, get_runtime_bool, get_runtime_value
+from app.runtime_config import (
+  get_ark_chat_completions_endpoint,
+  get_runtime_bool,
+  get_runtime_value,
+  get_zan_chat_completions_endpoint,
+)
 
 try:  # Optional dependency for Azure support
   from openai import AsyncAzureOpenAI
@@ -47,6 +51,7 @@ class LLMProvider(str, Enum):
   """Supported chat completion providers."""
 
   ARK = "ark"
+  ZAN = "zan"
   AZURE = "azure"
   OLLAMA = "ollama"
 
@@ -64,6 +69,9 @@ class LLMSettings:
   ark_endpoint: str = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
   ark_api_key: Optional[str] = None
   ark_model: Optional[str] = None
+  zan_endpoint: Optional[str] = None
+  zan_api_key: Optional[str] = None
+  zan_model: Optional[str] = None
   ollama_endpoint: str = "http://100.69.97.8:11434"
   ollama_model: str = "gpt-oss:20b"
   request_timeout: float = 60.0
@@ -94,6 +102,9 @@ def configure_llm(
   ark_endpoint: Optional[str] = None,
   ark_api_key: Optional[str] = None,
   ark_model: Optional[str] = None,
+  zan_endpoint: Optional[str] = None,
+  zan_api_key: Optional[str] = None,
+  zan_model: Optional[str] = None,
   ollama_endpoint: Optional[str] = None,
   ollama_model: Optional[str] = None,
   request_timeout: Optional[float] = None,
@@ -125,6 +136,12 @@ def configure_llm(
     settings.ark_api_key = ark_api_key
   if ark_model is not None:
     settings.ark_model = ark_model
+  if zan_endpoint is not None:
+    settings.zan_endpoint = zan_endpoint
+  if zan_api_key is not None:
+    settings.zan_api_key = zan_api_key
+  if zan_model is not None:
+    settings.zan_model = zan_model
   if ollama_endpoint is not None:
     settings.ollama_endpoint = ollama_endpoint
   if ollama_model is not None:
@@ -169,6 +186,10 @@ def _load_settings_from_env() -> LLMSettings:
   settings.ark_api_key = get_runtime_value("ARK_API_KEY") or None
   settings.ark_model = get_runtime_value("ARK_MODEL") or None
 
+  settings.zan_endpoint = get_zan_chat_completions_endpoint() or None
+  settings.zan_api_key = get_runtime_value("ZAN_API_KEY") or None
+  settings.zan_model = get_runtime_value("ZAN_MODEL") or None
+
   settings.ollama_endpoint = get_runtime_value("OLLAMA_ENDPOINT") or settings.ollama_endpoint
   settings.ollama_model = get_runtime_value("OLLAMA_MODEL") or settings.ollama_model
 
@@ -192,6 +213,8 @@ def _coerce_provider(provider: str | LLMProvider) -> LLMProvider:
     return LLMProvider.AZURE
   if normalized == LLMProvider.OLLAMA.value:
     return LLMProvider.OLLAMA
+  if normalized in {LLMProvider.ZAN.value, "openai_compatible", "openai-compatible"}:
+    return LLMProvider.ZAN
   return LLMProvider.ARK
 
 
@@ -219,6 +242,33 @@ def _clean_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
   return {k: v for k, v in payload.items() if v is not None}
 
 
+def _cache_usage_fields(value: Any) -> Any:
+  if not isinstance(value, dict):
+    return None
+  fields: Dict[str, Any] = {}
+  for key, nested_value in value.items():
+    nested = _cache_usage_fields(nested_value)
+    if "cache" in key.lower():
+      fields[key] = nested_value
+    elif nested:
+      fields[key] = nested
+  return fields or None
+
+
+def _log_cache_metadata(provider: LLMProvider, response: Any, data: Dict[str, Any]) -> None:
+  """Log provider cache telemetry when explicitly enabled, without prompt data."""
+  if not get_runtime_bool("LLM_LOG_CACHE_HEADERS", False):
+    return
+  headers = getattr(response, "headers", {})
+  cache_headers = {
+    str(name): str(value)
+    for name, value in getattr(headers, "items", lambda: [])()
+    if "cache" in str(name).lower()
+  }
+  cache_usage = _cache_usage_fields(data.get("usage"))
+  logger.info("LLM cache telemetry provider=%s headers=%s usage=%s", provider.value, cache_headers, cache_usage or {})
+
+
 async def chat_completion(
   *,
   messages: List[Dict[str, Any]],
@@ -239,6 +289,20 @@ async def chat_completion(
 
   if active_provider == LLMProvider.ARK:
     return await _chat_completion_ark(
+      settings=settings,
+      messages=messages,
+      model=model,
+      response_format=response_format,
+      temperature=temperature,
+      max_tokens=max_tokens,
+      top_p=top_p,
+      tools=tools,
+      tool_choice=tool_choice,
+      extra_body=extra_body,
+    )
+
+  if active_provider == LLMProvider.ZAN:
+    return await _chat_completion_zan(
       settings=settings,
       messages=messages,
       model=model,
@@ -400,6 +464,7 @@ async def _chat_completion_ark(
 
   response.raise_for_status()
   data = response.json()
+  _log_cache_metadata(LLMProvider.ARK, response, data)
   content = ""
   try:
     content = data["choices"][0]["message"].get("content", "")
@@ -407,6 +472,56 @@ async def _chat_completion_ark(
     logger.warning("Ark response missing content: %s", json.dumps(data))
 
   return ChatCompletionResult(content=content or "", raw=data, provider=LLMProvider.ARK)
+
+
+async def _chat_completion_zan(
+  *,
+  settings: LLMSettings,
+  messages: List[Dict[str, Any]],
+  model: Optional[str],
+  response_format: Optional[Dict[str, Any]],
+  temperature: Optional[float],
+  max_tokens: Optional[int],
+  top_p: Optional[float],
+  tools: Optional[List[Dict[str, Any]]],
+  tool_choice: Optional[Any],
+  extra_body: Optional[Dict[str, Any]],
+) -> ChatCompletionResult:
+  """Send a request to ZAN's OpenAI-compatible chat-completions API."""
+  if not settings.zan_api_key or not settings.zan_endpoint:
+    raise RuntimeError("ZAN_API_KEY and ZAN_OPENAI_BASE_URL must be configured for provider=zan.")
+
+  payload: Dict[str, Any] = {
+    "model": model or settings.zan_model,
+    "messages": messages,
+    "temperature": temperature,
+    "max_tokens": max_tokens,
+    "top_p": top_p,
+    "response_format": response_format,
+    "tools": tools,
+    "tool_choice": tool_choice,
+    # ZAN accepts the Ark-compatible thinking flag used by the configured Luna model.
+    "thinking": {"type": "enabled" if settings.enable_thinking else "disabled"},
+  }
+  if extra_body:
+    payload.update(extra_body)
+
+  headers = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {settings.zan_api_key}",
+  }
+  async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
+    response = await client.post(settings.zan_endpoint, headers=headers, json=_clean_dict(payload))
+
+  response.raise_for_status()
+  data = response.json()
+  _log_cache_metadata(LLMProvider.ZAN, response, data)
+  content = ""
+  try:
+    content = data["choices"][0]["message"].get("content", "")
+  except (KeyError, IndexError, TypeError):
+    logger.warning("ZAN response missing content: %s", json.dumps(data))
+  return ChatCompletionResult(content=content or "", raw=data, provider=LLMProvider.ZAN)
 
 
 async def _chat_completion_azure(
@@ -521,6 +636,16 @@ def _build_test_messages(user_prompt: str, system_prompt: str) -> List[Dict[str,
   ]
 
 
+def _default_model_for_provider(settings: LLMSettings, provider: LLMProvider) -> Optional[str]:
+  if provider == LLMProvider.ARK:
+    return settings.ark_model
+  if provider == LLMProvider.ZAN:
+    return settings.zan_model
+  if provider == LLMProvider.AZURE:
+    return settings.azure_deployment
+  return settings.ollama_model
+
+
 async def _run_diagnostic(args: argparse.Namespace) -> None:
   if args.ark_api_key or args.ark_model:
     configure_llm(ark_api_key=args.ark_api_key, ark_model=args.ark_model)
@@ -544,7 +669,7 @@ async def _run_diagnostic(args: argparse.Namespace) -> None:
   if args.dry_run:
     payload = _clean_dict(
       {
-        "model": args.model or (settings.ark_model if provider == LLMProvider.ARK else settings.azure_deployment),
+        "model": args.model or _default_model_for_provider(settings, provider),
         "messages": messages,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
@@ -612,4 +737,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-

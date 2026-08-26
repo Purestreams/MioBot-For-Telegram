@@ -14,8 +14,8 @@ def test_live_llm_smoke_current_provider_model(request: pytest.FixtureRequest) -
     Run manually with:
       RUN_LIVE_LLM_TEST=1 uv run pytest -q test/test_llm_live.py
     """
-    #if os.getenv("RUN_LIVE_LLM_TEST") != "1":
-    #    pytest.skip("Set RUN_LIVE_LLM_TEST=1 to run live LLM smoke test.")
+    if os.getenv("RUN_LIVE_LLM_TEST") != "1":
+        pytest.skip("Set RUN_LIVE_LLM_TEST=1 to run live LLM smoke test.")
 
     bootstrap_runtime_environment()
 
@@ -23,6 +23,8 @@ def test_live_llm_smoke_current_provider_model(request: pytest.FixtureRequest) -
 
     if provider == "ark" and not os.getenv("ARK_API_KEY"):
         pytest.skip("ARK_API_KEY is missing for live ark test.")
+    if provider == "zan" and (not os.getenv("ZAN_API_KEY") or not os.getenv("ZAN_OPENAI_BASE_URL")):
+        pytest.skip("ZAN_API_KEY and ZAN_OPENAI_BASE_URL are required for live zan test.")
     if provider == "azure" and (not os.getenv("AZURE_OPENAI_API_KEY") or not os.getenv("AZURE_OPENAI_ENDPOINT")):
         pytest.skip("Azure OpenAI credentials are missing for live azure test.")
     if provider == "ollama" and not os.getenv("OLLAMA_ENDPOINT"):

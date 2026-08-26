@@ -14,11 +14,15 @@ _BOOTSTRAPPED = False
 DEFAULTS = {
     "LLM_PROVIDER": "ark",
     "LLM_ENABLE_THINKING": "0",
+    "LLM_LOG_CACHE_HEADERS": "0",
     "AZURE_OPENAI_API_VERSION": "2024-04-01-preview",
     "AZURE_OPENAI_DEPLOYMENT_NAME": "gpt-5-mini",
     "ARK_API_ENDPOINT": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
     "ARK_MODEL": "doubao-seed-1-8-251228",
     "ARK_VISION_MODEL": "doubao-seed-1-6-251015",
+    "ZAN_OPENAI_BASE_URL": "",
+    "ZAN_MODEL": "",
+    "ZAN_VISION_MODEL": "",
     "OLLAMA_ENDPOINT": "http://100.69.97.8:11434",
     "OLLAMA_MODEL": "gpt-oss:20b",
     "TELEGRAM_BOT_USERNAME": "MioooooooooBot",
@@ -26,9 +30,14 @@ DEFAULTS = {
     "DB_FILE": "data/message_history.db",
     "MESSAGE_REVIEW_BACK": "80",
     "RAG_TOP_K": "12",
+    "PROBE_MESSAGE_REVIEW_BACK": "12",
+    "PROMPT_CACHE_ANCHOR_MESSAGES": "12",
     "STICKER_REPLY_ENABLED": "1",
     "STICKER_REPLY_CANDIDATE_LIMIT": "12",
     "STICKER_REPLY_COOLDOWN_MINUTES": "30",
+    "STICKER_REPLY_RATIO_WINDOW": "20",
+    "AMBIENT_REPLY_COOLDOWN_SECONDS": "180",
+    "SUPPORT_STATE_TTL_SECONDS": "600",
     "MEMORY_CANDIDATE_EXTRACTION_ENABLED": "1",
     "MEMORY_CANDIDATE_AUTO_REFRESH_COUNT": "3",
     "EMBED_MODEL": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
@@ -99,6 +108,11 @@ def get_ark_chat_completions_endpoint() -> str:
 
 def get_ark_responses_endpoint() -> str:
     return _derive_ark_endpoint(get_runtime_value("ARK_API_ENDPOINT"), "responses")
+
+
+def get_zan_chat_completions_endpoint() -> str:
+    """Return ZAN's OpenAI-compatible chat-completions endpoint."""
+    return _derive_ark_endpoint(get_runtime_value("ZAN_OPENAI_BASE_URL"), "chat/completions")
 
 
 def get_runtime_int(name: str, default: int) -> int:

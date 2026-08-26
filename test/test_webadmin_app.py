@@ -7,6 +7,9 @@ def test_webadmin_login_and_management_api(monkeypatch, tmp_path):
     db_path = tmp_path / "webadmin_api.db"
     monkeypatch.setenv("DB_FILE", str(db_path))
     monkeypatch.setenv("WEBADMIN_SECRET_KEY", "test-secret")
+    monkeypatch.setenv("WEBADMIN_COOKIE_SECURE", "0")
+    monkeypatch.setenv("WEBADMIN_HOST", "127.0.0.1")
+    monkeypatch.setenv("WEBADMIN_BASE_URL", "http://127.0.0.1:8765")
     monkeypatch.setattr(database, "DB_FILE", str(db_path))
 
     async def fake_embed_message_content(*args, **kwargs):

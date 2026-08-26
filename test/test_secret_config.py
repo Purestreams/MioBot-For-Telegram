@@ -55,6 +55,14 @@ def test_ark_endpoint_helpers_derive_chat_and_responses_urls(monkeypatch):
     assert runtime_config.get_ark_chat_completions_endpoint() == "https://example.test/api/v3/chat/completions"
     assert runtime_config.get_ark_responses_endpoint() == "https://example.test/api/v3/responses"
 
+
+def test_zan_endpoint_helper_derives_chat_completions_url(monkeypatch):
+    monkeypatch.setenv("ZAN_OPENAI_BASE_URL", "https://ai.zan.top/v1")
+    assert runtime_config.get_zan_chat_completions_endpoint() == "https://ai.zan.top/v1/chat/completions"
+
+    monkeypatch.setenv("ZAN_OPENAI_BASE_URL", "https://ai.zan.top/v1/chat/completions")
+    assert runtime_config.get_zan_chat_completions_endpoint() == "https://ai.zan.top/v1/chat/completions"
+
     monkeypatch.setenv("ARK_API_ENDPOINT", "https://example.test/api/v3/responses")
 
     assert runtime_config.get_ark_chat_completions_endpoint() == "https://example.test/api/v3/chat/completions"

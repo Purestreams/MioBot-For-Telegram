@@ -53,6 +53,35 @@ def test_build_user_prompt_orders_cache_stable_context_before_volatile_context()
     assert prompt.rstrip().endswith("newest message")
 
 
+def test_cacheable_context_messages_preserve_history_prefix_across_turns():
+    first_turn = reply2message._build_cacheable_context_messages(
+        ["Alice: first", "Bob: second"],
+        additional_context=["user_personal_memory:\nlikes tea"],
+    )
+    second_turn = reply2message._build_cacheable_context_messages(
+        ["Alice: first", "Bob: second", "Alice: third"],
+        additional_context=["user_personal_memory:\nlikes tea"],
+    )
+
+    assert first_turn[0] == second_turn[0]
+    assert second_turn[1]["content"].endswith("Bob: second")
+    assert all("DURABLE CONTEXT" not in message["content"] for message in second_turn[:2])
+    assert second_turn[-1]["content"].endswith("Alice: third")
+
+
+def test_cacheable_context_messages_keep_latest_message_last():
+    messages = reply2message._build_cacheable_context_messages(
+        ["old", "latest"],
+        available_memory_subjects=[{"key": "sender", "display": "Alice", "role": "latest_message_author"}],
+        include_memory_subjects=True,
+    )
+
+    available_index = next(index for index, message in enumerate(messages) if "AVAILABLE MEMORY SUBJECTS" in message["content"])
+    assert available_index < len(messages) - 1
+    assert "LATEST MESSAGE TO RESPOND TO" in messages[-1]["content"]
+    assert messages[-1]["content"].endswith("latest")
+
+
 def test_should_activate_reply_returns_true_when_model_says_yes(monkeypatch, tmp_path):
     info_file = tmp_path / "info.txt"
     info_file.write_text("line1\nline2\n", encoding="utf-8")
@@ -74,11 +103,155 @@ def test_should_activate_reply_returns_true_when_model_says_yes(monkeypatch, tmp
     )
 
     assert result is True
-    system_prompt = called["messages"][0]["content"]
-    user_prompt = called["messages"][1]["content"]
+    system_prompt = called["messages"][1]["content"]
+    user_prompt = "\n".join(message["content"] for message in called["messages"][2:])
     assert "LATEST MESSAGE TO RESPOND TO" in system_prompt
     assert "is_mentioned: true" in user_prompt
     assert "directly_addressed: true" in user_prompt
+
+
+def test_generation_context_omits_probe_only_memory_subjects():
+    messages = reply2message._build_cacheable_context_messages(
+        ["old", "latest"],
+        available_memory_subjects=[{"key": "sender", "display": "Alice", "role": "latest_message_author"}],
+    )
+
+    assert all("AVAILABLE MEMORY SUBJECTS" not in message["content"] for message in messages)
+    assert "LATEST MESSAGE TO RESPOND TO" in messages[-1]["content"]
+
+
+def test_probe_prompt_is_identical_across_models():
+    luna_prompt = reply2message._build_probe_system_prompt(model="gpt-5.6-luna")
+    generic_prompt = reply2message._build_probe_system_prompt(model="another-model")
+
+    assert luna_prompt == generic_prompt
+    assert "Never transfer medical, self-harm, or violence assumptions between speakers" in luna_prompt
+    assert "Never put police" in luna_prompt
+
+
+def test_generation_prompt_is_identical_across_models_and_uses_json():
+    luna_prompt = reply2message._build_generation_system_prompt(
+        information_lines=[],
+        model="gpt-5.6-luna",
+    )
+    generic_prompt = reply2message._build_generation_system_prompt(
+        information_lines=[],
+        model="another-model",
+    )
+
+    assert luna_prompt == generic_prompt
+    assert "Offer warmth and emotional acknowledgement before advice" in luna_prompt
+    assert "Never mention police" in luna_prompt
+    assert '"reply_content" and "support_level"' in luna_prompt
+
+
+def test_normalize_reply_content_removes_thinking_tags_anywhere():
+    assert reply2message._normalize_reply_content("你好</think_never_used_abc>") == "你好"
+    assert reply2message._normalize_reply_content("<think>hidden</think>最终回复") == "最终回复"
+
+
+def test_group_reply_violation_detects_thinking_tags_on_unsanitized_text():
+    assert reply2message.group_reply_violation("<think>hidden</think>最终回复") == "thinking_tag"
+    assert reply2message.group_reply_violation("你好</think_never_used_abc>") == "thinking_tag"
+    assert reply2message.group_reply_violation("最终回复") is None
+
+
+def test_group_reply_guard_detects_forbidden_escalation_and_false_actions():
+    assert reply2message.group_reply_violation("请马上拨打119") == "emergency_escalation"
+    assert reply2message.group_reply_violation("call the police") == "emergency_escalation"
+    assert reply2message.group_reply_violation("这就生成公钥发你") == "false_external_action"
+    assert reply2message.group_reply_violation("我在这里听你说") is None
+    assert reply2message.group_reply_violation("这是电影里的警察台词") is None
+    assert reply2message.group_reply_violation("打不了911啊这是玩梗吧") is None
+
+
+def test_guard_fallback_does_not_add_trusted_person_advice_for_non_danger():
+    assert "信任" not in reply2message._guard_fallback("thinking_tag")
+    assert "信任" not in reply2message._guard_fallback("emergency_escalation", support_level="normal")
+    assert "信任" in reply2message._guard_fallback(
+        "emergency_escalation",
+        support_level="explicit_current_danger",
+    )
+    assert reply2message._guard_fallback("false_external_action") == reply2message.CAPABILITY_FALLBACK
+
+
+def test_disabled_thinking_extra_body_is_provider_specific(monkeypatch):
+    monkeypatch.setattr(
+        reply2message,
+        "get_settings",
+        lambda: type("Settings", (), {"provider": reply2message.LLMProvider.AZURE})(),
+    )
+    assert reply2message._disabled_thinking_extra_body() is None
+
+    monkeypatch.setattr(
+        reply2message,
+        "get_settings",
+        lambda: type("Settings", (), {"provider": reply2message.LLMProvider.ZAN})(),
+    )
+    assert reply2message._disabled_thinking_extra_body() == {"thinking": {"type": "disabled"}}
+
+    monkeypatch.setattr(
+        reply2message,
+        "get_settings",
+        lambda: type("Settings", (), {"provider": reply2message.LLMProvider.OLLAMA})(),
+    )
+    assert reply2message._disabled_thinking_extra_body() is None
+
+
+def test_generate_group_reply_thinking_tag_fallback_is_not_crisis(monkeypatch, tmp_path):
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("x\n", encoding="utf-8")
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        return _Completion(
+            json.dumps({"reply_content": "哈哈 think_never_used", "support_level": "normal"})
+        )
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
+
+    result = asyncio.run(reply2message.generate_group_reply(["u: hi"], return_result=True))
+
+    assert isinstance(result, reply2message.GeneratedGroupReply)
+    assert result.reply_content == reply2message.LISTENING_FALLBACK
+    assert "信任" not in result.reply_content
+    assert result.guard_repaired is True
+    assert result.forbidden_pattern == "thinking_tag"
+
+
+def test_generate_group_reply_strips_well_formed_think_tags_without_discarding_reply(
+    monkeypatch, tmp_path
+):
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("x\n", encoding="utf-8")
+    calls = {"n": 0}
+
+    async def fake_chat_completion(*, messages, **kwargs):
+        calls["n"] += 1
+        return _Completion(
+            json.dumps(
+                {
+                    "reply_content": "<think>hidden reasoning</think>最终回复",
+                    "support_level": "normal",
+                }
+            )
+        )
+
+    monkeypatch.setattr(reply2message, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(reply2message, "INFO_FILE_PATH", info_file)
+
+    result = asyncio.run(reply2message.generate_group_reply(["u: hi"], return_result=True))
+
+    assert isinstance(result, reply2message.GeneratedGroupReply)
+    assert result.reply_content == "最终回复"
+    assert result.guard_repaired is True
+    assert result.forbidden_pattern == "thinking_tag"
+    assert calls["n"] == 1
+
+
+def test_direct_reply_activation_disables_rag_by_default():
+    assert reply2message.direct_reply_activation_decision().needs_rag is False
+    assert reply2message.direct_reply_activation_decision(needs_rag=True).needs_rag is True
 
 
 def test_should_activate_reply_returns_false_on_invalid_json(monkeypatch, tmp_path):
@@ -127,7 +300,7 @@ def test_should_activate_reply_can_return_generation_plan(monkeypatch):
     called = {}
 
     async def fake_chat_completion(*, messages, **kwargs):
-        called["user_prompt"] = messages[1]["content"]
+        called["user_prompt"] = "\n".join(message["content"] for message in messages[1:])
         return _Completion(
             json.dumps(
                 {

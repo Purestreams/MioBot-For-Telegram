@@ -4,6 +4,42 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 import main
+import pytest
+from app.reply2message import GeneratedGroupReply
+
+
+@pytest.fixture(autouse=True)
+def _isolate_group_reply_runtime(monkeypatch):
+    async def no_global_memory(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "get_global_memory_context", no_global_memory)
+    main._AMBIENT_LAST_REPLY_AT.clear()
+    main._STICKER_REPLY_EVENTS.clear()
+    main._SUPPORT_STATES.clear()
+
+
+def test_support_state_is_user_scoped_and_expires(monkeypatch):
+    main._SUPPORT_STATES.clear()
+    monkeypatch.setattr(main.time, "monotonic", lambda: 100.0)
+    main._SUPPORT_STATES[(7, "tg_user:1")] = main._SupportState(expires_at=110.0)
+
+    assert main._support_state_for(7, "tg_user:1") is not None
+    assert main._support_state_for(7, "tg_user:2") is None
+
+    monkeypatch.setattr(main.time, "monotonic", lambda: 111.0)
+    assert main._support_state_for(7, "tg_user:1") is None
+
+
+def test_sticker_ratio_gate_limits_recent_reply_share():
+    main._STICKER_REPLY_EVENTS.clear()
+    main._record_reply_event(7, used_sticker=True)
+    assert main._sticker_ratio_allows(7) is False
+    for _ in range(3):
+        main._record_reply_event(7, used_sticker=False)
+    assert main._sticker_ratio_allows(7) is False
+    main._record_reply_event(7, used_sticker=False)
+    assert main._sticker_ratio_allows(7) is True
 
 
 class _FakeMessage:
@@ -58,7 +94,7 @@ def test_group_reply_pipeline_calls_rag_and_replies(monkeypatch):
         calls["add"] += 1
         captured["add_kwargs"].append(kwargs)
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         calls["context"].append(query)
         return ["[t] user: hello"], ["[t] user: cats and fish"]
 
@@ -110,7 +146,7 @@ def test_group_reply_pipeline_includes_reply_relation_context(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         captured["added"].append(content)
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         return ["[t] user: hello"], []
 
     async def fake_should_activate_reply(**kwargs):
@@ -165,7 +201,7 @@ def test_group_reply_pipeline_uses_probe_memory_focus(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         return None
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         return ["[t] UserA @user_a: A asks about B"], []
 
     async def fake_should_activate_reply(**kwargs):
@@ -221,7 +257,7 @@ def test_group_reply_pipeline_stops_after_negative_probe(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         calls["add"] += 1
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         calls["context"].append(query)
         return ["[t] user: hello"], []
 
@@ -267,7 +303,7 @@ def test_group_reply_pipeline_direct_mention_bypasses_probe(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         return None
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         calls["context"].append(query)
         return ["[t] user: hello"], ["[t] user: mioo look here"]
 
@@ -301,7 +337,7 @@ def test_group_reply_pipeline_direct_mention_bypasses_probe(monkeypatch):
 
     assert calls["probe"] == 0
     assert calls["generate"] == 1
-    assert calls["context"] == ["mioo look here | UserA @user_a"]
+    assert calls["context"] == [""]
     assert update.message.replies == ["在呢"]
 
 
@@ -316,7 +352,7 @@ def test_group_reply_pipeline_uses_cached_memory_and_schedules_refresh(monkeypat
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         return None
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         return ["[t] UserA @user_a: mioo help"], []
 
     async def fake_should_activate_reply(**kwargs):
@@ -394,7 +430,7 @@ def test_group_reply_pipeline_reply_to_bot_is_case_insensitive(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         return None
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         return ["[t] user: hello"], ["[t] mio: prior bot reply"]
 
     async def fail_should_activate_reply(**kwargs):
@@ -543,7 +579,7 @@ def test_group_reply_pipeline_can_attach_selected_sticker(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         captured["added"].append({"username": username, "content": content, **kwargs})
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         return ["[t] UserA @user_a: mioo 哈哈"], []
 
     async def fake_generate_group_reply(**kwargs):
@@ -614,7 +650,7 @@ def test_group_reply_pipeline_can_send_sticker_without_text(monkeypatch):
     async def fake_add_message(*, chat_id, username, content, **kwargs):
         captured["added"].append({"username": username, "content": content, **kwargs})
 
-    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None):
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
         return ["[t] UserA @user_a: mioo 发个表情"], []
 
     async def fake_generate_group_reply(**kwargs):
@@ -701,3 +737,146 @@ def test_send_sticker_reply_still_succeeds_when_history_logging_fails(monkeypatc
 
     assert result is True
     assert update.message.sticker_replies == ["file-wave"]
+
+
+def _stub_group_reply_pipeline(monkeypatch, *, generate_return="在呢"):
+    calls = {"probe": 0, "generate": 0, "context": []}
+
+    async def fake_add_message(*, chat_id, username, content, **kwargs):
+        return None
+
+    async def fake_get_prompt_context_parts(chat_id, query, recent_n=None, retrieved_k=None, cache_anchor_n=0):
+        calls["context"].append(query)
+        return ["[t] user: hello"], []
+
+    async def fake_should_activate_reply(**kwargs):
+        calls["probe"] += 1
+        return True
+
+    async def fake_generate_group_reply(**kwargs):
+        calls["generate"] += 1
+        return generate_return
+
+    async def fake_get_personal_memory_context(telegram_user_key, **kwargs):
+        return None
+
+    def fake_schedule_personal_memory_refresh(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "add_message", fake_add_message)
+    monkeypatch.setattr(main, "get_prompt_context_parts", fake_get_prompt_context_parts)
+    monkeypatch.setattr(main, "should_activate_reply", fake_should_activate_reply)
+    monkeypatch.setattr(main, "generate_group_reply", fake_generate_group_reply)
+    monkeypatch.setattr(main, "get_personal_memory_context", fake_get_personal_memory_context)
+    monkeypatch.setattr(main, "_schedule_personal_memory_refresh", fake_schedule_personal_memory_refresh)
+    monkeypatch.setattr(main, "_sticker_reply_enabled", lambda: False)
+    return calls
+
+
+def test_group_reply_pipeline_skips_other_bot_mentions(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="@other_helper_bot 出来", message_id=801)
+    monkeypatch.setattr(main, "TELEGRAM_BOT_USERNAME", "MioooooooooBot")
+    calls = _stub_group_reply_pipeline(monkeypatch)
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(update, "@other_helper_bot 出来"))
+
+    assert calls["probe"] == 0
+    assert calls["generate"] == 0
+    assert update.message.replies == []
+
+
+def test_group_reply_pipeline_stop_phrase_replies_and_ignores_keep_secret(monkeypatch):
+    stop_update = _FakeUpdate()
+    stop_update.message = _FakeMessage(text="小小宫闭嘴", message_id=802)
+    stop_update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    stop_update.effective_user = stop_update.message.from_user
+    stop_calls = _stub_group_reply_pipeline(monkeypatch)
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(stop_update, "小小宫闭嘴"))
+
+    assert stop_calls["generate"] == 0
+    assert stop_update.message.replies == [main.STOP_REPLY_TEXT]
+
+    secret_update = _FakeUpdate()
+    secret_update.message = _FakeMessage(text="小小宫不要说出去", message_id=803)
+    secret_update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    secret_update.effective_user = secret_update.message.from_user
+    secret_calls = _stub_group_reply_pipeline(monkeypatch)
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(secret_update, "小小宫不要说出去"))
+
+    assert secret_calls["generate"] == 1
+    assert secret_update.message.replies == ["在呢"]
+
+
+def test_group_reply_pipeline_direct_history_query_enables_rag(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="小小宫刚才说的链接是哪个", message_id=804)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
+    calls = _stub_group_reply_pipeline(monkeypatch)
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(update, "小小宫刚才说的链接是哪个"))
+
+    assert calls["probe"] == 0
+    assert calls["generate"] == 1
+    assert calls["context"]
+    assert calls["context"][-1] != ""
+
+
+def test_group_reply_pipeline_ambient_cooldown_skips_followup(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="这段也太好笑了", message_id=805)
+    context = SimpleNamespace(bot=SimpleNamespace(id=1), application=None)
+    calls = _stub_group_reply_pipeline(monkeypatch)
+    monkeypatch.setattr(main, "AMBIENT_REPLY_COOLDOWN_SECONDS", 180)
+    main._AMBIENT_LAST_REPLY_AT[1] = main.time.monotonic()
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(update, "这段也太好笑了", context=context))
+
+    assert calls["probe"] == 0
+    assert calls["generate"] == 0
+    assert update.message.replies == []
+
+
+def test_group_reply_pipeline_clears_support_state_on_normal_reply(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="哈哈好好笑", message_id=806)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
+    main._SUPPORT_STATES[(1, "tg_user:10101")] = main._SupportState(
+        expires_at=main.time.monotonic() + 600,
+        followups_remaining=1,
+    )
+    _stub_group_reply_pipeline(
+        monkeypatch,
+        generate_return=GeneratedGroupReply(reply_content="哈哈", support_level="normal"),
+    )
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(update, "哈哈好好笑"))
+
+    assert main._support_state_for(1, "tg_user:10101") is None
+    assert update.message.replies == ["哈哈"]
+
+
+def test_group_reply_pipeline_caps_danger_followups(monkeypatch):
+    update = _FakeUpdate()
+    update.message = _FakeMessage(text="我现在还是很难受", message_id=807)
+    update.message.from_user = _FakeUser(name="UserA", is_bot=False, username="user_a", user_id=10101)
+    update.effective_user = update.message.from_user
+    main._SUPPORT_STATES[(1, "tg_user:10101")] = main._SupportState(
+        expires_at=main.time.monotonic() + 600,
+        followups_remaining=0,
+    )
+    _stub_group_reply_pipeline(
+        monkeypatch,
+        generate_return=GeneratedGroupReply(
+            reply_content="听起来你现在很难受，先找身边信任的人陪着你。",
+            support_level="explicit_current_danger",
+        ),
+    )
+
+    asyncio.run(main._handle_group_ai_reply_pipeline(update, "我现在还是很难受"))
+
+    assert update.message.replies == ["小小宫还在听着，你想说什么就说吧。"]

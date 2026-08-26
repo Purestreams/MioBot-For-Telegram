@@ -277,6 +277,30 @@ def _classify_group_reply_trigger(message_text: Optional[str], bot_username: Opt
     return "ambient"
 
 
+STOP_REPLY_TEXT = "好，我先不打扰了"
+_STOP_REPLY_RE = re.compile(
+    r"(?:闭嘴|閉嘴|别说了|別說了|不要再说(?:了)?|不要再說(?:了)?|别再说话|別再說話|"
+    r"别吵了|別吵了|不要吵了|谁问你|誰問你|受够你(?:了)?|受夠你(?:了)?)"
+)
+_HISTORY_QUERY_RE = re.compile(
+    r"(?:之前|上次|刚才|剛才|刚刚|剛剛|还记得|還記得|记得吗|記得嗎|"
+    r"以前说过|以前說過|你说过|你說過|说过的|說過的|过去聊过|過去聊過|那次|"
+    r"\bremember(?:\s+when)?\b|\blast time\b|\bearlier\b|\byou said\b|"
+    r"\bwhat did (?:i|we|you) say\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _mentions_another_bot_only(message_text: Optional[str], bot_username: Optional[str]) -> bool:
+    mentions = re.findall(
+        r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]+bot)(?![A-Za-z0-9_])",
+        message_text or "",
+        flags=re.IGNORECASE,
+    )
+    own = (bot_username or "").strip().lstrip("@").lower()
+    return bool(mentions) and own not in {mention.lower() for mention in mentions}
+
+
 def _display_name_from_user(user) -> str:
     if not user:
         return "unknown_user @unknown"

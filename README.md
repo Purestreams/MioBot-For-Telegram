@@ -188,7 +188,7 @@ The pipeline does the following:
 
 This design keeps reply latency low: expensive memory refreshes, candidate extraction, and sync media extraction are moved out of the main async path where possible.
 
-The prompt layout is also shaped for provider-side KV or prompt-cache reuse. Stable instructions stay in the system prompt. The user prompt orders context from more reusable to more volatile: earlier history, durable personal memory, RAG results, message-specific reply/media context, direct-address flags, runtime state, and finally the newest message. This keeps the longest practical prefix stable across adjacent requests while preserving the newest message at the end where the model should focus.
+The prompt layout is shaped for provider-side KV or prompt-cache reuse. A shared context-protocol system message and earlier history are emitted as append-only messages. On the next turn, the previous latest message is appended to that history rather than rewriting one monolithic prompt. Durable memory, RAG results, message-specific context, direct-address flags, and runtime state follow the history; the newest message remains the final message. Ambient reply probes use a shorter history and no RAG; when a busy chat's recent-history window rolls, a small oldest-message anchor preserves a stable prefix.
 
 ### SQLite Storage Model
 
@@ -304,7 +304,7 @@ TELEGRAM_BOT_USERNAME=MioooooooooBot
 TELEGRAM_BOT_KEY=
 TELEGRAM_ADMIN_USER_IDS=
 
-# Provider selection: ark | azure | ollama
+# Provider selection: ark | zan | azure | ollama
 LLM_PROVIDER=ark
 LLM_ENABLE_THINKING=0
 
@@ -320,6 +320,13 @@ ARK_API_KEY=
 ARK_MODEL=doubao-seed-1-8-251228
 ARK_VISION_MODEL=doubao-seed-1-6-251015
 
+# ZAN (OpenAI-compatible chat and vision)
+ZAN_OPENAI_BASE_URL=https://ai.zan.top/v1
+ZAN_API_KEY=
+ZAN_MODEL=gpt-5.6-luna
+# Optional; defaults to ZAN_MODEL.
+ZAN_VISION_MODEL=
+
 # Ollama
 OLLAMA_ENDPOINT=http://100.69.97.8:11434
 OLLAMA_MODEL=gpt-oss:20b
@@ -329,6 +336,7 @@ DB_FILE=data/message_history.db
 MESSAGE_REVIEW_BACK=80
 RAG_TOP_K=12
 EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+RAG_REINDEX_ON_STARTUP=background
 
 # Personal memory
 MEMORY_CANDIDATE_EXTRACTION_ENABLED=1
@@ -340,6 +348,11 @@ Ark now uses a single endpoint variable:
 - Configure only `ARK_API_ENDPOINT`.
 - Text completions use the derived `/chat/completions` endpoint.
 - Vision and sticker understanding use the derived `/responses` endpoint.
+
+For `LLM_PROVIDER=zan`, chat, image, and sticker understanding use ZAN's
+OpenAI-compatible `/chat/completions` endpoint. `ZAN_VISION_MODEL` defaults to
+`ZAN_MODEL`. Set `RAG_REINDEX_ON_STARTUP` to `background` (default), `blocking`,
+or `disabled`; the manual fallback is `miobot-rag reindex`.
 
 Optional Twitter/X cookie configuration:
 
@@ -636,7 +649,7 @@ Twitter/X 走 [app/twitter_downloader.py](app/twitter_downloader.py)，支持图
 
 这条设计的重点是保持回复低延迟：记忆刷新、候选抽取、同步媒体解析都尽量放到主回复路径之外。
 
-Prompt 顺序也专门照顾 provider 侧 KV cache / prompt cache。稳定规则放在 system prompt；user prompt 按“更稳定到更动态”的顺序排列：早期聊天历史、长期个人记忆、RAG 结果、当前消息专属上下文、direct-address flags、runtime state，最后才是最新消息。这样相邻请求能复用尽可能长的前缀，同时让模型最后看到当前要回复的消息。
+Prompt 结构专门照顾 provider 侧 KV cache / prompt cache。共享的上下文协议与稳定规则放在 system prompt，早期聊天历史以可追加的独立 message 发送；下一轮会把上一条最新消息追加到历史末尾，而不会从头重写一个大 prompt。长期个人记忆、RAG 结果、当前消息专属上下文、direct-address flags 与 runtime state 均位于历史之后，最新消息始终最后发送。普通环境消息的 Probe 使用更短的历史且不触发 RAG；高频群聊的历史窗口滚动时，会保留少量最早消息作为稳定锚点。
 
 ### SQLite 存储模型
 
@@ -753,7 +766,7 @@ TELEGRAM_BOT_USERNAME=MioooooooooBot
 TELEGRAM_BOT_KEY=
 TELEGRAM_ADMIN_USER_IDS=
 
-# Provider: ark | azure | ollama
+# Provider: ark | zan | azure | ollama
 LLM_PROVIDER=ark
 LLM_ENABLE_THINKING=0
 
@@ -763,14 +776,26 @@ ARK_API_KEY=
 ARK_MODEL=doubao-seed-1-8-251228
 ARK_VISION_MODEL=doubao-seed-1-6-251015
 
+# ZAN（OpenAI 兼容聊天与视觉）
+ZAN_OPENAI_BASE_URL=https://ai.zan.top/v1
+ZAN_API_KEY=
+ZAN_MODEL=gpt-5.6-luna
+ZAN_VISION_MODEL=
+
 # Database and retrieval
 DB_FILE=data/message_history.db
 MESSAGE_REVIEW_BACK=80
 RAG_TOP_K=12
 EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+RAG_REINDEX_ON_STARTUP=background
 ```
 
 Ark endpoint 已统一：只配置 `ARK_API_ENDPOINT`。文本模型使用自动推导出的 `/chat/completions`，图片和贴纸使用自动推导出的 `/responses`。
+
+使用 `LLM_PROVIDER=zan` 时，文本、图片和贴纸理解均通过 ZAN 的 OpenAI 兼容
+`/chat/completions` 接口；未设置 `ZAN_VISION_MODEL` 时默认使用 `ZAN_MODEL`。
+`RAG_REINDEX_ON_STARTUP` 可设为 `background`（默认）、`blocking` 或 `disabled`；
+手动重建命令为 `miobot-rag reindex`。
 
 ## 管理员命令
 

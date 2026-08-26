@@ -7,7 +7,10 @@ import io
 import logging
 import multiprocessing
 import os
+import re
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -46,6 +49,7 @@ from app.youtube_dl import (
     resolve_caption_url,
 )
 from app.reply2message import (
+    GeneratedGroupReply,
     ReplyActivationDecision,
     choose_reply_sticker,
     direct_reply_activation_decision,
@@ -64,6 +68,7 @@ from app.user_memory import (
     reject_user_memory_candidate,
 )
 from app.database import (
+    BOT_HISTORY_USERNAME,
     add_message,
     archive_global_memory_fact,
     archive_user_memory_fact,
@@ -79,8 +84,6 @@ from app.database import (
     init_db,
     list_user_memory_candidates,
     list_user_memory_overviews,
-    log_embedding_health_report,
-    reindex_message_embeddings,
     record_sticker_reply_usage,
     search_user_memories,
     update_user_memory_fact,
@@ -102,6 +105,7 @@ from app.cryto import get_Allez_APR, get_Allez_USDC_APR, get_Price_Coinbase
 
 from app.med import MedRenderError, generate_jpg_from_med_json, generate_med
 from app.ai_model import configure_llm
+from app.startup import prepare_embedding_index
 from app.main_helpers import (
     OUTPUT_DIR,
     MD2JPG_REGEX,
@@ -112,6 +116,10 @@ from app.main_helpers import (
     _extract_video_url,
     _is_reply_to_this_bot,
     _classify_group_reply_trigger,
+    _mentions_another_bot_only,
+    _STOP_REPLY_RE,
+    _HISTORY_QUERY_RE,
+    STOP_REPLY_TEXT,
     _display_name_from_user,
     is_zhihu_answer_url,
     is_zhihu_url,
@@ -154,6 +162,8 @@ def _warn_missing_runtime_env(provider: str) -> None:
         required += ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_DEPLOYMENT_NAME"]
     elif provider == "ark":
         required += ["ARK_API_KEY", "ARK_API_ENDPOINT", "ARK_MODEL"]
+    elif provider in {"zan", "openai_compatible", "openai-compatible"}:
+        required += ["ZAN_OPENAI_BASE_URL", "ZAN_API_KEY", "ZAN_MODEL"]
     elif provider == "ollama":
         required += ["OLLAMA_ENDPOINT", "OLLAMA_MODEL"]
 
@@ -185,9 +195,102 @@ TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_TEXT_LIMIT = 4096
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _USER_MEMORY_REFRESH_KEYS: set[str] = set()
+AMBIENT_REPLY_COOLDOWN_SECONDS = max(0, get_runtime_int("AMBIENT_REPLY_COOLDOWN_SECONDS", 180))
+SUPPORT_STATE_TTL_SECONDS = max(60, get_runtime_int("SUPPORT_STATE_TTL_SECONDS", 600))
+STICKER_REPLY_RATIO_WINDOW = max(4, get_runtime_int("STICKER_REPLY_RATIO_WINDOW", 20))
+STICKER_REPLY_MAX_RATIO = 0.25
+_AMBIENT_LAST_REPLY_AT: dict[int, float] = {}
+_STICKER_REPLY_EVENTS: dict[int, deque[bool]] = {}
+
+
+@dataclass
+class _SupportState:
+    expires_at: float
+    followups_remaining: int = 1
+
+
+_SUPPORT_STATES: dict[tuple[int, str], _SupportState] = {}
+
+
+def _support_state_for(chat_id: int, telegram_user_key: Optional[str]) -> Optional[_SupportState]:
+    if not telegram_user_key:
+        return None
+    key = (chat_id, telegram_user_key)
+    state = _SUPPORT_STATES.get(key)
+    if state and state.expires_at > time.monotonic():
+        return state
+    _SUPPORT_STATES.pop(key, None)
+    return None
+
+
+def _clear_support_state(chat_id: int, telegram_user_key: Optional[str]) -> None:
+    if telegram_user_key:
+        _SUPPORT_STATES.pop((chat_id, telegram_user_key), None)
+
+
+def _prune_expired_support_states() -> None:
+    now = time.monotonic()
+    expired = [key for key, state in _SUPPORT_STATES.items() if state.expires_at <= now]
+    for key in expired:
+        _SUPPORT_STATES.pop(key, None)
+
+
+def _record_reply_event(chat_id: int, *, used_sticker: bool) -> None:
+    events = _STICKER_REPLY_EVENTS.setdefault(chat_id, deque(maxlen=STICKER_REPLY_RATIO_WINDOW))
+    events.append(used_sticker)
+
+
+def _sticker_ratio_allows(chat_id: int) -> bool:
+    events = _STICKER_REPLY_EVENTS.get(chat_id)
+    if not events:
+        return True
+    return (sum(events) / max(len(events), 4)) < STICKER_REPLY_MAX_RATIO
+
+
+def _active_group_reply_model() -> str:
+    if LLM_PROVIDER == "zan":
+        return get_runtime_value("ZAN_MODEL")
+    if LLM_PROVIDER == "ark":
+        return get_runtime_value("ARK_MODEL")
+    if LLM_PROVIDER == "ollama":
+        return get_runtime_value("OLLAMA_MODEL")
+    return get_runtime_value("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+
+def _log_group_reply_metric(
+    *,
+    started_at: float,
+    trigger_type: str,
+    probe_should_reply: bool,
+    support_level: str = "normal",
+    output_repair: bool = False,
+    forbidden_pattern: Optional[str] = None,
+    rag_enabled: bool = False,
+    reply_length: int = 0,
+    sticker_sent: bool = False,
+    failure: Optional[str] = None,
+) -> None:
+    logger.info(
+        "group_reply_metric model=%s trigger_type=%s probe_should_reply=%s support_level=%s "
+        "output_repair=%s forbidden_pattern=%s rag_enabled=%s reply_length=%s sticker_sent=%s "
+        "latency_ms=%s failure=%s",
+        _active_group_reply_model(),
+        trigger_type,
+        probe_should_reply,
+        support_level,
+        output_repair,
+        forbidden_pattern or "none",
+        rag_enabled,
+        reply_length,
+        sticker_sent,
+        round((time.monotonic() - started_at) * 1000),
+        failure or "none",
+    )
 MAX_RENDER_DOCUMENT_BYTES = max(1, get_runtime_int("MAX_RENDER_DOCUMENT_BYTES", 10 * 1024 * 1024))
 MAX_MEDIA_LINKS_PER_MESSAGE = max(1, get_runtime_int("MAX_MEDIA_LINKS_PER_MESSAGE", 4))
 MEDIA_PROCESSING_CONCURRENCY = max(1, get_runtime_int("MEDIA_PROCESSING_CONCURRENCY", 2))
+PROBE_MESSAGE_REVIEW_BACK = max(1, get_runtime_int("PROBE_MESSAGE_REVIEW_BACK", 12))
+PROMPT_CACHE_ANCHOR_MESSAGES = max(0, get_runtime_int("PROMPT_CACHE_ANCHOR_MESSAGES", 12))
 _MEDIA_PROCESSING_SEMAPHORE = asyncio.Semaphore(MEDIA_PROCESSING_CONCURRENCY)
 
 
@@ -842,7 +945,10 @@ def _coerce_activation_decision(value: object, *, direct_reason: str = "direct t
         return value
     if isinstance(value, bool):
         if value:
-            return direct_reply_activation_decision(reason=direct_reason)
+            # A legacy boolean result can only come from the ambient probe and
+            # carries no explicit retrieval plan. Preserve its historical RAG
+            # behaviour; deterministic direct triggers bypass this helper.
+            return direct_reply_activation_decision(reason=direct_reason, needs_rag=True)
         return ReplyActivationDecision(should_reply=False, reason="activation probe declined")
     should_reply = bool(getattr(value, "should_reply", False))
     if should_reply:
@@ -850,6 +956,7 @@ def _coerce_activation_decision(value: object, *, direct_reason: str = "direct t
         return direct_reply_activation_decision(
             memory_focus=memory_focus if isinstance(memory_focus, list) else None,
             reason=str(getattr(value, "reason", direct_reason) or direct_reason),
+            needs_rag=bool(getattr(value, "needs_rag", False)),
         )
     return ReplyActivationDecision(should_reply=False, reason=str(getattr(value, "reason", "activation probe declined") or "activation probe declined"))
 
@@ -961,8 +1068,14 @@ async def _choose_sticker_reply_candidate(
     ai_reply: str,
     additional_context: Optional[list[str]],
     runtime_state: Optional[list[str]],
+    support_level: str = "normal",
 ) -> Optional[tuple[object, bool]]:
     if not _sticker_reply_enabled() or not update.message or context is None:
+        return None
+    if support_level == "explicit_current_danger":
+        return None
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    if chat_id is not None and not _sticker_ratio_allows(chat_id):
         return None
     if getattr(context, "bot", None) is None:
         return None
@@ -978,6 +1091,24 @@ async def _choose_sticker_reply_candidate(
             additional_context=additional_context,
         )
         candidates = await find_sticker_reply_candidates(query_text, limit=limit)
+        if support_level == "emotional":
+            unsafe_emotional_terms = re.compile(
+                r"(?:weapon|gun|knife|threat|death|dead|horror|scare|武器|枪|槍|刀|威胁|威脅|死亡|惊吓|驚嚇)",
+                flags=re.IGNORECASE,
+            )
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not unsafe_emotional_terms.search(
+                    " ".join(
+                        [
+                            str(getattr(candidate, "description", "") or ""),
+                            str(getattr(candidate, "mood", "") or ""),
+                            " ".join(getattr(candidate, "tags", []) or []),
+                        ]
+                    )
+                )
+            ]
         if not candidates:
             return None
 
@@ -1035,7 +1166,7 @@ async def _send_sticker_reply(
     try:
         await add_message(
             chat_id=chat_id,
-            username="mioo_bot",
+            username=BOT_HISTORY_USERNAME,
             content=f"sticker reply: {selected.description}",
             telegram_message_id=getattr(sent_message, "message_id", None),
             reply_to_telegram_message_id=getattr(update.message, "message_id", None),
@@ -1743,6 +1874,7 @@ async def _handle_group_ai_reply_pipeline(
         return
 
     chat_id = update.effective_chat.id
+    metric_started_at = time.monotonic()
     sender_display = _display_name_from_user(sender_user)
     telegram_user_key = _telegram_user_key_from_user(sender_user)
     stored_message_text, relation_context = _build_reply_relation_payload(update, message_text)
@@ -1790,11 +1922,61 @@ async def _handle_group_ai_reply_pipeline(
         direct_addressed=is_directly_addressed,
     )
 
+    if _mentions_another_bot_only(raw_user_text, TELEGRAM_BOT_USERNAME) and not is_directly_addressed:
+        logger.info("Skipping group reply because the latest message addresses another bot.")
+        _log_group_reply_metric(
+            started_at=metric_started_at, trigger_type="other_bot_mention", probe_should_reply=False
+        )
+        return
+
+    if _STOP_REPLY_RE.search(raw_user_text):
+        _clear_support_state(chat_id, telegram_user_key)
+        if not is_directly_addressed:
+            _log_group_reply_metric(
+                started_at=metric_started_at, trigger_type=trigger_type, probe_should_reply=False
+            )
+            return
+        stop_reply = STOP_REPLY_TEXT
+        sent_message = await update.message.reply_text(stop_reply)
+        await add_message(
+            chat_id=chat_id,
+            username=BOT_HISTORY_USERNAME,
+            content=stop_reply,
+            telegram_message_id=getattr(sent_message, "message_id", None),
+            reply_to_telegram_message_id=getattr(update.message, "message_id", None),
+            reply_to_username=sender_display,
+        )
+        _record_reply_event(chat_id, used_sticker=False)
+        _log_group_reply_metric(
+            started_at=metric_started_at,
+            trigger_type=trigger_type,
+            probe_should_reply=True,
+            reply_length=len(stop_reply),
+        )
+        return
+
+    if context is not None and not is_directly_addressed and AMBIENT_REPLY_COOLDOWN_SECONDS > 0:
+        last_reply_at = _AMBIENT_LAST_REPLY_AT.get(chat_id)
+        if last_reply_at is not None and time.monotonic() - last_reply_at < AMBIENT_REPLY_COOLDOWN_SECONDS:
+            logger.info("Skipping ambient group reply during cooldown.")
+            _log_group_reply_metric(
+                started_at=metric_started_at, trigger_type=trigger_type, probe_should_reply=False
+            )
+            return
+
     if is_directly_addressed:
         logger.info("User %s directly triggered the bot via %s.", sender_display, trigger_type)
-        activation_decision = direct_reply_activation_decision(reason=trigger_type)
+        activation_decision = direct_reply_activation_decision(
+            reason=trigger_type,
+            needs_rag=bool(_HISTORY_QUERY_RE.search(message_text)),
+        )
     else:
-        probe_history_messages, _ = await get_prompt_context_parts(chat_id, query="")
+        probe_history_messages, _ = await get_prompt_context_parts(
+            chat_id,
+            query="",
+            recent_n=PROBE_MESSAGE_REVIEW_BACK,
+            retrieved_k=0,
+        )
         probe_result = await should_activate_reply(
             message_history=probe_history_messages,
             additional_context=merged_additional_context or None,
@@ -1806,6 +1988,12 @@ async def _handle_group_ai_reply_pipeline(
         )
         activation_decision = _coerce_activation_decision(probe_result, direct_reason="activation probe approved")
         if not activation_decision.should_reply:
+            _log_group_reply_metric(
+                started_at=metric_started_at,
+                trigger_type=trigger_type,
+                probe_should_reply=False,
+                failure="probe_error" if activation_decision.reason == "activation probe error" else None,
+            )
             return
 
     memory_query = _activation_memory_query(
@@ -1824,21 +2012,66 @@ async def _handle_group_ai_reply_pipeline(
     )
     merged_additional_context.extend(reply_activation_decision_context_lines(activation_decision))
 
+    support_state = _support_state_for(chat_id, telegram_user_key)
+    if support_state:
+        merged_additional_context.extend(
+            [
+                "support_state:",
+                f"followups_remaining: {support_state.followups_remaining}",
+                "Do not repeat safety advice. Keep any remaining follow-up brief and emotional.",
+            ]
+        )
+
     rag_query = _build_rag_query_from_message(
         activation_decision.rag_query_hint or message_text,
         additional_context=merged_additional_context,
         sender_display=sender_display,
     ) if activation_decision.needs_rag else ""
-    history_messages, rag_related_messages = await get_prompt_context_parts(chat_id, query=rag_query)
+    history_messages, rag_related_messages = await get_prompt_context_parts(
+        chat_id,
+        query=rag_query,
+        cache_anchor_n=PROMPT_CACHE_ANCHOR_MESSAGES,
+    )
 
-    ai_reply = await generate_group_reply(
+    generated_reply = await generate_group_reply(
         message_history=history_messages,
         rag_related_messages=rag_related_messages,
         additional_context=merged_additional_context or None,
         is_reply_to_bot=is_reply_to_bot,
         is_mentioned=is_mentioned,
         runtime_state=runtime_state,
+        return_result=True,
     )
+
+    if isinstance(generated_reply, GeneratedGroupReply):
+        ai_reply = generated_reply.reply_content
+        support_level = generated_reply.support_level
+        output_repair = generated_reply.guard_repaired
+        forbidden_pattern = generated_reply.forbidden_pattern
+    else:
+        ai_reply = generated_reply
+        support_level = "normal"
+        output_repair = False
+        forbidden_pattern = None
+
+    if support_state and support_state.followups_remaining <= 0 and support_level == "explicit_current_danger":
+        ai_reply = "小小宫还在听着，你想说什么就说吧。"
+        support_level = "emotional"
+
+    if support_level == "explicit_current_danger" and telegram_user_key:
+        if support_state is None:
+            _prune_expired_support_states()
+            _SUPPORT_STATES[(chat_id, telegram_user_key)] = _SupportState(
+                expires_at=time.monotonic() + SUPPORT_STATE_TTL_SECONDS,
+                followups_remaining=1,
+            )
+        else:
+            support_state.followups_remaining = max(0, support_state.followups_remaining - 1)
+            support_state.expires_at = time.monotonic() + SUPPORT_STATE_TTL_SECONDS
+    elif support_state and support_level == "emotional":
+        support_state.followups_remaining = max(0, support_state.followups_remaining - 1)
+    elif support_state:
+        _clear_support_state(chat_id, telegram_user_key)
 
     if ai_reply:
         try:
@@ -1849,6 +2082,7 @@ async def _handle_group_ai_reply_pipeline(
                 ai_reply=ai_reply,
                 additional_context=merged_additional_context or None,
                 runtime_state=runtime_state,
+                support_level=support_level,
             )
             if sticker_reply:
                 selected_sticker, send_text = sticker_reply
@@ -1860,27 +2094,74 @@ async def _handle_group_ai_reply_pipeline(
                         selected=selected_sticker,
                     )
                     if sent_sticker:
+                        _record_reply_event(chat_id, used_sticker=True)
+                        if context is not None and not is_directly_addressed:
+                            _AMBIENT_LAST_REPLY_AT[chat_id] = time.monotonic()
+                        _log_group_reply_metric(
+                            started_at=metric_started_at,
+                            trigger_type=trigger_type,
+                            probe_should_reply=True,
+                            support_level=support_level,
+                            output_repair=output_repair,
+                            forbidden_pattern=forbidden_pattern,
+                            rag_enabled=activation_decision.needs_rag,
+                            sticker_sent=True,
+                        )
                         return
 
             sent_message = await update.message.reply_text(ai_reply)
             await add_message(
                 chat_id=chat_id,
-                username="mioo_bot",
+                username=BOT_HISTORY_USERNAME,
                 content=ai_reply,
                 telegram_message_id=getattr(sent_message, "message_id", None),
                 reply_to_telegram_message_id=getattr(update.message, "message_id", None),
                 reply_to_username=sender_display,
             )
+            sent_sticker = False
             if sticker_reply:
                 selected_sticker, _ = sticker_reply
-                await _send_sticker_reply(
+                sent_sticker = await _send_sticker_reply(
                     update=update,
                     chat_id=chat_id,
                     sender_display=sender_display,
                     selected=selected_sticker,
                 )
+            _record_reply_event(chat_id, used_sticker=sent_sticker)
+            if context is not None and not is_directly_addressed:
+                _AMBIENT_LAST_REPLY_AT[chat_id] = time.monotonic()
+            _log_group_reply_metric(
+                started_at=metric_started_at,
+                trigger_type=trigger_type,
+                probe_should_reply=True,
+                support_level=support_level,
+                output_repair=output_repair,
+                forbidden_pattern=forbidden_pattern,
+                rag_enabled=activation_decision.needs_rag,
+                reply_length=len(ai_reply),
+                sticker_sent=sent_sticker,
+            )
         except Exception as e:
             logger.error(f"Error sending AI reply: {e}")
+            _log_group_reply_metric(
+                started_at=metric_started_at,
+                trigger_type=trigger_type,
+                probe_should_reply=True,
+                support_level=support_level,
+                output_repair=output_repair,
+                forbidden_pattern=forbidden_pattern,
+                rag_enabled=activation_decision.needs_rag,
+                reply_length=len(ai_reply),
+                failure="send_failed",
+            )
+    else:
+        _log_group_reply_metric(
+            started_at=metric_started_at,
+            trigger_type=trigger_type,
+            probe_should_reply=True,
+            rag_enabled=activation_decision.needs_rag,
+            failure="generation_empty",
+        )
 
 
 def _schedule_background_task(context: Optional[ContextTypes.DEFAULT_TYPE], coroutine) -> None:
@@ -2368,24 +2649,6 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("crypto", handle_crypto_command))
 
 
-async def _ensure_embedding_index_ready() -> None:
-    report = await log_embedding_health_report()
-    if not report.get("needs_reindex"):
-        return
-
-    logger.warning(
-        "Detected legacy or drifted embeddings in %s. Reindexing automatically before bot startup.",
-        report.get("db_file", "(unknown db)"),
-    )
-    result = await reindex_message_embeddings()
-    logger.info(
-        "Automatic embedding reindex finished. reindexed=%s signature=%s",
-        result.get("reindexed"),
-        result.get("signature"),
-    )
-    await log_embedding_health_report()
-
-
 def _run_webadmin_server() -> None:
     from webadmin.app import main as webadmin_main
 
@@ -2418,13 +2681,19 @@ def main() -> None:
 
     # Initialize the database
     init_db()
-    asyncio.run(_ensure_embedding_index_ready())
 
     webadmin_process = _start_webadmin_process()
 
     try:
         # Create the Application and pass it your bot's token.
-        application = Application.builder().token(TELEGRAM_BOT_KEY).read_timeout(30).write_timeout(30).build()
+        application = (
+            Application.builder()
+            .token(TELEGRAM_BOT_KEY)
+            .read_timeout(30)
+            .write_timeout(30)
+            .post_init(prepare_embedding_index)
+            .build()
+        )
 
         register_handlers(application)
         application.add_error_handler(handle_application_error)
